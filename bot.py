@@ -5,9 +5,11 @@ import re
 import time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from analyzer import (analyze_stock, scan_watchlist,
+from analyzer import (analyze_stock, analyze_stock_full, scan_watchlist,
                        get_price_data, get_fundamental_data,
                        get_foreign_flow_data, get_market_data, get_news_data)
+from db import init_db, save_signal, run_evaluation_cron, get_report, get_history
+from datetime import timedelta
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -39,14 +41,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "VN Signal Bot — San sang!\n\n"
         "DANH SACH LENH:\n"
-        "/check <MA>    — Phan tich sau 1 ma (6 agents AI)\n"
+        "/check <MA>    — Phan tich sau 1 ma (8 agents AI)\n"
         "  Vi du: /check VCB\n\n"
-        "/scan          — Quet nhanh toan bo watchlist\n"
+        "/scan          — Quet nhanh watchlist + Top 5 Vol Spike VN30\n"
         "/watchlist     — Xem danh sach ma dang theo doi\n"
         "/add <MA>      — Them ma vao watchlist\n"
         "/remove <MA>   — Xoa ma khoi watchlist\n"
-        "/status        — Kiem tra trang thai bot & API keys\n"
-        "/debug <MA>    — Debug tung data source (fundamental, foreign, market, news)\n"
+        "/report [ngay] — Accuracy tung agent (mac dinh 30 ngay)\n"
+        "/history <MA>  — Lich su signal cua 1 ma\n"
+        "/status        — Kiem tra trang thai bot & API keys & DB\n"
+        "/debug <MA>    — Debug tung data source\n"
         "/help          — Huong dan chi tiet\n"
         "/start         — Hien thi menu nay"
     )
@@ -130,6 +134,18 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"  Gemini API   : {'Co' if os.environ.get('GEMINI_API_KEY') else 'Chua set (fallback off)'}")
     lines.append(f"  VNAI API     : {'Co' if os.environ.get('VNAI_API_KEY') else 'Chua set'}")
     lines.append(f"  Watchlist    : {len(_get_watchlist(context))} ma")
+    # Kiểm tra DB
+    db_url = os.environ.get("DATABASE_URL", "")
+    if db_url:
+        try:
+            from db import get_conn
+            conn = get_conn()
+            conn.close()
+            lines.append("  PostgreSQL   : Ket noi OK")
+        except Exception as e:
+            lines.append(f"  PostgreSQL   : LOI — {str(e)[:60]}")
+    else:
+        lines.append("  PostgreSQL   : CHUA SET DATABASE_URL")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -234,11 +250,27 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = context.args[0].upper().strip()
     msg = await update.message.reply_text(f"Dang phan tich {symbol}... (~1-2 phut)")
     try:
-        result = await asyncio.to_thread(analyze_stock, symbol)
+        result, meta = await asyncio.to_thread(analyze_stock_full, symbol)
         result = plain(result)
         if len(result) > 4000:
             result = result[:3950] + "\n...[cat bot]"
         await msg.edit_text(result)
+
+        # Lưu signal vào DB nếu phân tích thành công
+        if meta:
+            try:
+                sid = save_signal(
+                    symbol,
+                    meta["verdict"],
+                    meta["ind"],
+                    meta["agent_verdicts"],
+                    meta["macro_v"],
+                )
+                if sid > 0:
+                    logger.info(f"Signal saved: {symbol} id={sid}")
+            except Exception as db_err:
+                logger.warning(f"Khong luu duoc signal vao DB: {db_err}")
+
     except Exception as e:
         logger.error(f"Error analyzing {symbol}: {e}")
         await msg.edit_text(f"Loi khi phan tich {symbol}: {str(e)[:200]}")
@@ -259,10 +291,69 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"Loi khi quet watchlist: {str(e)[:200]}")
 
 
+# ── /report ───────────────────────────────────────────────────────────────────
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tổng kết accuracy từng agent trong 30 ngày gần nhất"""
+    msg = await update.message.reply_text("Dang tinh toan report...")
+    try:
+        days = 30
+        if context.args:
+            try:
+                days = int(context.args[0])
+            except ValueError:
+                pass
+        result = await asyncio.to_thread(get_report, days)
+        await msg.edit_text(result)
+    except Exception as e:
+        await msg.edit_text(f"Loi khi lay report: {str(e)[:200]}")
+
+
+# ── /history ──────────────────────────────────────────────────────────────────
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lịch sử signal của 1 mã"""
+    if not context.args:
+        await update.message.reply_text("Vi du: /history VCB")
+        return
+    symbol = context.args[0].upper().strip()
+    msg = await update.message.reply_text(f"Dang lay lich su {symbol}...")
+    try:
+        result = await asyncio.to_thread(get_history, symbol)
+        await msg.edit_text(result)
+    except Exception as e:
+        await msg.edit_text(f"Loi khi lay history {symbol}: {str(e)[:200]}")
+
+
+# ── Cron job tự chấm điểm agent (chạy 18:00 mỗi ngày) ───────────────────────
+async def _start_cron():
+    """Chạy nền — tự chấm điểm agent predictions sau đóng cửa HOSE"""
+    while True:
+        now    = asyncio.get_event_loop().time
+        import datetime as _dt
+        now_dt = _dt.datetime.now()
+        target = now_dt.replace(hour=18, minute=0, second=0, microsecond=0)
+        if now_dt >= target:
+            target += _dt.timedelta(days=1)
+        wait_secs = (target - now_dt).total_seconds()
+        logger.info(f"Cron: next run in {wait_secs/3600:.1f}h ({target.strftime('%d/%m %H:%M')})")
+        await asyncio.sleep(wait_secs)
+        try:
+            updated = await asyncio.to_thread(run_evaluation_cron)
+            logger.info(f"Cron xong: {updated} predictions da cham diem")
+        except Exception as e:
+            logger.error(f"Cron error: {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_TOKEN chua duoc set")
+
+    # Khởi tạo DB schema (tự động tạo bảng nếu chưa có)
+    try:
+        init_db()
+        logger.info("DB initialized OK")
+    except Exception as e:
+        logger.warning(f"DB init failed (bot van chay, chi mat tinh nang luu signal): {e}")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -275,6 +366,14 @@ def main():
     app.add_handler(CommandHandler("debug",     debug_cmd))
     app.add_handler(CommandHandler("check",     check_cmd))
     app.add_handler(CommandHandler("scan",      scan_cmd))
+    app.add_handler(CommandHandler("report",    report_cmd))
+    app.add_handler(CommandHandler("history",   history_cmd))
+
+    # Khởi động cron job tự chấm điểm agent
+    async def post_init(application):
+        asyncio.create_task(_start_cron())
+
+    app.post_init = post_init
 
     logger.info("Bot dang chay...")
     app.run_polling(

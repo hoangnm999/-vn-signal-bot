@@ -733,25 +733,77 @@ def run_smart_money_agent(symbol, foreign):
     return txt + suffix, v
 
 
+_MACRO_KEYWORDS = [
+    "lai suat", "lãi suất", "ty gia", "tỷ giá", "fed", "sbv", "ngan hang nha nuoc",
+    "tin dung", "tín dụng", "lam phat", "lạm phát", "gdp", "tang truong kinh te",
+    "chinh sach tien te", "room tin dung", "usd", "vnd", "ndt", "cung tien",
+    "trai phieu", "trái phiếu", "ls dieu hanh", "bơm tiền", "hut tien",
+]
+
+def _extract_macro_headlines(headlines: list) -> list:
+    """Lọc các headline liên quan đến macro/tiền tệ từ danh sách chung"""
+    macro = []
+    for h in headlines:
+        h_lower = h.lower()
+        if any(kw in h_lower for kw in _MACRO_KEYWORDS):
+            macro.append(h)
+    return macro
+
+
+def run_macro_agent(news: dict) -> tuple:
+    """
+    Macro Agent — đánh giá môi trường vĩ mô từ RSS headlines có sẵn.
+    Filter keyword: lãi suất, tỷ giá, Fed, SBV, tín dụng, lạm phát...
+    Trả về: (text, label) với label = THUAN LOI / TRUNG TINH / RUI RO
+    """
+    if not news.get("success"):
+        return "Khong co du lieu macro", "TRUNG TINH"
+
+    macro_headlines = _extract_macro_headlines(news.get("headlines", []))
+
+    if not macro_headlines:
+        return "Khong tim thay tin tuc macro trong ky (lai suat, ty gia, SBV...)", "TRUNG TINH"
+
+    headlines_text = "\n".join(f"- {h}" for h in macro_headlines[:10])
+    sys_p = (
+        "Ban la chuyen gia kinh te vi mo Viet Nam. "
+        "Danh gia moi truong vi mo (lai suat, ty gia, chinh sach SBV/Fed, tin dung) "
+        "anh huong den TTCK Viet Nam. "
+        "Format bat buoc:\n"
+        "NHAN XET: <2 cau tom tat tin hieu vi mo>\n"
+        "MACRO: THUAN LOI hoac TRUNG TINH hoac RUI RO"
+    )
+    user = (
+        f"Tin tuc vi mo thu thap duoc ({len(macro_headlines)} tin):\n"
+        f"{headlines_text}\n\n"
+        "Danh gia anh huong den TTCK VN. Tra loi theo format yeu cau."
+    )
+    txt = call_deepseek(sys_p, user, max_tokens=200)
+    u = txt.upper()
+    v = ("THUAN LOI" if "THUAN LOI" in u else
+         "RUI RO"    if "RUI RO"    in u else "TRUNG TINH")
+    return txt, v
+
+
 def run_news_agent(symbol, news):
     if not news.get("success"):
-        return f"⚠️ Không lấy được tin tức: {news.get('error','')}", "TRUNG TÍNH"
+        return f"Khong lay duoc tin tuc: {news.get('error','')}", "TRUNG TINH"
     headlines_text = "\n".join(f"- {h}" for h in news["headlines"])
     src_summary    = news.get("source_summary", {})
     active_sources = [k for k, v in src_summary.items() if v > 0]
-    source_note    = f"Nguồn có dữ liệu: {', '.join(active_sources) or 'không có'} | Tổng: {news.get('total',0)} mục"
-    sys_p = ("Bạn là chuyên gia phân tích sentiment đa nguồn cho TTCK VN. "
-             "Dữ liệu từ: báo tài chính (CafeF/VnEconomy/Stockbiz/Vietstock), "
-             "diễn đàn trader (f319), mạng xã hội trader (Fireant), "
-             "báo cáo CTCK (VCSC/HSC/ACBS/VNDIRECT/SSI). "
-             "Báo cáo CTCK có trọng số CAO HƠN ý kiến cá nhân. "
-             "Dòng cuối PHẢI là — Kết luận: TÍCH CỰC hoặc TRUNG TÍNH hoặc TIÊU CỰC")
-    user = (f"Cổ phiếu: {symbol}\n{source_note}\n\n"
-            f"Nội dung thu thập:\n{headlines_text}\n\n"
-            "Phân tích 3-4 câu. Kết luận: TÍCH CỰC/TRUNG TÍNH/TIÊU CỰC")
+    source_note    = f"Nguon co du lieu: {', '.join(active_sources) or 'khong co'} | Tong: {news.get('total',0)} muc"
+    sys_p = ("Ban la chuyen gia phan tich sentiment da nguon cho TTCK VN. "
+             "Du lieu tu: bao tai chinh (CafeF/VnEconomy/Stockbiz/Vietstock), "
+             "dien dan trader (f319), mang xa hoi trader (Fireant), "
+             "bao cao CTCK (VCSC/HSC/ACBS/VNDIRECT/SSI). "
+             "Bao cao CTCK co trong so CAO HON y kien ca nhan. "
+             "Dong cuoi PHAI la — Ket luan: TICH CUC hoac TRUNG TINH hoac TIEU CUC")
+    user = (f"Co phieu: {symbol}\n{source_note}\n\n"
+            f"Noi dung thu thap:\n{headlines_text}\n\n"
+            "Phan tich 3-4 cau. Ket luan: TICH CUC/TRUNG TINH/TIEU CUC")
     txt = call_deepseek(sys_p, user, max_tokens=350)
-    v = ("TÍCH CỰC" if "TÍCH CỰC" in txt.upper() else
-         "TIÊU CỰC" if "TIÊU CỰC" in txt.upper() else "TRUNG TÍNH")
+    v = ("TICH CUC" if "TICH CUC" in txt.upper() else
+         "TIEU CUC" if "TIEU CUC" in txt.upper() else "TRUNG TINH")
     return txt, v
 
 
@@ -933,9 +985,9 @@ def analyze_stock(symbol: str) -> str:
     except Exception as e:
         return f"❌ Lỗi tính indicators {symbol}: {e}"
 
-    # 2. Chạy 7 agent song song
+    # 2. Chạy 8 agent song song (thêm Macro agent)
     try:
-        with ThreadPoolExecutor(max_workers=7) as ex:
+        with ThreadPoolExecutor(max_workers=8) as ex:
             f1 = ex.submit(run_trend_agent,          symbol, ind)
             f2 = ex.submit(run_volume_agent,         symbol, ind)
             f3 = ex.submit(run_risk_agent,           symbol, ind)
@@ -943,6 +995,7 @@ def analyze_stock(symbol: str) -> str:
             f5 = ex.submit(run_smart_money_agent,    symbol, foreign_data)
             f6 = ex.submit(run_news_agent,           symbol, news_data)
             f7 = ex.submit(run_market_regime_agent,          market_data)
+            f8 = ex.submit(run_macro_agent,                  news_data)
             trend_txt,  trend_v  = f1.result()
             volume_txt, volume_v = f2.result()
             risk_txt,   risk_v   = f3.result()
@@ -950,6 +1003,7 @@ def analyze_stock(symbol: str) -> str:
             smart_txt,  smart_v  = f5.result()
             news_txt,   news_v   = f6.result()
             market_txt, market_v = f7.result()
+            macro_txt,  macro_v  = f8.result()
     except Exception as e:
         return f"❌ Lỗi khi chạy agents {symbol}: {e}"
 
@@ -986,7 +1040,7 @@ DU LIEU:
   Ho tro: {ind['support_20d']:,.0f} | Khang cu: {ind['resistance_20d']:,.0f}
   VN-Index: {vnindex_str}
 
-7 AGENTS:
+8 AGENTS:
   Xu huong:    {trend_v}
   Volume:      {volume_v}
   Rui ro:      {risk_v}
@@ -994,6 +1048,7 @@ DU LIEU:
   Smart Money: {smart_v}
   News:        {news_v}
   Market:      {market_v}
+  Macro:       {macro_v}
 
 CHI TIET AGENTS:
   [Xu huong] {trend_txt}
@@ -1003,6 +1058,7 @@ CHI TIET AGENTS:
   [Smart Money] {smart_txt}
   [News] {news_txt}
   [Market] {market_txt}
+  [Macro] {macro_txt}
 
 {'='*30}
 {emoji} KET LUAN: {final_v}
@@ -1020,6 +1076,61 @@ CANH BAO: {negative}
 {'='*30}""".strip()
 
     return msg[:4000] + "\n[Cat bot]" if len(msg) > 4000 else msg
+
+
+VN30_SYMBOLS = [
+    "VCB","BID","CTG","TCB","MBB","VPB","ACB","HDB","STB","LPB",
+    "VIC","VHM","VRE","MSN","MWG","FPT","HPG","HSG","NKG","GAS",
+    "PLX","POW","PVD","REE","SAB","SSI","VND","HCM","VCI","DXG",
+]
+
+
+def _get_volume_spike_top5(exclude_watchlist: list) -> str:
+    """Quét VN30, tìm top 5 mã có volume spike cao nhất so với TB 20 phiên"""
+    results = []
+    to_scan = [s for s in VN30_SYMBOLS if s not in exclude_watchlist]
+
+    def _check_spike(sym):
+        try:
+            data = get_price_data(sym, 30)
+            if not data.get("success"):
+                return None
+            df     = data["df"]
+            volume = df["volume"].astype(float)
+            close  = df["close"].astype(float)
+            avg20  = float(volume.rolling(20).mean().iloc[-1])
+            if avg20 <= 0:
+                return None
+            vol_ratio = float(volume.iloc[-1]) / avg20
+            change_1d = float((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100) if len(close) >= 2 else 0
+            return {
+                "symbol":    sym,
+                "vol_ratio": round(vol_ratio, 2),
+                "price":     round(float(close.iloc[-1]), 0),
+                "change_1d": round(change_1d, 1),
+            }
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(_check_spike, s): s for s in to_scan}
+        for f in futures:
+            r = f.result()
+            if r and r["vol_ratio"] >= 1.5:   # chỉ lấy mã có vol spike >= 1.5x
+                results.append(r)
+
+    if not results:
+        return "Khong co ma nao co volume spike dang ke trong phien nay."
+
+    top5 = sorted(results, key=lambda x: x["vol_ratio"], reverse=True)[:5]
+    lines = ["TOP 5 VOL SPIKE (VN30):"]
+    for r in top5:
+        em = "🟢" if r["change_1d"] > 0 else "🔴" if r["change_1d"] < 0 else "🟡"
+        lines.append(
+            f"  {em} {r['symbol']}  {r['price']:,.0f}  ({r['change_1d']:+.1f}%)  "
+            f"Vol: {r['vol_ratio']}x TB20"
+        )
+    return "\n".join(lines)
 
 
 def scan_watchlist(watchlist: list) -> str:
@@ -1056,9 +1167,12 @@ def scan_watchlist(watchlist: list) -> str:
         regime = ("🟢 UPTREND"   if market["above_ma20"] and market["change_5d"] > 0 else
                   "🔴 DOWNTREND" if not market["above_ma20"] and market["change_5d"] < 0 else
                   "🟡 SIDEWAYS")
-        vnindex_line = (f"\n🌊 VN-Index: `{market['vnindex']:,}` "
+        vnindex_line = (f"\n🌊 VN-Index: {market['vnindex']:,} "
                         f"({market['change_5d']:+.1f}% 5D) — {regime}\n{'─'*28}\n")
 
-    header = f"📋 *Scan Watchlist* — {now}\n{'─'*28}{vnindex_line}"
-    footer = "\n\n_/check <MÃ> để phân tích sâu 6 agents_"
+    # Volume spike toàn VN30
+    spike_section = _get_volume_spike_top5(watchlist)
+
+    header = f"📋 Scan Watchlist — {now}\n{'─'*28}{vnindex_line}"
+    footer = f"\n\n{'─'*28}\n{spike_section}\n\n/check <MA> de phan tich sau 8 agents"
     return header + "\n".join(results) + footer
