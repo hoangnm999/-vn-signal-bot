@@ -774,22 +774,137 @@ def run_market_regime_agent(market):
     return txt, v
 
 
-def run_verdict_agent(symbol, verdicts):
-    sys_p = ("Bạn là Chief Investment Analyst, tổng hợp ý kiến từ 6 chuyên gia. "
-             "Trọng số cao hơn cho Market Regime và Smart Money. "
-             "Dòng cuối PHẢI là — Kết luận: ĐỒNG THUẬN MUA hoặc ĐỒNG THUẬN BÁN hoặc TRUNG LẬP hoặc PHẢN BÁC")
-    user = (f"Cổ phiếu: {symbol}\n\n"
-            f"Xu hướng: {verdicts['trend']}\nVolume: {verdicts['volume']}\n"
-            f"Rủi ro: {verdicts['risk']}\nFundamental: {verdicts['fundamental']}\n"
-            f"Smart Money: {verdicts['smart_money']}\nNews: {verdicts['news']}\n"
-            f"Market Regime: {verdicts['market']}\n\n"
-            "Tổng hợp 3-4 câu. Kết luận: ĐỒNG THUẬN MUA/ĐỒNG THUẬN BÁN/TRUNG LẬP/PHẢN BÁC")
-    txt = call_deepseek(sys_p, user, max_tokens=400)
-    u = txt.upper()
-    v = ("ĐỒNG THUẬN MUA" if "ĐỒNG THUẬN MUA" in u else
-         "ĐỒNG THUẬN BÁN" if "ĐỒNG THUẬN BÁN" in u else
-         "PHẢN BÁC"       if "PHẢN BÁC"       in u else "TRUNG LẬP")
-    return txt, v
+def run_verdict_agent(symbol, verdicts, ind):
+    """
+    Verdict agent mới — trả về dict với 4 keys:
+      verdict_label : ĐỒNG THUẬN MUA / ĐỒNG THUẬN BÁN / TRUNG LẬP / PHẢN BÁC
+      confidence    : float 1.0-10.0
+      summary       : 2-3 câu tổng hợp lý do
+      action_plan   : dict {entry, tp, sl, rr}
+      negative      : 1 dòng lý do không nên vào lệnh ngay
+    """
+    # ── Tính Confidence Score từ sự đồng thuận agents ────────────────────────
+    # Mỗi agent vote: +1 nếu bullish, -1 nếu bearish, 0 nếu neutral
+    votes = {
+        "trend":      1 if verdicts["trend"] == "TĂNG" else -1 if verdicts["trend"] == "GIẢM" else 0,
+        "volume":     1 if verdicts["volume"] == "XÁC NHẬN" else -1 if verdicts["volume"] == "PHÂN KỲ" else 0,
+        "risk":       1 if verdicts["risk"] == "THẤP" else -1 if verdicts["risk"] == "CAO" else 0,
+        "fundamental":1 if verdicts["fundamental"] in ("TOT", "TỐT") else -1 if verdicts["fundamental"] in ("YEU", "YẾU") else 0,
+        "smart_money":1 if verdicts["smart_money"] == "MUA RONG" else -1 if verdicts["smart_money"] == "BAN RONG" else 0,
+        "news":       1 if verdicts["news"] == "TÍCH CỰC" else -1 if verdicts["news"] == "TIÊU CỰC" else 0,
+        "market":     1 if verdicts["market"] == "UPTREND" else -1 if verdicts["market"] == "DOWNTREND" else 0,
+    }
+
+    # Market Regime + Smart Money có trọng số 1.5x
+    weighted_score = (
+        votes["trend"]       * 1.0 +
+        votes["volume"]      * 1.0 +
+        votes["risk"]        * 1.0 +
+        votes["fundamental"] * 1.0 +
+        votes["smart_money"] * 1.5 +
+        votes["news"]        * 1.0 +
+        votes["market"]      * 1.5
+    )
+    max_score = 9.0  # tổng trọng số tối đa
+    # Scale về 1-10, tâm 5.5
+    confidence = round(5.5 + (weighted_score / max_score) * 4.5, 1)
+    confidence = max(1.0, min(10.0, confidence))
+
+    bull_count = sum(1 for v in votes.values() if v == 1)
+    bear_count = sum(1 for v in votes.values() if v == -1)
+
+    # ── Verdict label ─────────────────────────────────────────────────────────
+    if weighted_score >= 3.0:
+        verdict_label = "ĐỒNG THUẬN MUA"
+    elif weighted_score <= -3.0:
+        verdict_label = "ĐỒNG THUẬN BÁN"
+    elif weighted_score >= 1.0:
+        verdict_label = "TRUNG LẬP"
+    elif weighted_score <= -1.0:
+        verdict_label = "PHẢN BÁC"
+    else:
+        verdict_label = "TRUNG LẬP"
+
+    # ── Action Plan từ indicators có sẵn ─────────────────────────────────────
+    price   = ind["current_price"]
+    support = ind["support_20d"]
+    resist  = ind["resistance_20d"]
+    bb_low  = ind["bb_lower"]
+    bb_up   = ind["bb_upper"]
+
+    # Entry: giữa giá hiện tại và BB_lower (vùng hợp lý để chờ pullback)
+    entry_low  = round(max(support, bb_low) * 1.005, 0)   # +0.5% trên support
+    entry_high = round(price * 1.005, 0)                   # ngay trên giá hiện tại
+
+    # SL: dưới support 20D hoặc BB Lower (lấy mức thấp hơn)
+    sl = round(min(support, bb_low) * 0.985, 0)            # -1.5% dưới support
+
+    # TP: kháng cự 20D hoặc BB Upper
+    tp = round(max(resist, bb_up) * 0.995, 0)              # sát dưới kháng cự
+
+    # R:R
+    risk   = price - sl
+    reward = tp - price
+    rr     = round(reward / risk, 1) if risk > 0 else 0
+
+    action_plan = {
+        "entry_low":  int(entry_low),
+        "entry_high": int(entry_high),
+        "tp":         int(tp),
+        "sl":         int(sl),
+        "tp_pct":     round((tp - price) / price * 100, 1),
+        "sl_pct":     round((sl - price) / price * 100, 1),
+        "rr":         rr,
+    }
+
+    # ── LLM: Summary + Negative Filter ───────────────────────────────────────
+    sys_p = (
+        "Ban la Chief Investment Analyst cho TTCK Viet Nam. "
+        "Nhiem vu: viet 2 doan ngan gon bang tieng Viet khong dau (ASCII safe). "
+        "DOAN 1 — SUMMARY: 2 cau ly do chinh cho ket luan. "
+        "DOAN 2 — NEGATIVE: 1 cau ngan ve rui ro/ly do KHONG nen vao lenh ngay bay gio. "
+        "Format bat buoc:\n"
+        "SUMMARY: <noi dung>\n"
+        "NEGATIVE: <noi dung>"
+    )
+    user = (
+        f"Co phieu: {symbol} | Gia: {price:,}\n"
+        f"Ket luan: {verdict_label} | Confidence: {confidence}/10\n"
+        f"Agents dong thuan: {bull_count}/7 bullish, {bear_count}/7 bearish\n\n"
+        f"Xu huong: {verdicts['trend']} | Volume: {verdicts['volume']} | "
+        f"Rui ro: {verdicts['risk']}\n"
+        f"Fundamental: {verdicts['fundamental']} | Smart Money: {verdicts['smart_money']}\n"
+        f"News: {verdicts['news']} | Market Regime: {verdicts['market']}\n\n"
+        f"VN-Index proxy: {verdicts['market']}\n"
+        "Viet SUMMARY 2 cau va NEGATIVE 1 cau theo format yeu cau."
+    )
+    llm_txt = call_deepseek(sys_p, user, max_tokens=300)
+
+    # Parse SUMMARY và NEGATIVE từ LLM output
+    summary  = ""
+    negative = ""
+    for line in llm_txt.splitlines():
+        line = line.strip()
+        if line.upper().startswith("SUMMARY:"):
+            summary = line[8:].strip()
+        elif line.upper().startswith("NEGATIVE:"):
+            negative = line[9:].strip()
+
+    # Fallback nếu LLM không theo format
+    if not summary:
+        summary = llm_txt[:200].strip()
+    if not negative:
+        negative = f"Kiem tra lai khi thi truong xac nhan ro rang hon (confidence {confidence}/10)"
+
+    return {
+        "verdict_label": verdict_label,
+        "confidence":    confidence,
+        "bull_count":    bull_count,
+        "bear_count":    bear_count,
+        "summary":       summary,
+        "action_plan":   action_plan,
+        "negative":      negative,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -840,56 +955,71 @@ def analyze_stock(symbol: str) -> str:
 
     # 3. Verdict
     try:
-        verdict_txt, final_v = run_verdict_agent(symbol, {
+        verdict = run_verdict_agent(symbol, {
             "trend": trend_v, "volume": volume_v, "risk": risk_v,
             "fundamental": fund_v, "smart_money": smart_v,
             "news": news_v, "market": market_v,
-        })
+        }, ind)
     except Exception as e:
         return f"❌ Lỗi verdict agent {symbol}: {e}"
 
     # 4. Format
+    final_v  = verdict["verdict_label"]
+    conf     = verdict["confidence"]
+    ap       = verdict["action_plan"]
+    summary  = verdict["summary"]
+    negative = verdict["negative"]
+    bull     = verdict["bull_count"]
+    bear     = verdict["bear_count"]
+
     emoji = {"ĐỒNG THUẬN MUA": "🟢", "ĐỒNG THUẬN BÁN": "🔴",
              "PHẢN BÁC": "🔴", "TRUNG LẬP": "🟡"}.get(final_v, "🟡")
     vnindex_str = (f"{market_data['vnindex']:,} ({market_data['change_5d']:+.1f}% 5D)"
                    if market_data.get("success") else "N/A")
     now = datetime.now().strftime("%d/%m %H:%M")
 
-    msg = f"""{emoji} *Phân tích {symbol}* — {now}
+    msg = f"""{emoji} Phan tich {symbol} — {now}
 
-📊 *Dữ liệu:*
-• Giá: `{ind['current_price']:,.0f}` | 1W: `{ind['change_1w_pct']:+.1f}%` | 1M: `{ind['change_1m_pct']:+.1f}%`
-• RSI: `{ind['rsi']}` | MACD Hist: `{ind['macd_hist']:+.4f}` | Vol: `{ind['volume_ratio']}x`
-• Hỗ trợ: `{ind['support_20d']:,.0f}` | Kháng cự: `{ind['resistance_20d']:,.0f}`
-• VN-Index: `{vnindex_str}`
+DU LIEU:
+  Gia: {ind['current_price']:,.0f} | 1W: {ind['change_1w_pct']:+.1f}% | 1M: {ind['change_1m_pct']:+.1f}%
+  RSI: {ind['rsi']} | MACD Hist: {ind['macd_hist']:+.4f} | Vol: {ind['volume_ratio']}x
+  Ho tro: {ind['support_20d']:,.0f} | Khang cu: {ind['resistance_20d']:,.0f}
+  VN-Index: {vnindex_str}
 
-🤖 *6 Agents:*
-  📈 Xu hướng: `{trend_v}`
-  💧 Volume: `{volume_v}`
-  ⚠️ Rủi ro: `{risk_v}`
-  🏦 Fundamental: `{fund_v}`
-  🐋 Smart Money: `{smart_v}`
-  📰 News: `{news_v}`
-  🌊 Market Regime: `{market_v}`
+7 AGENTS:
+  Xu huong:    {trend_v}
+  Volume:      {volume_v}
+  Rui ro:      {risk_v}
+  Fundamental: {fund_v}
+  Smart Money: {smart_v}
+  News:        {news_v}
+  Market:      {market_v}
 
-📈 *Xu hướng:* {trend_txt}
+CHI TIET AGENTS:
+  [Xu huong] {trend_txt}
+  [Volume] {volume_txt}
+  [Rui ro] {risk_txt}
+  [Fundamental] {fund_txt}
+  [Smart Money] {smart_txt}
+  [News] {news_txt}
+  [Market] {market_txt}
 
-💧 *Volume:* {volume_txt}
+{'='*30}
+{emoji} KET LUAN: {final_v}
+CONFIDENCE: {conf}/10 ({bull}/7 bullish, {bear}/7 bearish)
 
-⚠️ *Rủi ro:* {risk_txt}
+LY DO: {summary}
 
-🏦 *Fundamental:* {fund_txt}
+ACTION PLAN:
+  Entry:  {ap['entry_low']:,} - {ap['entry_high']:,}
+  Target: {ap['tp']:,} ({ap['tp_pct']:+.1f}%)
+  SL:     {ap['sl']:,} ({ap['sl_pct']:+.1f}%)
+  R:R   = 1:{ap['rr']}
 
-🐋 *Smart Money:* {smart_txt}
+CANH BAO: {negative}
+{'='*30}""".strip()
 
-📰 *News Sentiment:* {news_txt}
-
-🌊 *Market Regime:* {market_txt}
-
-{emoji} *KẾT LUẬN: {final_v}*
-{verdict_txt}""".strip()
-
-    return msg[:4000] + "\n_[Cắt bớt]_" if len(msg) > 4000 else msg
+    return msg[:4000] + "\n[Cat bot]" if len(msg) > 4000 else msg
 
 
 def scan_watchlist(watchlist: list) -> str:
