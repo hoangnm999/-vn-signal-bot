@@ -183,38 +183,42 @@ def get_foreign_flow_data(symbol: str) -> dict:
         # Volume-price analysis thay cho foreign flow trực tiếp
         # Ngày tăng giá + volume cao => tín hiệu mua mạnh (smart money)
         # Ngày giảm giá + volume cao => tín hiệu bán mạnh
-        price_chg  = close.pct_change()
-        avg_vol    = volume.rolling(20).mean()
-        vol_ratio  = volume / avg_vol
+        price_chg = close.pct_change()
+        avg_vol   = volume.rolling(20).mean()
+        vol_ratio = volume / avg_vol
 
-        # 5 phiên gần nhất
-        recent_chg = price_chg.tail(5)
-        recent_vr  = vol_ratio.tail(5)
+        def _net_flow(chg_series, vr_series):
+            """
+            Tính net flow score cho 1 cửa sổ thời gian.
+            buy_pressure  = trung bình (vol_ratio * sign_tăng)
+            sell_pressure = trung bình (vol_ratio * sign_giảm)
+            Nhân với avg_trade_val (tỷ VND/ngày) → ra tỷ VND ước tính
+            """
+            buy  = float(((chg_series > 0) * vr_series.clip(0, 3)).sum())
+            sell = float(((chg_series < 0) * vr_series.clip(0, 3)).sum())
+            n    = len(chg_series)
+            # net = (buy - sell) / n  → tỉ lệ [-1, 1] mỗi phiên
+            return round((buy - sell) / n, 4) if n > 0 else 0.0
 
-        # .values để tránh Series không convert được sang scalar float
-        buy_signal  = float(((recent_chg > 0) * recent_vr.clip(0, 3)).mean())
-        sell_signal = float(((recent_chg < 0) * recent_vr.clip(0, 3)).mean())
-        net_signal  = round(buy_signal - sell_signal, 3)
-
-        # avg_trade_val = giá trị giao dịch TB ngày (đơn vị: tỷ VND)
-        # volume tính bằng cp, close tính bằng VND/cp
-        # volume * close = VND → /1e9 = tỷ VND
+        # avg_trade_val: giá trị giao dịch TB 1 phiên (tỷ VND)
         avg_trade_val = float((volume * close).tail(20).mean()) / 1e9
 
-        # net_signal là tỉ lệ [-1, 1] → nhân với avg_trade_val để ra tỷ VND thực tế
-        # Không nhân thêm scale factor nhỏ — đó là nguyên nhân ra số ~0.01
-        net_20d_series = ((price_chg > 0) * vol_ratio.clip(0, 3) -
-                          (price_chg < 0) * vol_ratio.clip(0, 3)).tail(20)
-        net_est_20d = round(float(net_20d_series.mean()) * avg_trade_val, 2)
-        net_est_5d  = round(net_signal * avg_trade_val, 2)
+        # 3 khung thời gian THỰC SỰ khác nhau
+        net_1d  = _net_flow(price_chg.tail(1),  vol_ratio.tail(1))
+        net_5d  = _net_flow(price_chg.tail(5),  vol_ratio.tail(5))
+        net_20d = _net_flow(price_chg.tail(20), vol_ratio.tail(20))
 
+        # Quy đổi sang tỷ VND — nhân tỉ lệ với avg_trade_val
+        # Ý nghĩa: nếu net = 0.5 và avg_trade_val = 100 tỷ/ngày
+        # → ước tính ~50 tỷ VND net mua trong phiên
         return {
             "success":   True,
-            "net_today": round(net_signal * avg_trade_val, 2),
-            "net_5d":    net_est_5d,
-            "net_20d":   net_est_20d,
+            "net_today": round(net_1d  * avg_trade_val, 1),
+            "net_5d":    round(net_5d  * avg_trade_val, 1),
+            "net_20d":   round(net_20d * avg_trade_val, 1),
+            "avg_daily_val": round(avg_trade_val, 1),
             "source":    "volume_proxy",
-            "note":      "uoc tinh tu volume-price pattern (don vi: ty VND)",
+            "note":      "uoc tinh tu volume-price pattern (ty VND/ngay)",
         }
     except Exception as e:
         return {"success": False, "error": str(e)[:120]}
@@ -240,62 +244,28 @@ def _parse_close_series(data) -> pd.Series:
 
 def get_market_data() -> dict:
     """
-    Lấy market regime data.
-    VNINDEX không phải stock => dùng ETF proxy:
-    - E1VFVN30: ETF track VN30, niêm yết HOSE, đồng hành VNINDEX
-    - FUEVFVND: ETF VNFIN LEAD
-    - Fallback: dùng 1 bluechip (VCB) làm proxy tương đối
+    Lấy market regime data dùng _price_from_entrade (đã hoạt động ổn).
+    ETF proxy: E1VFVN30 → FUEVFVND → FUESSVFL → VCB fallback
     """
-    import time
-    to_ts   = int(time.time())
-    from_ts = to_ts - 90 * 86400
-
-    base = "https://services.entrade.com.vn/chart-api/v2/ohlcs/stock"
-    # ETF proxy symbols - track thị trường chung
     symbols_to_try = [
         ("E1VFVN30", "ETF VN30"),
         ("FUEVFVND", "ETF VNFIN"),
-        ("FUESSVFL", "ETF VN30"),
-        ("VCB",      "Proxy VCB"),   # fallback cuối - bluechip đại diện
+        ("FUESSVFL", "ETF VN30 2"),
+        ("VCB",      "Proxy VCB"),
     ]
 
     last_err = "Tat ca symbols fail"
     for symbol, label in symbols_to_try:
         try:
-            url = f"{base}?symbol={symbol}&resolution=D&from={from_ts}&to={to_ts}"
-            r = requests.get(url, headers=_BROWSER_HEADERS, timeout=12)
-            if r.status_code != 200:
-                last_err = f"{symbol} HTTP {r.status_code}"
+            # Dùng lại _price_from_entrade đã hoạt động ổn thay vì parse thủ công
+            df = _price_from_entrade(symbol, 90)
+            if df is None or df.empty:
+                last_err = f"{symbol}: empty dataframe"
                 continue
 
-            raw = r.json()
-
-            if isinstance(raw, dict):
-                # Entrade keys: t=time, o=open, h=high, l=low, c=close, v=volume
-                close_list = None
-                for k in ["c", "close", "Close"]:
-                    if k in raw and isinstance(raw[k], list):
-                        # Chỉ bỏ None và giá trị âm
-                        # KHÔNG lọc "0" vì ETF có giá hợp lệ dạng 14.xx (nghìn đồng)
-                        vals = []
-                        for x in raw[k]:
-                            try:
-                                v = float(x)
-                                if v > 0:
-                                    vals.append(v)
-                            except (TypeError, ValueError):
-                                continue
-                        if len(vals) >= 5:
-                            close_list = vals
-                            break
-
-                if not close_list:
-                    last_err = f"{symbol}: khong co close data hop le, keys={list(raw.keys())[:6]}"
-                    continue
-
-                close = pd.Series(close_list, dtype=float)
-            else:
-                last_err = f"{symbol}: response khong phai dict ({type(raw)})"
+            close = df["close"].astype(float)
+            if len(close) < 5:
+                last_err = f"{symbol}: khong du du lieu ({len(close)} bars)"
                 continue
 
             ma20 = close.rolling(20).mean().iloc[-1]
@@ -899,6 +869,34 @@ def run_market_regime_agent(market):
     return txt, v
 
 
+def _format_action_plan(verdict_label: str, ap: dict) -> str:
+    """
+    Format Action Plan theo verdict:
+    - MUA/BAN: hiển thị đầy đủ Entry/TP/SL/RR
+    - TRUNG LAP/PHAN BAC: không thể quyết định mua/bán tại thời điểm này
+    """
+    if "MUA" in verdict_label or "BAN" in verdict_label:
+        action = "MUA" if "MUA" in verdict_label else "BAN"
+        return (
+            f"ACTION PLAN ({action}):\n"
+            f"  Entry:  {ap['entry_low']:,} - {ap['entry_high']:,}\n"
+            f"  Target: {ap['tp']:,} ({ap['tp_pct']:+.1f}%)\n"
+            f"  SL:     {ap['sl']:,} ({ap['sl_pct']:+.1f}%)\n"
+            f"  R:R   = 1:{ap['rr']}\n"
+            f"\n  Vung theo doi them: {ap['sl']:,} - {ap['entry_low']:,}"
+        )
+    else:
+        # TRUNG LAP hoac PHAN BAC
+        return (
+            f"ACTION PLAN:\n"
+            f"  Khong the quyet dinh mua/ban tai thoi diem nay.\n"
+            f"  Vung co the xem xet mua khi co tin hieu:\n"
+            f"    Ho tro: {ap['sl']:,} - {ap['entry_low']:,}\n"
+            f"  Muc TP neu vao duoc: {ap['tp']:,} ({ap['tp_pct']:+.1f}%)\n"
+            f"  Dieu kien can them: RSI < 70 + Volume xac nhan + Market Regime UPTREND"
+        )
+
+
 def run_verdict_agent(symbol, verdicts, ind):
     """
     Verdict agent mới — trả về dict với 4 keys:
@@ -1162,11 +1160,7 @@ CONFIDENCE: {conf}/10 ({bull}/7 bullish, {bear}/7 bearish)
 
 LY DO: {summary}
 
-ACTION PLAN:
-  Entry:  {ap['entry_low']:,} - {ap['entry_high']:,}
-  Target: {ap['tp']:,} ({ap['tp_pct']:+.1f}%)
-  SL:     {ap['sl']:,} ({ap['sl_pct']:+.1f}%)
-  R:R   = 1:{ap['rr']}
+{_format_action_plan(final_v, ap)}
 
 CANH BAO: {negative}
 {'='*30}""".strip()
@@ -1384,11 +1378,7 @@ CONFIDENCE: {conf}/10 ({bull}/7 bullish, {bear}/7 bearish)
 
 LY DO: {summary}
 
-ACTION PLAN:
-  Entry:  {ap['entry_low']:,} - {ap['entry_high']:,}
-  Target: {ap['tp']:,} ({ap['tp_pct']:+.1f}%)
-  SL:     {ap['sl']:,} ({ap['sl_pct']:+.1f}%)
-  R:R   = 1:{ap['rr']}
+{_format_action_plan(final_v, ap)}
 
 CANH BAO: {negative}
 {'='*30}""".strip()
