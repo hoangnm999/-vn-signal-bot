@@ -8,6 +8,15 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from analyzer import (analyze_stock_full, scan_watchlist,
                       get_price_data, get_market_data, get_news_data)
 from db import init_db, save_signal, run_evaluation_cron, get_report, get_history
+try:
+    from vibe_client import (
+        is_available as vibe_available,
+        start_swarm, poll_swarm, format_swarm_result,
+        SWARM_ALIASES, SWARM_LABELS, SWARM_GROUPS,
+    )
+    _VIBE_CLIENT = True
+except ImportError:
+    _VIBE_CLIENT = False
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -410,6 +419,127 @@ async def _start_cron():
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+# ── /vibe — Gọi Vibe-Trading swarm agents thật sự ────────────────────────────
+# Lệnh: /vibe <MA> [preset]
+# Preset: technical (mặc định), investment, risk, macro, fundamental, sector
+# Ví dụ: /vibe VCB
+#         /vibe HPG investment
+#         /vibe FPT risk
+
+async def vibe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Chạy Vibe-Trading swarm agents (29 swarms / 113 agents)."""
+    if not is_allowed(update): await _deny(update); return
+
+    if not _VIBE_CLIENT:
+        await update.message.reply_text(
+            "vibe_client.py chua duoc deploy.\n"
+            "Them file vibe_client.py vao repo va set VIBE_API_URL."
+        ); return
+
+    # Nếu không có args → hiện menu
+    if not context.args:
+        if not _VIBE_CLIENT:
+            await update.message.reply_text("Vibe client chua san sang."); return
+        lines = ["VIBE-TRADING — 29 Swarms / 113 Agents", ""]
+        for group, aliases in SWARM_GROUPS.items():
+            lines.append(f"{group}:")
+            for a in aliases:
+                label = SWARM_LABELS.get(a, a)
+                lines.append(f"  /vibe <MA> {a:<18} {label}")
+            lines.append("")
+        lines.append("Vi du: /vibe VCB technical")
+        lines.append("       /vibe HPG investment")
+        lines.append("       /vibe FPT macro")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    valid, symbol = _validate_symbol(context.args[0])
+    if not valid:
+        await update.message.reply_text("Ma khong hop le (VD: VCB, HPG, FPT)."); return
+
+    alias = context.args[1].lower() if len(context.args) > 1 else "technical"
+    if alias not in SWARM_ALIASES:
+        close = [a for a in SWARM_ALIASES if alias in a]
+        tip = f"Y ban noi: {', '.join(close[:3])}?" if close else ""
+        await update.message.reply_text(
+            f"Swarm '{alias}' khong ton tai. {tip}\n"
+            f"Goi /vibe de xem danh sach 29 swarms."
+        ); return
+
+    if not vibe_available():
+        await update.message.reply_text(
+            "Vibe-Trading service OFFLINE.\n"
+            "Kiem tra VIBE_API_URL va Railway deploy."
+        ); return
+
+    # Rate limit cho /vibe (tốn tài nguyên hơn /check)
+    user_id = str(update.effective_user.id) if update.effective_user else "unknown"
+    wait = _check_rate_limit(user_id)
+    if wait > 0:
+        await update.message.reply_text(f"Vui long cho {wait:.0f}s."); return
+    _record_cmd(user_id)
+
+    label = SWARM_LABELS.get(alias, alias)
+    msg = await update.message.reply_text(
+        f"Vibe-Trading: {label}\n"
+        f"Ma: {symbol} | Dang khoi dong agents...\n"
+        f"(Qua trinh co the mat 5-15 phut)"
+    )
+
+    async def _progress(status_str: str):
+        try:
+            await msg.edit_text(
+                f"Vibe-Trading: {label}\n"
+                f"Ma: {symbol}\n\n{status_str}"
+            )
+        except Exception:
+            pass
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            run_id = start_swarm(alias, symbol)
+            if not run_id:
+                return {"status": "error",
+                        "error": "Khong khoi dong duoc swarm. Kiem tra VIBE_API_KEY."}
+            def _sync_cb(s):
+                asyncio.run_coroutine_threadsafe(_progress(s), loop)
+            return poll_swarm(run_id, progress_callback=_sync_cb)
+
+        result = await asyncio.to_thread(_run)
+        output = format_swarm_result(result, symbol, alias)
+        if len(output) > 4000:
+            output = output[:3950] + "\n...[cat bot]"
+        await msg.edit_text(output)
+
+    except Exception as e:
+        logger.error(f"vibe_cmd error: {e}")
+        await msg.edit_text(f"Loi khi chay Vibe-Trading {alias} cho {symbol}: {str(e)[:200]}")
+
+
+async def vibe_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kiểm tra Vibe-Trading service + liệt kê swarms."""
+    if not is_allowed(update): await _deny(update); return
+
+    if not _VIBE_CLIENT:
+        await update.message.reply_text("vibe_client.py chua duoc cai dat."); return
+
+    online  = vibe_available()
+    vibe_url = os.environ.get("VIBE_API_URL", "")
+    lines = [
+        "Vibe-Trading Service:",
+        f"  URL    : {vibe_url[:40]+'...' if len(vibe_url)>40 else vibe_url or 'CHUA SET'}",
+        f"  Status : {'Online' if online else 'OFFLINE'}",
+        f"  API Key: {'Co' if os.environ.get('VIBE_API_KEY') else 'Chua set (dev mode)'}",
+        f"  Swarms : {len(SWARM_ALIASES)} presets / 113 agents",
+        "",
+        "Dung: /vibe <MA> <swarm>",
+        "Xem list: /vibe",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
 def main():
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_TOKEN chua duoc set")
@@ -428,17 +558,19 @@ def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",     start))
-    app.add_handler(CommandHandler("help",      help_cmd))
-    app.add_handler(CommandHandler("watchlist", watchlist_cmd))
-    app.add_handler(CommandHandler("add",       add_cmd))
-    app.add_handler(CommandHandler("remove",    remove_cmd))
-    app.add_handler(CommandHandler("status",    status_cmd))
-    app.add_handler(CommandHandler("debug",     debug_cmd))
-    app.add_handler(CommandHandler("check",     check_cmd))
-    app.add_handler(CommandHandler("scan",      scan_cmd))
-    app.add_handler(CommandHandler("report",    report_cmd))
-    app.add_handler(CommandHandler("history",   history_cmd))
+    app.add_handler(CommandHandler("start",        start))
+    app.add_handler(CommandHandler("help",         help_cmd))
+    app.add_handler(CommandHandler("watchlist",    watchlist_cmd))
+    app.add_handler(CommandHandler("add",          add_cmd))
+    app.add_handler(CommandHandler("remove",       remove_cmd))
+    app.add_handler(CommandHandler("status",       status_cmd))
+    app.add_handler(CommandHandler("debug",        debug_cmd))
+    app.add_handler(CommandHandler("check",        check_cmd))
+    app.add_handler(CommandHandler("scan",         scan_cmd))
+    app.add_handler(CommandHandler("report",       report_cmd))
+    app.add_handler(CommandHandler("history",      history_cmd))
+    app.add_handler(CommandHandler("vibe",         vibe_cmd))
+    app.add_handler(CommandHandler("vibestatus",   vibe_status_cmd))
 
     async def post_init(application):
         asyncio.create_task(_start_cron())
