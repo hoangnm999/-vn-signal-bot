@@ -1176,3 +1176,133 @@ def scan_watchlist(watchlist: list) -> str:
     header = f"📋 Scan Watchlist — {now}\n{'─'*28}{vnindex_line}"
     footer = f"\n\n{'─'*28}\n{spike_section}\n\n/check <MA> de phan tich sau 8 agents"
     return header + "\n".join(results) + footer
+
+
+def analyze_stock_full(symbol: str) -> tuple:
+    """
+    Giống analyze_stock() nhưng trả về tuple (msg, metadata).
+    metadata dùng để lưu DB qua save_signal() trong bot.py.
+    metadata = None nếu có lỗi.
+    """
+    # 1. Thu thập data song song
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        f_price   = ex.submit(get_price_data,        symbol, 90)
+        f_fund    = ex.submit(get_fundamental_data,  symbol)
+        f_foreign = ex.submit(get_foreign_flow_data, symbol)
+        f_market  = ex.submit(get_market_data)
+        f_news    = ex.submit(get_news_data,         symbol)
+        price_data   = f_price.result()
+        fund_data    = f_fund.result()
+        foreign_data = f_foreign.result()
+        market_data  = f_market.result()
+        news_data    = f_news.result()
+
+    if not price_data["success"]:
+        return f"Khong lay duoc du lieu gia {symbol}: {price_data['error']}", None
+
+    try:
+        ind = compute_indicators(price_data["df"])
+    except Exception as e:
+        return f"Loi tinh indicators {symbol}: {e}", None
+
+    # 2. Chạy 8 agent song song
+    try:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            f1 = ex.submit(run_trend_agent,        symbol, ind)
+            f2 = ex.submit(run_volume_agent,       symbol, ind)
+            f3 = ex.submit(run_risk_agent,         symbol, ind)
+            f4 = ex.submit(run_fundamental_agent,  symbol, fund_data)
+            f5 = ex.submit(run_smart_money_agent,  symbol, foreign_data)
+            f6 = ex.submit(run_news_agent,         symbol, news_data)
+            f7 = ex.submit(run_market_regime_agent,        market_data)
+            f8 = ex.submit(run_macro_agent,                news_data)
+            trend_txt,  trend_v  = f1.result()
+            volume_txt, volume_v = f2.result()
+            risk_txt,   risk_v   = f3.result()
+            fund_txt,   fund_v   = f4.result()
+            smart_txt,  smart_v  = f5.result()
+            news_txt,   news_v   = f6.result()
+            market_txt, market_v = f7.result()
+            macro_txt,  macro_v  = f8.result()
+    except Exception as e:
+        return f"Loi khi chay agents {symbol}: {e}", None
+
+    agent_verdicts = {
+        "trend": trend_v, "volume": volume_v, "risk": risk_v,
+        "fundamental": fund_v, "smart_money": smart_v,
+        "news": news_v, "market": market_v,
+    }
+
+    # 3. Verdict
+    try:
+        verdict = run_verdict_agent(symbol, agent_verdicts, ind)
+    except Exception as e:
+        return f"Loi verdict agent {symbol}: {e}", None
+
+    # 4. Format (giống analyze_stock)
+    final_v  = verdict["verdict_label"]
+    conf     = verdict["confidence"]
+    ap       = verdict["action_plan"]
+    summary  = verdict["summary"]
+    negative = verdict["negative"]
+    bull     = verdict["bull_count"]
+    bear     = verdict["bear_count"]
+
+    emoji = {"DONG THUAN MUA": "🟢", "DONG THUAN BAN": "🔴",
+             "PHAN BAC": "🔴", "TRUNG LAP": "🟡"}.get(final_v, "🟡")
+    vnindex_str = (f"{market_data['vnindex']:,} ({market_data['change_5d']:+.1f}% 5D)"
+                   if market_data.get("success") else "N/A")
+    now = datetime.now().strftime("%d/%m %H:%M")
+
+    msg = f"""{emoji} Phan tich {symbol} — {now}
+
+DU LIEU:
+  Gia: {ind['current_price']:,.0f} | 1W: {ind['change_1w_pct']:+.1f}% | 1M: {ind['change_1m_pct']:+.1f}%
+  RSI: {ind['rsi']} | MACD Hist: {ind['macd_hist']:+.4f} | Vol: {ind['volume_ratio']}x
+  Ho tro: {ind['support_20d']:,.0f} | Khang cu: {ind['resistance_20d']:,.0f}
+  VN-Index: {vnindex_str}
+
+8 AGENTS:
+  Xu huong:    {trend_v}
+  Volume:      {volume_v}
+  Rui ro:      {risk_v}
+  Fundamental: {fund_v}
+  Smart Money: {smart_v}
+  News:        {news_v}
+  Market:      {market_v}
+  Macro:       {macro_v}
+
+CHI TIET AGENTS:
+  [Xu huong] {trend_txt}
+  [Volume] {volume_txt}
+  [Rui ro] {risk_txt}
+  [Fundamental] {fund_txt}
+  [Smart Money] {smart_txt}
+  [News] {news_txt}
+  [Market] {market_txt}
+  [Macro] {macro_txt}
+
+{'='*30}
+{emoji} KET LUAN: {final_v}
+CONFIDENCE: {conf}/10 ({bull}/7 bullish, {bear}/7 bearish)
+
+LY DO: {summary}
+
+ACTION PLAN:
+  Entry:  {ap['entry_low']:,} - {ap['entry_high']:,}
+  Target: {ap['tp']:,} ({ap['tp_pct']:+.1f}%)
+  SL:     {ap['sl']:,} ({ap['sl_pct']:+.1f}%)
+  R:R   = 1:{ap['rr']}
+
+CANH BAO: {negative}
+{'='*30}""".strip()
+
+    msg = msg[:4000] + "\n[Cat bot]" if len(msg) > 4000 else msg
+
+    metadata = {
+        "verdict":        verdict,
+        "ind":            ind,
+        "agent_verdicts": agent_verdicts,
+        "macro_v":        macro_v,
+    }
+    return msg, metadata
