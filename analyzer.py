@@ -246,12 +246,15 @@ def get_market_data() -> dict:
     """
     Lấy market regime data dùng _price_from_entrade (đã hoạt động ổn).
     ETF proxy: E1VFVN30 → FUEVFVND → FUESSVFL → VCB fallback
+    Ngoài giờ GD (trước 9h / sau 15h30): lấy data ngày hôm qua vẫn hợp lệ.
     """
     symbols_to_try = [
         ("E1VFVN30", "ETF VN30"),
         ("FUEVFVND", "ETF VNFIN"),
         ("FUESSVFL", "ETF VN30 2"),
         ("VCB",      "Proxy VCB"),
+        ("HPG",      "Proxy HPG"),   # thêm fallback thứ 5
+        ("FPT",      "Proxy FPT"),
     ]
 
     last_err = "Tat ca symbols fail"
@@ -657,16 +660,93 @@ def run_risk_agent(symbol, ind):
     return txt, v
 
 
+# ── Lookup table tên công ty — tránh LLM hallucinate khi chỉ có mã 3 ký tự ──
+_COMPANY_NAMES = {
+    # Ngân hàng
+    "VCB":"Vietcombank", "BID":"BIDV", "CTG":"VietinBank",
+    "TCB":"Techcombank", "MBB":"MB Bank", "VPB":"VPBank",
+    "ACB":"ACB", "HDB":"HDBank", "STB":"Sacombank",
+    "LPB":"LienVietPostBank", "SHB":"SHB", "MSB":"MSB",
+    "TPB":"TPBank", "VIB":"VIB", "EIB":"Eximbank",
+    # Bất động sản
+    "VIC":"Vingroup (tap doan da nganh: BDS, o to VinFast, ban le)",
+    "VHM":"Vinhomes (BDS Vingroup)", "VRE":"Vincom Retail",
+    "NVL":"Novaland", "PDR":"Phat Dat Real Estate",
+    "DXG":"Dat Xanh Group", "KDH":"Khang Dien",
+    "BCM":"Becamex IDC",
+    # Thép
+    "HPG":"Hoa Phat Group (thep)", "HSG":"Hoa Sen Group (ton thep)",
+    "NKG":"Thep Nam Kim", "TLH":"Thep Tien Len",
+    # Công nghệ
+    "FPT":"Tap doan FPT (CNTT, vien thong, giao duc)",
+    "CMG":"Tap doan CMC", "VGI":"Viettel Global",
+    # Bán lẻ
+    "MWG":"The Gioi Di Dong (ban le dien may, duoc pham Long Chau)",
+    "PNJ":"PNJ (vang bac da quy)", "FRT":"FPT Retail",
+    "DGW":"Digiworld",
+    # Thực phẩm
+    "VNM":"Vinamilk", "SAB":"Sabeco (bia)", "MSN":"Masan Group",
+    "KDC":"Kido Group (thuc pham)", "MCH":"Masan Consumer",
+    # Năng lượng
+    "GAS":"PV GAS (khi dot)", "PLX":"Petrolimex (xang dau)",
+    "POW":"PV Power (dien luc)", "PVD":"PV Drilling (khoan dau khi)",
+    "BSR":"Binh Son Refining (loc hoa dau)",
+    # Hàng không / Cảng / Vận tải
+    "HVN":"Vietnam Airlines", "ACV":"ACV (cang hang khong)",
+    "GMD":"Gemadept (cang bien logistics)",
+    "HAH":"Hai An Transport (van tai container)",
+    "DVP":"Cang Dinh Vu - CTCP Cang Dinh Vu (cang container tai Hai Phong, KHONG PHAI duoc pham)",
+    "PHP":"Cang Hai Phong", "VSC":"Container Viet Nam",
+    "TCO":"Cang Tan Cuong (TP HCM)",
+    # Chứng khoán
+    "SSI":"SSI Securities", "VND":"VNDirect",
+    "HCM":"HSC (Chung khoan TP HCM)", "VCI":"Viet Capital Securities",
+    "MBS":"MB Securities",
+    # Điện / Tiện ích
+    "REE":"REE Corporation (co dien lanh, dien)", "PC1":"PC1 Group (xay lap dien)",
+    "GEG":"Gia Lai Electricity",
+    # Xây dựng
+    "CTD":"Coteccons (xay dung)", "HBC":"Hoa Binh Construction",
+    "VCS":"Vicostone (da thach anh nhan tao)",
+    # Nông nghiệp / Thủy sản
+    "VHC":"Vinh Hoan (xuat khau ca tra)",
+    "ANV":"Nam Viet (ca tra)", "IDI":"IDI Corporation (thuy san)",
+    # Dược phẩm (NOTE: DVP ≠ dược — DVP là cảng)
+    "DHG":"DHG Pharma (duoc Hau Giang)",
+    "IMP":"Imexpharm", "DMC":"Domesco",
+    "DVN":"Davipharm - Tong Cong ty Duoc Viet Nam (ma DVN, KHONG PHAI DVP)",
+    "TRA":"Traphaco (duoc pham)",
+}
+
+def _get_company_name(symbol: str) -> str:
+    """Lấy tên công ty từ lookup table, fallback vnstock."""
+    if symbol in _COMPANY_NAMES:
+        return _COMPANY_NAMES[symbol]
+    try:
+        from vnstock import Vnstock
+        info = Vnstock().stock(symbol=symbol, source="VCI").company.overview()
+        if info is not None and not info.empty:
+            row = info.iloc[0]
+            name = str(row.get("short_name", symbol))
+            ind  = str(row.get("industry_name", ""))
+            return f"{name} - nganh {ind}" if ind else name
+    except Exception:
+        pass
+    return f"Ma {symbol} (chua co trong lookup table — can xac minh ten cong ty)"
+
+
 def run_fundamental_agent(symbol, fund):
     if not fund.get("success"):
         return f"Khong lay duoc fundamental: {fund.get('error','')}", "TRUNG TINH"
+
+    company_name = _get_company_name(symbol)
 
     # Nếu có data thực từ API
     if fund.get("source") in ("vnstock KBS", "Entrade"):
         sys_p = ("Ban la chuyen gia phan tich co ban co phieu VN. "
                  "Danh gia suc khoe tai chinh dua tren PE, PB, ROE, tang truong. "
                  "Dong cuoi PHAI la — Ket luan: TOT hoac TRUNG TINH hoac YEU")
-        user = (f"Co phieu: {symbol}\n"
+        user = (f"Co phieu: {symbol} | Ten cong ty: {company_name}\n"
                 f"PE: {fund['pe']} | PB: {fund['pb']} | ROE: {fund['roe']}%\n"
                 f"EPS: {fund['eps']:,} | Tang truong DT: {fund['revenue_growth']:+.1f}%\n"
                 f"Tang truong LN: {fund['profit_growth']:+.1f}% | No/Von: {fund['debt_equity']}\n"
@@ -675,22 +755,22 @@ def run_fundamental_agent(symbol, fund):
         v = "TOT" if "TOT" in txt.upper() else "YEU" if "YEU" in txt.upper() else "TRUNG TINH"
         return txt, v
 
-    # Không có API data — dùng LLM knowledge về công ty
-    sys_p = ("Ban la chuyen gia tai chinh voi kien thuc sau ve cac cong ty niem yet tren HOSE/HNX Viet Nam. "
-             "Dua tren kien thuc co san cua ban ve cong ty nay (ket qua kinh doanh, vi the nganh, xu huong gan day), "
-             "hay danh gia suc khoe co ban. "
-             "Luu y ro rang day la danh gia dua tren kien thuc LLM, khong phai real-time data. "
+    # Không có API data — dùng LLM knowledge, BẮT BUỘC dùng đúng tên công ty
+    sys_p = ("Ban la chuyen gia tai chinh co kien thuc ve cac cong ty niem yet tren HOSE/HNX. "
+             "QUAN TRONG: Phan tich dung cong ty duoc neu trong prompt. "
+             "Neu khong co du thong tin chinh xac, phai noi ro 'khong du thong tin'. "
+             "TUYET DOI KHONG duoc nham lan voi cong ty khac co ma tuong tu. "
              "Dong cuoi PHAI la — Ket luan: TOT hoac TRUNG TINH hoac YEU")
     user = (f"Co phieu: {symbol}\n"
-            "Khong co real-time financial API data. "
-            "Dua tren kien thuc cua ban ve {symbol}: nganh nghe, lich su KQKD, vi the canh tranh, "
-            "cac chi so tai chinh thuong thay, hay danh gia fundamental 2-3 cau. "
-            "Neu khong biet ro thi noi ro la khong co du thong tin. "
-            "Ket luan: TOT/TRUNG TINH/YEU")
-    user = user.replace("{symbol}", symbol)
-    txt = call_deepseek(sys_p, user)
+            f"Ten cong ty chinh xac: {company_name}\n"
+            f"Khong co real-time financial data.\n"
+            f"Dua tren kien thuc ve DUNG cong ty '{company_name}' (ma {symbol}): "
+            f"nganh nghe, vi the canh tranh, lich su KQKD, danh gia fundamental 2-3 cau. "
+            f"Neu khong biet ro ve cong ty nay thi noi 'Khong du thong tin de danh gia'. "
+            f"Ket luan: TOT/TRUNG TINH/YEU")
+    txt = call_deepseek(sys_p, user, max_tokens=400)
     v = "TOT" if "TOT" in txt.upper() else "YEU" if "YEU" in txt.upper() else "TRUNG TINH"
-    return txt + " [LLM knowledge, khong co real-time data]", v
+    return txt + f" [LLM knowledge - {company_name}]", v
 
 
 def run_smart_money_agent(symbol, foreign):
