@@ -196,20 +196,25 @@ def get_foreign_flow_data(symbol: str) -> dict:
         sell_signal = float(((recent_chg < 0) * recent_vr.clip(0, 3)).mean())
         net_signal  = round(buy_signal - sell_signal, 3)
 
+        # avg_trade_val = giá trị giao dịch TB ngày (đơn vị: tỷ VND)
+        # volume tính bằng cp, close tính bằng VND/cp
+        # volume * close = VND → /1e9 = tỷ VND
         avg_trade_val = float((volume * close).tail(20).mean()) / 1e9
 
+        # net_signal là tỉ lệ [-1, 1] → nhân với avg_trade_val để ra tỷ VND thực tế
+        # Không nhân thêm scale factor nhỏ — đó là nguyên nhân ra số ~0.01
         net_20d_series = ((price_chg > 0) * vol_ratio.clip(0, 3) -
                           (price_chg < 0) * vol_ratio.clip(0, 3)).tail(20)
-        net_est_20d = round(float(net_20d_series.mean()) * avg_trade_val * 0.3, 2)
-        net_est_5d  = round(net_signal * avg_trade_val * 0.3, 2)
+        net_est_20d = round(float(net_20d_series.mean()) * avg_trade_val, 2)
+        net_est_5d  = round(net_signal * avg_trade_val, 2)
 
         return {
             "success":   True,
-            "net_today": round(net_signal * avg_trade_val * 0.15, 2),
+            "net_today": round(net_signal * avg_trade_val, 2),
             "net_5d":    net_est_5d,
             "net_20d":   net_est_20d,
             "source":    "volume_proxy",
-            "note":      "uoc tinh tu volume-price pattern",
+            "note":      "uoc tinh tu volume-price pattern (don vi: ty VND)",
         }
     except Exception as e:
         return {"success": False, "error": str(e)[:120]}
@@ -265,20 +270,27 @@ def get_market_data() -> dict:
 
             raw = r.json()
 
-            # Debug: log tất cả keys và sample values
             if isinstance(raw, dict):
                 # Entrade keys: t=time, o=open, h=high, l=low, c=close, v=volume
-                # Tìm key close price (c hoặc close)
                 close_list = None
                 for k in ["c", "close", "Close"]:
                     if k in raw and isinstance(raw[k], list):
-                        vals = [float(x) for x in raw[k] if x is not None and str(x) not in ("0","0.0","")]
+                        # Chỉ bỏ None và giá trị âm
+                        # KHÔNG lọc "0" vì ETF có giá hợp lệ dạng 14.xx (nghìn đồng)
+                        vals = []
+                        for x in raw[k]:
+                            try:
+                                v = float(x)
+                                if v > 0:
+                                    vals.append(v)
+                            except (TypeError, ValueError):
+                                continue
                         if len(vals) >= 5:
                             close_list = vals
                             break
 
                 if not close_list:
-                    last_err = f"{symbol}: khong co close data, keys={list(raw.keys())[:6]}"
+                    last_err = f"{symbol}: khong co close data hop le, keys={list(raw.keys())[:6]}"
                     continue
 
                 close = pd.Series(close_list, dtype=float)
@@ -734,10 +746,24 @@ def run_smart_money_agent(symbol, foreign):
 
 
 _MACRO_KEYWORDS = [
-    "lai suat", "lãi suất", "ty gia", "tỷ giá", "fed", "sbv", "ngan hang nha nuoc",
-    "tin dung", "tín dụng", "lam phat", "lạm phát", "gdp", "tang truong kinh te",
-    "chinh sach tien te", "room tin dung", "usd", "vnd", "ndt", "cung tien",
-    "trai phieu", "trái phiếu", "ls dieu hanh", "bơm tiền", "hut tien",
+    # Lãi suất
+    "lai suat", "lãi suất", "ls dieu hanh", "ls co ban", "lai suat tiet kiem",
+    "lai suat cho vay", "ngan hang nha nuoc", "sbv", "nhnn",
+    # Tỷ giá
+    "ty gia", "tỷ giá", "usd", "vnd", "usd/vnd", "gia dollar", "gia usd",
+    "ty gia ngoai te", "ngoai te",
+    # Fed / quốc tế
+    "fed", "federal reserve", "lai suat my", "powell", "fomc",
+    # Tín dụng / tiền tệ
+    "tin dung", "tín dụng", "room tin dung", "cung tien", "bom tien", "hut tien",
+    "thi truong mo", "nghiep vu thi truong mo",
+    # Lạm phát / kinh tế
+    "lam phat", "lạm phát", "cpi", "gdp", "tang truong kinh te",
+    "chinh sach tien te", "vi mo", "kinh te vi mo",
+    # Trái phiếu
+    "trai phieu", "trái phiếu", "trai phieu chinh phu", "lai suat trai phieu",
+    # Ngân hàng / tín dụng
+    "von hoa ngan hang", "an toan von", "basel", "car",
 ]
 
 def _extract_macro_headlines(headlines: list) -> list:
@@ -753,23 +779,59 @@ def _extract_macro_headlines(headlines: list) -> list:
 def run_macro_agent(news: dict) -> tuple:
     """
     Macro Agent — đánh giá môi trường vĩ mô từ RSS headlines có sẵn.
-    Filter keyword: lãi suất, tỷ giá, Fed, SBV, tín dụng, lạm phát...
-    Trả về: (text, label) với label = THUAN LOI / TRUNG TINH / RUI RO
+    Nếu không đủ tin → fetch thêm RSS VnEconomy macro.
     """
-    if not news.get("success"):
-        return "Khong co du lieu macro", "TRUNG TINH"
+    import urllib.parse, re
 
-    macro_headlines = _extract_macro_headlines(news.get("headlines", []))
+    RSS_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (compatible; Feedfetcher-Google)",
+        "Accept": "application/rss+xml, application/xml, */*",
+    }
+
+    def _parse_rss_titles(url):
+        try:
+            r = requests.get(url, headers=RSS_HEADERS, timeout=8)
+            if r.status_code != 200:
+                return []
+            text  = r.text
+            titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", text, re.DOTALL)
+            if not titles:
+                titles = re.findall(r"<title>(.*?)</title>", text, re.DOTALL)
+            titles = [re.sub(r"<[^>]+>", "", t).strip() for t in titles if len(t.strip()) > 15]
+            return titles[1:8]   # bỏ title đầu (tên feed)
+        except Exception:
+            return []
+
+    # Bước 1: filter từ headlines chung
+    macro_headlines = _extract_macro_headlines(news.get("headlines", [])) if news.get("success") else []
+
+    # Bước 2: nếu < 3 tin → fetch thêm RSS macro riêng
+    if len(macro_headlines) < 3:
+        extra = []
+        macro_rss_sources = [
+            "https://vneconomy.vn/tai-chinh.rss",
+            "https://vneconomy.vn/ngan-hang.rss",
+            "https://cafef.vn/rss/vi-mo-dau-tu.rss",
+            (f"https://news.google.com/rss/search?q="
+             f"{urllib.parse.quote('lai suat ty gia SBV ngan hang nha nuoc')}"
+             f"&hl=vi&gl=VN&ceid=VN:vi"),
+        ]
+        for url in macro_rss_sources:
+            titles = _parse_rss_titles(url)
+            extra.extend([f"[Macro] {t}" for t in titles])
+            if len(macro_headlines) + len(extra) >= 5:
+                break
+        macro_headlines = macro_headlines + extra
 
     if not macro_headlines:
-        return "Khong tim thay tin tuc macro trong ky (lai suat, ty gia, SBV...)", "TRUNG TINH"
+        return "Khong co tin tuc macro trong phien nay — moi truong vi mo chua xac dinh", "TRUNG TINH"
 
-    headlines_text = "\n".join(f"- {h}" for h in macro_headlines[:10])
+    headlines_text = "\n".join(f"- {h}" for h in macro_headlines[:12])
     sys_p = (
         "Ban la chuyen gia kinh te vi mo Viet Nam. "
-        "Danh gia moi truong vi mo (lai suat, ty gia, chinh sach SBV/Fed, tin dung) "
+        "Danh gia moi truong vi mo (lai suat, ty gia, chinh sach SBV/Fed, tin dung, lam phat) "
         "anh huong den TTCK Viet Nam. "
-        "Format bat buoc:\n"
+        "Format bat buoc (2 dong, khong them gi khac):\n"
         "NHAN XET: <2 cau tom tat tin hieu vi mo>\n"
         "MACRO: THUAN LOI hoac TRUNG TINH hoac RUI RO"
     )
@@ -797,30 +859,41 @@ def run_news_agent(symbol, news):
              "dien dan trader (f319), mang xa hoi trader (Fireant), "
              "bao cao CTCK (VCSC/HSC/ACBS/VNDIRECT/SSI). "
              "Bao cao CTCK co trong so CAO HON y kien ca nhan. "
-             "Dong cuoi PHAI la — Ket luan: TICH CUC hoac TRUNG TINH hoac TIEU CUC")
+             "Dong cuoi PHAI la mot trong 3 lua chon sau (viet chinh xac):\n"
+             "Ket luan: TICH CUC\n"
+             "Ket luan: TRUNG TINH\n"
+             "Ket luan: TIEU CUC")
     user = (f"Co phieu: {symbol}\n{source_note}\n\n"
             f"Noi dung thu thap:\n{headlines_text}\n\n"
-            "Phan tich 3-4 cau. Ket luan: TICH CUC/TRUNG TINH/TIEU CUC")
+            "Phan tich 2-3 cau. Dong cuoi: Ket luan: TICH CUC hoac TRUNG TINH hoac TIEU CUC")
     txt = call_deepseek(sys_p, user, max_tokens=350)
-    v = ("TICH CUC" if "TICH CUC" in txt.upper() else
-         "TIEU CUC" if "TIEU CUC" in txt.upper() else "TRUNG TINH")
+    u = txt.upper()
+    if "TICH CUC" in u or "TÍCH CỰC" in u or "POSITIVE" in u:
+        v = "TICH CUC"
+    elif "TIEU CUC" in u or "TIÊU CỰC" in u or "NEGATIVE" in u:
+        v = "TIEU CUC"
+    else:
+        v = "TRUNG TINH"
     return txt, v
 
 
 def run_market_regime_agent(market):
     if not market.get("success"):
-        return f"⚠️ Không lấy được data thị trường: {market.get('error','')}", "SIDEWAYS"
-    sys_p = ("Bạn là chuyên gia phân tích vĩ mô TTCK VN. "
-             "Xác định market regime dựa trên VN-Index. "
-             "Dòng cuối PHẢI là — Kết luận: UPTREND hoặc DOWNTREND hoặc SIDEWAYS")
-    ma50_str = (f"Trên MA50: {'Có' if market.get('above_ma50') else 'Không'}"
+        return f"Khong lay duoc data thi truong: {market.get('error','')}", "SIDEWAYS"
+    sys_p = ("Ban la chuyen gia phan tich vi mo TTCK VN. "
+             "Xac dinh market regime dua tren VN-Index proxy (ETF VN30). "
+             "Dong cuoi PHAI la mot trong 3 lua chon (viet chinh xac):\n"
+             "Ket luan: UPTREND\n"
+             "Ket luan: DOWNTREND\n"
+             "Ket luan: SIDEWAYS")
+    ma50_str = (f"Tren MA50: {'Co' if market.get('above_ma50') else 'Khong'}"
                 if market.get("above_ma50") is not None else "MA50: N/A")
-    user = (f"VN-Index: {market['vnindex']:,}\n"
-            f"Thay đổi 5 phiên: {market['change_5d']:+.2f}%\n"
-            f"Thay đổi 20 phiên: {market['change_20d']:+.2f}%\n"
-            f"Trên MA20: {'Có' if market['above_ma20'] else 'Không'} (MA20: {market['ma20']:,})\n"
+    user = (f"VN-Index proxy: {market['vnindex']:,}\n"
+            f"Thay doi 5 phien: {market['change_5d']:+.2f}%\n"
+            f"Thay doi 20 phien: {market['change_20d']:+.2f}%\n"
+            f"Tren MA20: {'Co' if market['above_ma20'] else 'Khong'} (MA20: {market['ma20']:,})\n"
             f"{ma50_str}\n"
-            "Đánh giá 2-3 câu. Kết luận: UPTREND/DOWNTREND/SIDEWAYS")
+            "Danh gia 2-3 cau. Dong cuoi: Ket luan: UPTREND hoac DOWNTREND hoac SIDEWAYS")
     txt = call_deepseek(sys_p, user)
     v = "UPTREND" if "UPTREND" in txt.upper() else "DOWNTREND" if "DOWNTREND" in txt.upper() else "SIDEWAYS"
     return txt, v
@@ -877,27 +950,50 @@ def run_verdict_agent(symbol, verdicts, ind):
     else:
         verdict_label = "TRUNG LẬP"
 
-    # ── Action Plan từ indicators có sẵn ─────────────────────────────────────
+    # ── Action Plan — tính dựa trên ATR để tránh SL vô lý ──────────────────
     price   = ind["current_price"]
     support = ind["support_20d"]
     resist  = ind["resistance_20d"]
     bb_low  = ind["bb_lower"]
     bb_up   = ind["bb_upper"]
 
-    # Entry: giữa giá hiện tại và BB_lower (vùng hợp lý để chờ pullback)
-    entry_low  = round(max(support, bb_low) * 1.005, 0)   # +0.5% trên support
-    entry_high = round(price * 1.005, 0)                   # ngay trên giá hiện tại
+    # ATR proxy: dùng (bb_upper - bb_lower) / 4 làm đơn vị rủi ro
+    atr_proxy = (bb_up - bb_low) / 4.0
+    if atr_proxy <= 0:
+        atr_proxy = price * 0.03   # fallback: 3% giá
 
-    # SL: dưới support 20D hoặc BB Lower (lấy mức thấp hơn)
-    sl = round(min(support, bb_low) * 0.985, 0)            # -1.5% dưới support
+    # SL: giá hiện tại - 1.5x ATR (không dùng support_20d vì có thể quá xa)
+    sl_atr = round(price - 1.5 * atr_proxy, 0)
+    # Nếu support_20d gần hơn (trong vòng 15% giá) thì dùng support
+    if support >= price * 0.85:
+        sl = round(min(sl_atr, support * 0.985), 0)
+    else:
+        sl = sl_atr   # support quá xa → chỉ dùng ATR
 
-    # TP: kháng cự 20D hoặc BB Upper
-    tp = round(max(resist, bb_up) * 0.995, 0)              # sát dưới kháng cự
+    # TP: kháng cự 20D hoặc BB Upper (lấy cái nào gần hơn và hợp lý)
+    tp_candidate = max(resist, bb_up)
+    # Nếu TP quá gần (< 2% upside) → dùng 2x ATR từ giá hiện tại
+    if tp_candidate < price * 1.02:
+        tp = round(price + 2.0 * atr_proxy, 0)
+    else:
+        tp = round(tp_candidate * 0.995, 0)
+
+    # Entry: vùng hợp lý quanh giá hiện tại (không kéo về support xa)
+    entry_low  = round(price * 0.99, 0)    # -1% giá hiện tại
+    entry_high = round(price * 1.01, 0)    # +1% giá hiện tại
 
     # R:R
     risk   = price - sl
     reward = tp - price
     rr     = round(reward / risk, 1) if risk > 0 else 0
+
+    # Cap SL pct để không hiển thị SL vô lý > 15%
+    sl_pct = round((sl - price) / price * 100, 1)
+    if sl_pct < -15:
+        sl     = round(price * 0.92, 0)   # force SL tối đa -8%
+        sl_pct = round((sl - price) / price * 100, 1)
+        risk   = price - sl
+        rr     = round(reward / risk, 1) if risk > 0 else 0
 
     action_plan = {
         "entry_low":  int(entry_low),
@@ -905,7 +1001,7 @@ def run_verdict_agent(symbol, verdicts, ind):
         "tp":         int(tp),
         "sl":         int(sl),
         "tp_pct":     round((tp - price) / price * 100, 1),
-        "sl_pct":     round((sl - price) / price * 100, 1),
+        "sl_pct":     sl_pct,
         "rr":         rr,
     }
 
