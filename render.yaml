@@ -1,0 +1,28 @@
+services:
+  - type: worker          # worker = chạy nền 24/7, không cần HTTP port
+    name: vn-signal-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: starter         # $7/tháng — chạy 24/7 không ngủ
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false       # điền tay trong Render dashboard
+      - key: CHAT_ID
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: VNAI_API_KEY
+        sync: false
+      - key: WATCHLIST
+        value: VCB,HPG,FPT,VNM,MWG,TCB
+      - key: DATABASE_URL
+        sync: false       # lấy từ PostgreSQL service bên dưới
+
+databases:
+  - name: vn-signal-db
+    plan: free            # PostgreSQL free — 1GB, đủ dùng
+    databaseName: vntrader
+    user: vntrader
