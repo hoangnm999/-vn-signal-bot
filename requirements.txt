@@ -1,0 +1,5 @@
+python-telegram-bot==22.7
+vnstock==3.5.1
+requests==2.31.0
+pandas==2.2.3
+psycopg2-binary==2.9.9
