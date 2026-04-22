@@ -6,6 +6,14 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
+# ── Vibe-Trading 10 engines (candlestick, ichimoku, smc, elliott, harmonic,
+#    technical-basic, volatility, seasonal, cross-market, multi-factor) ───────
+try:
+    from vibe_skills import run_vibe_agents as _run_vibe
+    _VIBE_AVAILABLE = True
+except Exception:
+    _VIBE_AVAILABLE = False
+
 DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY")
 DEEPSEEK_URL      = "https://api.deepseek.com/v1/chat/completions"
 VNAI_API_KEY      = os.environ.get("VNAI_API_KEY", "")
@@ -771,14 +779,17 @@ def call_deepseek(system_prompt: str, user_prompt: str, max_tokens: int = 300) -
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6 AGENTS + VERDICT
+# VIBE-TRADING AGENTS (HKUDS) — 7 engines thuần pandas
+# Source: github.com/HKUDS/Vibe-Trading
+# File:   vibe_skills.py (deploy cùng project)
 # ══════════════════════════════════════════════════════════════════════════════
+try:
+    from vibe_skills import run_vibe_agents as _run_vibe_agents
+    _VIBE_AVAILABLE = True
+except ImportError:
+    _VIBE_AVAILABLE = False
 
-# ══════════════════════════════════════════════════════════════════════════════
-# RULE-BASED AGENTS — Deterministic, không LLM, không hallucinate
-# Agents còn lại: Trend, Volume, Risk, News, Market, Macro (6 agents)
-# Loại bỏ: Fundamental (hallucinate), Smart Money (data không chính xác)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Context agents: Market Regime + News + Macro (dùng network data) ─────────
 
 def run_trend_agent(symbol, ind):
     """
@@ -1249,7 +1260,7 @@ def _build_message_safe(
             # Nếu cả short cũng không vừa → bỏ qua agent này
 
     detail_section = detail_header + "\n".join(detail_parts)
-    return header + detail_section + footer
+    return header + detail_section + vibe_section + footer
 
 
 def _fmt_price(p):
@@ -1451,142 +1462,217 @@ def run_verdict_agent(symbol, verdicts, ind):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PUBLIC API
+# PUBLIC API — dùng Vibe-Trading engines thay thế hoàn toàn agents cũ
 # ══════════════════════════════════════════════════════════════════════════════
 
-def analyze_stock(symbol: str) -> str:
-    # 1. Thu thập data (bỏ fundamental và foreign_flow)
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        f_price  = ex.submit(get_price_data,  symbol, 90)
-        f_market = ex.submit(get_market_data)
-        f_news   = ex.submit(get_news_data,   symbol)
-        price_data  = f_price.result()
-        market_data = f_market.result()
-        news_data   = f_news.result()
+def _vibe_verdict(vibe: dict, ind: dict, market: dict, news: dict) -> dict:
+    """
+    Tổng hợp verdict từ kết quả Vibe-Trading engines.
+    Thêm 2 context signals: Market Regime + News Sentiment.
+    """
+    signals = dict(vibe["signals"])  # 7 Vibe signals
 
-    if not price_data["success"]:
-        return f"Khong lay duoc du lieu gia {symbol}: {price_data['error']}"
+    # ── Context signal: Market Regime ─────────────────────────────────────
+    if market.get("success"):
+        chg_5d  = market["change_5d"]
+        above   = market.get("above_ma20", False)
+        chg_20d = market.get("change_20d", 0)
+        bull_mkt = sum([chg_5d > 1, chg_20d > 3, above])
+        bear_mkt = sum([chg_5d < -1, chg_20d < -3, not above])
+        if bull_mkt >= 2:   signals["MarketRegime"] = 1
+        elif bear_mkt >= 2: signals["MarketRegime"] = -1
+        else:               signals["MarketRegime"] = 0
+    else:
+        signals["MarketRegime"] = 0
 
-    try:
-        ind = compute_indicators(price_data["df"])
-    except Exception as e:
-        return f"Loi tinh indicators {symbol}: {e}"
+    # ── Context signal: News Sentiment ────────────────────────────────────
+    if news.get("success") and news.get("headlines"):
+        text_all = " ".join(news["headlines"]).lower()
+        pos = sum(1 for kw in [
+            "tang","loi nhuan","tang truong","ket qua tot","tich cuc",
+            "mua vao","co tuc","hop dong lon","vuot ke hoach","dot pha",
+        ] if kw in text_all)
+        neg = sum(1 for kw in [
+            "giam","thua lo","sut giam","tieu cuc","ban ra","rui ro",
+            "canh bao","vi pham","no xau","mat thanh khoan","sa thai",
+        ] if kw in text_all)
+        if pos > neg * 1.5:   signals["NewsSentiment"] = 1
+        elif neg > pos * 1.5: signals["NewsSentiment"] = -1
+        else:                 signals["NewsSentiment"] = 0
+    else:
+        signals["NewsSentiment"] = 0
 
-    # 2. Chạy 6 agents rule-based song song
-    try:
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            f1 = ex.submit(run_trend_agent,         symbol, ind)
-            f2 = ex.submit(run_volume_agent,        symbol, ind)
-            f3 = ex.submit(run_risk_agent,          symbol, ind)
-            f4 = ex.submit(run_news_agent,          symbol, news_data)
-            f5 = ex.submit(run_market_regime_agent, market_data)
-            f6 = ex.submit(run_macro_agent,         news_data)
-            trend_txt,  trend_v  = f1.result()
-            volume_txt, volume_v = f2.result()
-            risk_txt,   risk_v   = f3.result()
-            news_txt,   news_v   = f4.result()
-            market_txt, market_v = f5.result()
-            macro_txt,  macro_v  = f6.result()
-    except Exception as e:
-        return f"Loi khi chay agents {symbol}: {e}"
+    # ── Tổng hợp vote ─────────────────────────────────────────────────────
+    n_active = len(signals)
+    bull = sum(1 for v in signals.values() if v > 0)
+    bear = sum(1 for v in signals.values() if v < 0)
+    majority = n_active / 2
 
-    # 3. Verdict rule-based
-    try:
-        verdict = run_verdict_agent(symbol, {
-            "trend": trend_v, "volume": volume_v, "risk": risk_v,
-            "news": news_v, "market": market_v, "macro": macro_v,
-        }, ind)
-    except Exception as e:
-        return f"Loi verdict {symbol}: {e}"
+    if bull > majority and bear == 0:
+        verdict_label = "DONG THUAN MUA"
+    elif bull > majority:
+        verdict_label = "NGHIENG MUA"
+    elif bear > majority and bull == 0:
+        verdict_label = "DONG THUAN BAN"
+    elif bear > majority:
+        verdict_label = "NGHIENG BAN"
+    else:
+        verdict_label = "TRUNG LAP"
 
-    # 4. Format
-    final_v  = verdict["verdict_label"]
-    conf_pct = verdict["confidence_pct"]
-    ap       = verdict["action_plan"]
-    summary  = verdict["summary"]
-    negative = verdict["negative"]
-    bull     = verdict["bull_count"]
-    bear     = verdict["bear_count"]
-    n_agents = verdict["active_agents"]
+    conf_pct = round(max(bull, bear) / n_active * 100)
 
-    emoji = {
-        "DONG THUAN MUA": "🟢", "NGHIENG MUA": "🟢",
-        "DONG THUAN BAN": "🔴", "NGHIENG BAN": "🔴",
-        "TRUNG LAP": "🟡",
-    }.get(final_v, "🟡")
+    # ── Action Plan (ATR-based) ───────────────────────────────────────────
+    price  = ind["current_price"]
+    bb_up  = ind["bb_upper"]; bb_low = ind["bb_lower"]
+    sup    = ind["support_20d"]; res = ind["resistance_20d"]
+    atr    = (bb_up - bb_low) / 4.0 or price * 0.03
 
-    vnindex_str = (f"{market_data['vnindex']:,} ({market_data['change_5d']:+.1f}% 5D)"
-                   if market_data.get("success") else "N/A")
-    now = datetime.now().strftime("%d/%m %H:%M")
+    sl_raw = price - 1.5 * atr
+    sl     = round(min(sl_raw, sup * 0.985), 2) if sup >= price * 0.85 else round(sl_raw, 2)
+    tp_cand = max(res, bb_up)
+    tp     = round(price + 2.0 * atr, 2) if tp_cand < price * 1.02 else round(tp_cand * 0.995, 2)
+    e_lo   = round(price * 0.99, 2); e_hi = round(price * 1.01, 2)
+    if tp <= e_hi * 1.02: tp = round(e_hi * 1.03 + 2.0 * atr, 2)
+    sl_pct = round((sl - price) / price * 100, 1)
+    if sl_pct < -15: sl = round(price * 0.92, 2); sl_pct = round((sl - price) / price * 100, 1)
+    risk   = price - sl; reward = tp - price
+    rr     = round(reward / risk, 1) if risk > 0 else 0
 
-    agents_list = [
-        ("Xu huong", trend_v,  trend_txt),
-        ("Volume",   volume_v, volume_txt),
-        ("Rui ro",   risk_v,   risk_txt),
-        ("News",     news_v,   news_txt),
-        ("Market",   market_v, market_txt),
-        ("Macro",    macro_v,  macro_txt),
-    ]
+    action_plan = {
+        "entry_low": e_lo, "entry_high": e_hi,
+        "tp": tp, "sl": sl,
+        "tp_pct": round((tp - price) / price * 100, 1),
+        "sl_pct": sl_pct, "rr": rr,
+    }
 
-    return _build_message_safe_v2(
-        emoji, symbol, now, ind, vnindex_str,
-        agents_list, final_v, conf_pct, bull, bear, n_agents,
-        summary, ap, negative,
+    # ── LLM summary (chỉ viết 2 câu, không vote) ─────────────────────────
+    bull_agents = [k for k,v in signals.items() if v > 0]
+    bear_agents = [k for k,v in signals.items() if v < 0]
+    sys_p = (
+        "Viet 2 dong tom tat phan tich co phieu bang tieng Viet khong dau. "
+        "Chi dua tren du lieu duoc cung cap, KHONG them thong tin moi. "
+        "Format:\nSUMMARY: <2 cau mo ta ket qua agents>\nNEGATIVE: <1 cau rui ro chinh>"
     )
+    user_p = (
+        f"Co phieu: {ind.get('symbol','?')} | Gia: {_fmt_price(price)}\n"
+        f"Vibe-Trading 7 engines + 2 context: {bull}/{n_active} bullish, {bear}/{n_active} bearish\n"
+        f"Agents ung ho: {', '.join(bull_agents) or 'khong co'}\n"
+        f"Agents phan doi: {', '.join(bear_agents) or 'khong co'}\n"
+        f"RSI={ind['rsi']}, Vol={ind['volume_ratio']}x, "
+        f"Market={'UP' if signals.get('MarketRegime',0)>0 else 'DOWN' if signals.get('MarketRegime',0)<0 else 'SIDE'}"
+    )
+    try:
+        llm_txt = call_deepseek(sys_p, user_p, max_tokens=200)
+        summary = neg_txt = ""
+        for line in llm_txt.splitlines():
+            ls = line.strip()
+            if ls.upper().startswith("SUMMARY:"): summary = ls[8:].strip()
+            elif ls.upper().startswith("NEGATIVE:"): neg_txt = ls[9:].strip()
+        if not summary: summary = llm_txt[:150].strip()
+    except Exception:
+        summary = f"Vibe-Trading {bull}/{n_active} bullish, {bear}/{n_active} bearish."
+        neg_txt = ""
+
+    if not neg_txt:
+        parts = []
+        if ind["volume_ratio"] < 0.7: parts.append(f"vol thap {ind['volume_ratio']}x")
+        if ind["rsi"] > 68: parts.append(f"RSI={ind['rsi']} overbought")
+        if bear > 0: parts.append(f"{bear} agents phan doi")
+        neg_txt = "Luu y: " + ", ".join(parts) if parts else "Theo doi them tin hieu xac nhan."
+
+    return {
+        "verdict_label": verdict_label, "confidence_pct": conf_pct,
+        "bull_count": bull, "bear_count": bear, "active_agents": n_active,
+        "signals": signals,
+        "summary": summary, "negative": neg_txt, "action_plan": action_plan,
+    }
 
 
-def _build_message_safe_v2(
+def _build_vibe_message(
     emoji, symbol, now, ind, vnindex_str,
-    agents_list,  # list of (label, verdict, txt)
-    final_v, conf_pct, bull, bear, n_agents,
-    summary, ap, negative,
+    vibe: dict, verdict: dict,
     char_limit: int = 4000
 ) -> str:
-    """Build message với 6 agents, smart truncate, footer luôn nguyên vẹn."""
+    """Build Telegram message với kết quả Vibe-Trading 7+2 agents."""
+    ap  = verdict["action_plan"]
+    fv  = verdict["verdict_label"]
+    pct = verdict["confidence_pct"]
+    bull = verdict["bull_count"]
+    bear = verdict["bear_count"]
+    n    = verdict["active_agents"]
 
-    # Header
-    agents_summary = "\n".join(f"  {label+':':<12} {v}" for label, v, _ in agents_list)
+    # Emoji từng signal
+    def _sig_emoji(v): return "🟢" if v > 0 else "🔴" if v < 0 else "⚪"
+
+    sigs = verdict["signals"]
+    agents_lines = "\n".join(
+        f"  {_sig_emoji(v)} {name:<16} {'MUA' if v>0 else 'BAN' if v<0 else 'TL'}"
+        for name, v in sigs.items()
+    )
+
     header = (
-        f"{emoji} Phan tich {symbol} — {now}\n\n"
-        f"DU LIEU:\n"
-        f"  Gia: {_fmt_price(ind['current_price'])} | 1W: {ind['change_1w_pct']:+.1f}% | 1M: {ind['change_1m_pct']:+.1f}%\n"
-        f"  RSI: {ind['rsi']} | MACD: {ind['macd_hist']:+.4f} | Vol: {ind['volume_ratio']}x\n"
-        f"  Ho tro: {_fmt_price(ind['support_20d'])} | Khang cu: {_fmt_price(ind['resistance_20d'])}\n"
+        f"{emoji} {symbol} — {now}\n\n"
+        f"GIA & INDI:\n"
+        f"  Gia: {_fmt_price(ind['current_price'])} | "
+        f"1W: {ind['change_1w_pct']:+.1f}% | 1M: {ind['change_1m_pct']:+.1f}%\n"
+        f"  RSI: {ind['rsi']} | MACD: {ind['macd_hist']:+.4f} | "
+        f"Vol: {ind['volume_ratio']}x TB20\n"
+        f"  Ho tro: {_fmt_price(ind['support_20d'])} | "
+        f"Khang cu: {_fmt_price(ind['resistance_20d'])}\n"
         f"  VN-Index: {vnindex_str}\n\n"
-        f"6 AGENTS (Rule-based):\n{agents_summary}\n"
+        f"VIBE-TRADING ({n} AGENTS):\n{agents_lines}\n"
     )
 
-    # Footer — luôn nguyên vẹn
+    verdict_block = (
+        f"\n{'='*32}\n"
+        f"{emoji} KET LUAN: {fv}\n"
+        f"   {bull}/{n} bullish | {bear}/{n} bearish | Tin cay: {pct}%\n\n"
+        f"TOM TAT: {verdict['summary']}\n\n"
+    )
+
+    # Action plan
+    action_label = "MUA" if "MUA" in fv else "BAN" if "BAN" in fv else None
+    if action_label:
+        action_block = (
+            f"ACTION PLAN ({action_label}):\n"
+            f"  Entry:  {_fmt_price(ap['entry_low'])} - {_fmt_price(ap['entry_high'])}\n"
+            f"  Target: {_fmt_price(ap['tp'])} ({ap['tp_pct']:+.1f}%)\n"
+            f"  SL:     {_fmt_price(ap['sl'])} ({ap['sl_pct']:+.1f}%)\n"
+            f"  R:R   = 1:{ap['rr']}\n"
+        )
+    else:
+        action_block = (
+            f"ACTION PLAN (THEO DOI):\n"
+            f"  Vung mua neu co tin hieu: {_fmt_price(ap['entry_low'])} - {_fmt_price(ap['entry_high'])}\n"
+            f"  Muc TP neu vao: {_fmt_price(ap['tp'])} ({ap['tp_pct']:+.1f}%)\n"
+            f"  Dieu kien: > 50% agents dong thuan\n"
+        )
+
+    # Vibe details (rút gọn cho vừa Telegram)
+    details = vibe.get("details", {})
+    detail_lines = []
+    for name, desc in details.items():
+        sig = sigs.get(name, 0)
+        short = desc[:80].replace("\n", " ")
+        detail_lines.append(f"  [{name}] {short}")
+    detail_block = "\nCHI TIET:\n" + "\n".join(detail_lines) if detail_lines else ""
+
     footer = (
-        f"\n{'='*30}\n"
-        f"{emoji} KET LUAN: {final_v}\n"
-        f"   Dong thuan: {bull}/{n_agents} bullish, {bear}/{n_agents} bearish"
-        f" | Tin cay: {conf_pct}%\n\n"
-        f"TOM TAT: {summary}\n\n"
-        f"{_format_action_plan(final_v, ap)}\n\n"
-        f"LUU Y: {negative}\n"
-        f"{'='*30}"
+        f"\nLUU Y: {verdict['negative']}\n"
+        f"{'='*32}"
     )
 
-    # Chi tiết agents trong budget còn lại
-    detail_budget = char_limit - len(header) - len(footer) - 30
-    detail_header = "\nCHI TIET:\n"
-    detail_parts  = []
-    used = len(detail_header)
+    # Smart truncate
+    base = header + verdict_block + action_block + footer
+    remaining = char_limit - len(base) - 5
+    if remaining > 100 and detail_block:
+        detail_trunc = detail_block[:remaining]
+        msg = header + verdict_block + action_block + detail_trunc + footer
+    else:
+        msg = base
 
-    for label, verdict, txt in agents_list:
-        block = _fmt_agent(label, verdict, txt) + "\n"
-        if used + len(block) <= detail_budget:
-            detail_parts.append(block)
-            used += len(block)
-        else:
-            short = f"[{label} -> {verdict}]\n"
-            if used + len(short) <= detail_budget:
-                detail_parts.append(short)
-                used += len(short)
+    return msg[:char_limit]
 
-    detail_section = detail_header + "\n".join(detail_parts)
-    return header + detail_section + footer
 
 
 VN30_SYMBOLS = [
@@ -1711,21 +1797,24 @@ def analyze_stock_full(symbol: str) -> tuple:
     except Exception as e:
         return f"Loi tinh indicators {symbol}: {e}", None
 
-    # 2. Chạy 6 agents rule-based
+    # 2. Chạy 6 rule-based agents + 10 Vibe-Trading engines (song song)
     try:
-        with ThreadPoolExecutor(max_workers=6) as ex:
+        with ThreadPoolExecutor(max_workers=7) as ex:
             f1 = ex.submit(run_trend_agent,         symbol, ind)
             f2 = ex.submit(run_volume_agent,        symbol, ind)
             f3 = ex.submit(run_risk_agent,          symbol, ind)
             f4 = ex.submit(run_news_agent,          symbol, news_data)
             f5 = ex.submit(run_market_regime_agent, market_data)
             f6 = ex.submit(run_macro_agent,         news_data)
+            # Vibe-Trading engines chạy song song
+            f_vibe = ex.submit(_run_vibe_safe, symbol, price_data["df"]) if _VIBE_AVAILABLE else None
             trend_txt,  trend_v  = f1.result()
             volume_txt, volume_v = f2.result()
             risk_txt,   risk_v   = f3.result()
             news_txt,   news_v   = f4.result()
             market_txt, market_v = f5.result()
             macro_txt,  macro_v  = f6.result()
+            vibe_result = f_vibe.result() if f_vibe else None
     except Exception as e:
         return f"Loi khi chay agents {symbol}: {e}", None
 
@@ -1734,7 +1823,7 @@ def analyze_stock_full(symbol: str) -> tuple:
         "news": news_v, "market": market_v, "macro": macro_v,
     }
 
-    # 3. Verdict rule-based
+    # 3. Verdict từ 6 rule-based agents
     try:
         verdict = run_verdict_agent(symbol, agent_verdicts, ind)
     except Exception as e:
@@ -1773,6 +1862,7 @@ def analyze_stock_full(symbol: str) -> tuple:
         emoji, symbol, now, ind, vnindex_str,
         agents_list, final_v, conf_pct, bull, bear, n_agents,
         summary, ap, negative,
+        vibe_result=vibe_result,
     )
 
     metadata = {
@@ -1780,5 +1870,101 @@ def analyze_stock_full(symbol: str) -> tuple:
         "ind":            ind,
         "agent_verdicts": agent_verdicts,
         "macro_v":        macro_v,
+        "vibe_result":    vibe_result,
+    }
+    return msg, metadata
+def analyze_stock(symbol: str) -> str:
+    """Phân tích mã chứng khoán dùng Vibe-Trading 7 engines + 2 context agents."""
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_price  = ex.submit(get_price_data,  symbol, 120)
+        f_market = ex.submit(get_market_data)
+        f_news   = ex.submit(get_news_data,   symbol)
+        price_data  = f_price.result()
+        market_data = f_market.result()
+        news_data   = f_news.result()
+
+    if not price_data["success"]:
+        return f"Khong lay duoc du lieu gia {symbol}: {price_data['error']}"
+    try:
+        ind = compute_indicators(price_data["df"])
+        ind["symbol"] = symbol
+    except Exception as e:
+        return f"Loi tinh indicators {symbol}: {e}"
+
+    # ── Chạy Vibe-Trading 7 engines ──────────────────────────────────────────
+    if not _VIBE_AVAILABLE:
+        return "vibe_skills.py chua duoc deploy. Them file vibe_skills.py vao project."
+    try:
+        vibe = _run_vibe_agents(symbol, price_data["df"])
+    except Exception as e:
+        return f"Loi Vibe-Trading engines: {e}"
+
+    # ── Tổng hợp verdict (bao gồm Market + News context) ─────────────────────
+    try:
+        verdict = _vibe_verdict(vibe, ind, market_data, news_data)
+    except Exception as e:
+        return f"Loi tong hop verdict: {e}"
+
+    fv   = verdict["verdict_label"]
+    emoji = {"DONG THUAN MUA":"🟢","NGHIENG MUA":"🟢",
+             "DONG THUAN BAN":"🔴","NGHIENG BAN":"🔴","TRUNG LAP":"🟡"}.get(fv,"🟡")
+    vnindex_str = (f"{market_data['vnindex']:,} ({market_data['change_5d']:+.1f}% 5D)"
+                   if market_data.get("success") else "N/A")
+    now = datetime.now().strftime("%d/%m %H:%M")
+
+    return _build_vibe_message(emoji, symbol, now, ind, vnindex_str, vibe, verdict)
+
+
+def analyze_stock_full(symbol: str) -> tuple:
+    """Trả về (msg, metadata) cho bot.py — metadata dùng để lưu DB."""
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_price  = ex.submit(get_price_data,  symbol, 120)
+        f_market = ex.submit(get_market_data)
+        f_news   = ex.submit(get_news_data,   symbol)
+        price_data  = f_price.result()
+        market_data = f_market.result()
+        news_data   = f_news.result()
+
+    if not price_data["success"]:
+        return f"Khong lay duoc du lieu gia {symbol}: {price_data['error']}", None
+    try:
+        ind = compute_indicators(price_data["df"])
+        ind["symbol"] = symbol
+    except Exception as e:
+        return f"Loi tinh indicators {symbol}: {e}", None
+
+    if not _VIBE_AVAILABLE:
+        return "vibe_skills.py chua duoc deploy cung project.", None
+    try:
+        vibe = _run_vibe_agents(symbol, price_data["df"])
+    except Exception as e:
+        return f"Loi Vibe-Trading engines: {e}", None
+
+    try:
+        verdict = _vibe_verdict(vibe, ind, market_data, news_data)
+    except Exception as e:
+        return f"Loi tong hop verdict: {e}", None
+
+    fv   = verdict["verdict_label"]
+    emoji = {"DONG THUAN MUA":"🟢","NGHIENG MUA":"🟢",
+             "DONG THUAN BAN":"🔴","NGHIENG BAN":"🔴","TRUNG LAP":"🟡"}.get(fv,"🟡")
+    vnindex_str = (f"{market_data['vnindex']:,} ({market_data['change_5d']:+.1f}% 5D)"
+                   if market_data.get("success") else "N/A")
+    now = datetime.now().strftime("%d/%m %H:%M")
+
+    msg = _build_vibe_message(emoji, symbol, now, ind, vnindex_str, vibe, verdict)
+
+    # agent_verdicts theo format db.py expect
+    agent_verdicts = {k: ("MUA" if v>0 else "BAN" if v<0 else "TRUNG LAP")
+                      for k,v in verdict["signals"].items()}
+
+    metadata = {
+        "verdict":        verdict,
+        "ind":            ind,
+        "agent_verdicts": agent_verdicts,
+        "macro_v":        "THUAN LOI" if verdict["signals"].get("MarketRegime",0)>0
+                          else "RUI RO" if verdict["signals"].get("MarketRegime",0)<0
+                          else "TRUNG TINH",
+        "vibe_result":    vibe,
     }
     return msg, metadata
