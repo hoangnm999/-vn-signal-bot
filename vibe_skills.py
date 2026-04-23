@@ -136,6 +136,8 @@ class CandlestickEngine:
         signals, details = {}, {}
         for code, df in data_map.items():
             o,h,l,c = df["open"],df["high"],df["low"],df["close"]
+            v = df.get("volume", pd.Series(1,index=df.index))
+
             sc = pd.DataFrame(index=df.index)
             sc["hammer"]        = self._hammer(o,h,l,c)
             sc["inv_hammer"]    = self._inv_hammer(o,h,l,c)
@@ -149,16 +151,42 @@ class CandlestickEngine:
             sc["three_white"]   = self._three_white(o,h,l,c)
             sc["three_black"]   = self._three_black(o,h,l,c)
             total = sc.sum(axis=1)
+
+            # ── Volume Filter ─────────────────────────────────────────────
+            # Vol < 0.5x TB20: mô hình nến không đủ thanh khoản → trung lập
+            # Vol 0.5-0.7x: hạ cấp signal (chỉ giữ nếu mô hình mạnh >= 2 cùng chiều)
+            # Vol >= 0.7x: giữ nguyên signal
+            vol_ma20 = v.rolling(20).mean()
+            vol_ratio = v / vol_ma20.replace(0, np.nan)
+
             sig_series = pd.Series(np.sign(total).astype(int), index=df.index)
+
+            # Vol quá thấp → reset về 0
+            very_low_vol = vol_ratio < 0.5
+            sig_series[very_low_vol] = 0
+
+            # Vol thấp → chỉ giữ signal khi mô hình MẠNH (>= 2 pattern cùng chiều)
+            low_vol = (vol_ratio >= 0.5) & (vol_ratio < 0.7)
+            weak_signal = total.abs() < 2
+            sig_series[low_vol & weak_signal] = 0
+
             signals[code] = _last(sig_series)
-            # Tên pattern xuất hiện ở cây nến cuối
-            last = sc.iloc[-1]
-            found_bull = [n for n in sc.columns if last.get(n,0)>0]
-            found_bear = [n for n in sc.columns if last.get(n,0)<0]
+
+            # Detail
+            last  = sc.iloc[-1]
+            cur_vr = round(float(vol_ratio.iloc[-1]), 2) if not pd.isna(vol_ratio.iloc[-1]) else "N/A"
+            found_bull = [n for n in sc.columns if last.get(n,0) > 0]
+            found_bear = [n for n in sc.columns if last.get(n,0) < 0]
             desc = ""
             if found_bull: desc += f"Bullish: {', '.join(found_bull)}. "
             if found_bear: desc += f"Bearish: {', '.join(found_bear)}. "
-            details[code] = desc.strip() or "Khong nhan dien mo hinh nen dac biet."
+            if not desc:   desc = "Khong nhan dien mo hinh nen dac biet. "
+            vol_note = ""
+            if isinstance(cur_vr, float):
+                if cur_vr < 0.5:   vol_note = f"[Vol {cur_vr}x < 0.5x: RESET signal]"
+                elif cur_vr < 0.7: vol_note = f"[Vol {cur_vr}x thap: chi giu signal manh]"
+                else:              vol_note = f"[Vol {cur_vr}x OK]"
+            details[code] = (desc + vol_note).strip()
         return signals, details
 
 
@@ -180,31 +208,49 @@ class IchimokuEngine:
             h,l,c = df["high"],df["low"],df["close"]
             if len(df) < warmup:
                 signals[sym]=0; details[sym]="Khong du du lieu (can >= 78 bars)."; continue
-            tenkan = self._mid(h,self.tenkan)
-            kijun  = self._mid(h,self.kijun)
+            tenkan = self._mid(h, self.tenkan)
+            kijun  = self._mid(h, self.kijun)
             span_a = ((tenkan+kijun)/2).shift(self.displacement)
-            span_b = self._mid(h,self.senkou_b).shift(self.displacement)
+            span_b = self._mid(h, self.senkou_b).shift(self.displacement)
             cloud_top = pd.concat([span_a,span_b],axis=1).max(axis=1)
             cloud_bot = pd.concat([span_a,span_b],axis=1).min(axis=1)
-            tk_bull = (tenkan>kijun)&(tenkan.shift(1)<=kijun.shift(1))
-            tk_bear = (tenkan<kijun)&(tenkan.shift(1)>=kijun.shift(1))
-            above   = c > cloud_top
-            below   = c < cloud_bot
-            bull_cloud = span_a > span_b
-            bear_cloud = span_a < span_b
-            buy  = tk_bull & above & bull_cloud
-            sell = tk_bear & below & bear_cloud
-            sig  = pd.Series(0,index=df.index,dtype=int)
-            sig[buy]=1; sig[sell]=-1
+
+            # ── STATE-BASED scoring (không chỉ dựa vào cross) ──────────────
+            # Mỗi điều kiện +1 bull hoặc +1 bear
+            tk_above_kijun = tenkan > kijun          # TK cross bullish state
+            price_above_cloud = c > cloud_top        # Giá trên mây
+            price_below_cloud = c < cloud_bot        # Giá dưới mây
+            bull_kumo = span_a > span_b              # Mây xanh (bullish)
+            bear_kumo = span_a < span_b              # Mây đỏ (bearish)
+
+            bull_score = (tk_above_kijun.astype(int) +
+                          price_above_cloud.astype(int) +
+                          bull_kumo.astype(int))
+            bear_score = ((~tk_above_kijun).astype(int) +
+                          price_below_cloud.astype(int) +
+                          bear_kumo.astype(int))
+
+            sig = pd.Series(0, index=df.index, dtype=int)
+            # Cần >= 2/3 điều kiện cùng chiều để ra signal
+            sig[bull_score >= 2] = 1
+            sig[bear_score >= 2] = -1
+            # Nếu cả 2 đều >= 2 (trong mây, lẫn lộn) → trung lập
+            sig[(bull_score >= 2) & (bear_score >= 2)] = 0
+
             signals[sym] = _last(sig)
+
             # Detail
-            t_v = round(tenkan.iloc[-1],2) if not pd.isna(tenkan.iloc[-1]) else "N/A"
-            k_v = round(kijun.iloc[-1],2)  if not pd.isna(kijun.iloc[-1]) else "N/A"
-            ct  = round(cloud_top.iloc[-1],2) if not pd.isna(cloud_top.iloc[-1]) else "N/A"
-            cb  = round(cloud_bot.iloc[-1],2) if not pd.isna(cloud_bot.iloc[-1]) else "N/A"
-            tk_str = "bull" if tenkan.iloc[-1]>kijun.iloc[-1] else "bear"
-            pos    = "TREN may" if c.iloc[-1]>cloud_top.iloc[-1] else "DUOI may" if c.iloc[-1]<cloud_bot.iloc[-1] else "TRONG may"
-            details[sym] = f"TK={tk_str} | Tenkan={t_v} Kijun={k_v} | {pos} (top={ct} bot={cb})"
+            t_v  = round(tenkan.iloc[-1],2)    if not pd.isna(tenkan.iloc[-1]) else "N/A"
+            k_v  = round(kijun.iloc[-1],2)     if not pd.isna(kijun.iloc[-1]) else "N/A"
+            ct   = round(cloud_top.iloc[-1],2) if not pd.isna(cloud_top.iloc[-1]) else "N/A"
+            cb   = round(cloud_bot.iloc[-1],2) if not pd.isna(cloud_bot.iloc[-1]) else "N/A"
+            cur_c = c.iloc[-1]
+            pos  = ("TREN may" if (ct != "N/A" and cur_c > ct) else
+                    "DUOI may"  if (cb != "N/A" and cur_c < cb) else "TRONG may")
+            tk_str = "bull" if tenkan.iloc[-1] > kijun.iloc[-1] else "bear"
+            bs = int(bull_score.iloc[-1]); es = int(bear_score.iloc[-1])
+            details[sym] = (f"TK={tk_str} | Tenkan={t_v} Kijun={k_v} | {pos} "
+                            f"(top={ct} bot={cb}) | Score bull={bs}/3 bear={es}/3")
         return signals, details
 
 
@@ -220,9 +266,11 @@ class TechnicalEngine:
         self.rsi_os=rsi_os; self.rsi_ob=rsi_ob; self.vma=vma
 
     def _rsi(self, c, p):
-        d=c.diff(); g=d.where(d>0,0).ewm(alpha=1/p,adjust=False).mean()
-        ls=(-d.where(d<0,0)).ewm(alpha=1/p,adjust=False).mean()
-        return 100-100/(1+g/ls.replace(0,np.nan))
+        """Dùng rolling SMA (Wilder) giống compute_indicators để RSI nhất quán."""
+        d = c.diff()
+        gain = d.where(d > 0, 0).rolling(p).mean()
+        loss = (-d.where(d < 0, 0)).rolling(p).mean()
+        return 100 - 100 / (1 + gain / loss.replace(0, np.nan))
 
     def _adx(self, h, l, c, p):
         tr=pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
@@ -237,26 +285,60 @@ class TechnicalEngine:
     def _one(self, df):
         o,h,l,c = df["open"],df["high"],df["low"],df["close"]
         v = df.get("volume", pd.Series(1,index=df.index))
-        ef=c.ewm(span=self.ef,adjust=False).mean()
-        es=c.ewm(span=self.es,adjust=False).mean()
-        adx,pdi,ndi = self._adx(h,l,c,self.adx_p)
-        tbull=(ef>es)&(adx>self.adx_th)&(pdi>ndi)
-        tbear=(ef<es)&(adx>self.adx_th)&(ndi>pdi)
-        bm=c.rolling(self.bb_w).mean(); bs=c.rolling(self.bb_w).std()
-        bu=bm+self.bb_s*bs; bl=bm-self.bb_s*bs
-        rsi=self._rsi(c,self.rsi_p)
-        mr_bull=(c<bl)&(rsi<self.rsi_os); mr_bear=(c>bu)&(rsi>self.rsi_ob)
-        obv=(v*np.sign(c.diff())).fillna(0).cumsum()
-        obv_ma=obv.rolling(self.vma).mean(); vm=v.rolling(self.vma).mean()
-        vp_bull=(obv>obv_ma)&(v>vm); vp_bear=(obv<obv_ma)&(v>vm)
-        sig=pd.Series(0,index=df.index,dtype=int)
-        sig[tbull&~mr_bear&vp_bull]=1; sig[tbear&~mr_bull&vp_bear]=-1
+        ef  = c.ewm(span=self.ef,adjust=False).mean()
+        es  = c.ewm(span=self.es,adjust=False).mean()
+        adx, pdi, ndi = self._adx(h,l,c,self.adx_p)
+        bm  = c.rolling(self.bb_w).mean()
+        bst = c.rolling(self.bb_w).std()
+        bu  = bm + self.bb_s*bst
+        bl  = bm - self.bb_s*bst
+        rsi = self._rsi(c, self.rsi_p)
+        obv = (v*np.sign(c.diff())).fillna(0).cumsum()
+        obv_ma = obv.rolling(self.vma).mean()
+        vm     = v.rolling(self.vma).mean()
+
+        # ── STATE-BASED scoring — mỗi chiều tối đa 4 điểm ──────────────────
+        # Dim 1: Trend (EMA + ADX)
+        trend_bull = (ef > es).astype(int)                         # EMA bull
+        trend_bear = (ef < es).astype(int)                         # EMA bear
+        trend_strong = (adx > self.adx_th).astype(int)            # Có xu hướng rõ
+        dir_bull = (pdi > ndi).astype(int)
+        dir_bear = (ndi > pdi).astype(int)
+
+        # Dim 2: Momentum (RSI)
+        mom_bull = (rsi > 50).astype(int)
+        mom_bear = (rsi < 50).astype(int)
+        mom_strong_bull = (rsi > 55).astype(int)
+        mom_strong_bear = (rsi < 45).astype(int)
+
+        # Dim 3: Volume-Price (OBV)
+        vp_bull = (obv > obv_ma).astype(int)
+        vp_bear = (obv < obv_ma).astype(int)
+
+        # Tổng hợp: cần >= 3/5 tín hiệu cùng chiều
+        bull_score = trend_bull + dir_bull + trend_strong*dir_bull + mom_bull + vp_bull
+        bear_score = trend_bear + dir_bear + trend_strong*dir_bear + mom_bear + vp_bear
+
+        sig = pd.Series(0, index=df.index, dtype=int)
+        # Overbought/oversold override
+        ob_mask = (c > bu) & (rsi > self.rsi_ob)  # Overbought → BÁN
+        os_mask = (c < bl) & (rsi < self.rsi_os)  # Oversold → MUA
+        sig[bull_score >= 3] = 1
+        sig[bear_score >= 3] = -1
+        sig[ob_mask] = -1   # Override: quá mua → bán
+        sig[os_mask] = 1    # Override: quá bán → mua
+
         # Detail
-        adx_v=round(adx.iloc[-1],1); rsi_v=round(rsi.iloc[-1],1)
-        ef_v=round(ef.iloc[-1],2);   es_v=round(es.iloc[-1],2)
-        trend="bull" if ef.iloc[-1]>es.iloc[-1] else "bear"
-        detail=(f"EMA{self.ef}={ef_v} EMA{self.es}={es_v} ADX={adx_v} RSI={rsi_v} trend={trend}")
-        return sig, detail
+        adx_v = round(adx.iloc[-1],1)
+        rsi_v = round(rsi.iloc[-1],1)
+        ef_v  = round(ef.iloc[-1],2)
+        es_v  = round(es.iloc[-1],2)
+        bs    = int(bull_score.iloc[-1])
+        es_sc = int(bear_score.iloc[-1])
+        trend = "bull" if ef.iloc[-1] > es.iloc[-1] else "bear"
+        det   = (f"EMA{self.ef}={ef_v} EMA{self.es}={es_v} ADX={adx_v} RSI={rsi_v} "
+                 f"trend={trend} | Score bull={bs}/5 bear={es_sc}/5")
+        return sig, det
 
     def generate(self, data_map):
         signals, details = {}, {}
@@ -432,14 +514,28 @@ class VolatilityEngine:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SeasonalEngine:
-    def __init__(self, lookback_years=5, min_count=3, threshold=0.60):
+    def __init__(self, lookback_years=3, min_count=2, threshold=0.60):
+        """
+        lookback_years=3: cần 3 năm data (500 ngày đủ)
+        min_count=2: chỉ cần 2 lần lịch sử mỗi tháng để tính
+        """
         self.lb=lookback_years; self.mc=min_count; self.th=threshold
 
     def _one(self, df):
         c=df["close"]
+        # Cần index là DatetimeIndex để resample
+        if not isinstance(c.index, pd.DatetimeIndex):
+            try:
+                df = df.copy()
+                df.index = pd.to_datetime(df.index)
+                c = df["close"]
+            except Exception:
+                return pd.Series(0,index=df.index,dtype=int), "Khong the parse DatetimeIndex."
         mret=c.resample("ME").last().pct_change().dropna()
         sig=pd.Series(0,index=df.index,dtype=int)
-        if len(mret)<self.mc*6: return sig, "Khong du du lieu lich su seasonal."
+        # Cần ít nhất min_count*6 tháng (2*6=12 tháng = 1 năm)
+        if len(mret)<self.mc*6:
+            return sig, f"Khong du du lieu seasonal ({len(mret)} thang, can {self.mc*6})."
         cutoff=mret.index[-1]-pd.DateOffset(years=self.lb)
         hist=mret[mret.index>=cutoff]
         stats=hist.groupby(hist.index.month).apply(

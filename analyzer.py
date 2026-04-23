@@ -264,74 +264,129 @@ _market_cache = {"data": None, "date": None}
 
 def get_market_data() -> dict:
     """
-    Lấy market regime data dùng _price_from_entrade.
-    Cache kết quả trong ngày — thread-safe với Lock.
+    Lấy market regime từ VN-Index trực tiếp (SSI/cafef API) hoặc ETF proxy.
+    Cache trong ngày — thread-safe.
     """
     global _market_cache
     from datetime import date as _date
 
     today = _date.today().isoformat()
-
-    # Check cache trước (read không cần lock hoàn toàn an toàn)
     with _market_cache_lock:
         if _market_cache["data"] and _market_cache["date"] == today:
             return _market_cache["data"]
 
-    symbols_to_try = [
-        ("E1VFVN30", "ETF VN30"),
-        ("FUEVFVND", "ETF VNFIN"),
-        ("FUESSVFL", "ETF VN30 2"),
-        ("VCB",      "Proxy VCB"),
-        ("HPG",      "Proxy HPG"),
-        ("FPT",      "Proxy FPT"),
-        ("MWG",      "Proxy MWG"),
-        ("TCB",      "Proxy TCB"),
+    # ── Thử lấy VN-Index trực tiếp từ SSI API ────────────────────────────────
+    def _try_vnindex_direct():
+        """Lấy VN-Index OHLCV từ SSI public chart API."""
+        import time as _time
+        to_ts   = int(_time.time())
+        from_ts = to_ts - 90 * 86400
+        url = (
+            f"https://iboard-query.ssi.com.vn/v2/chart/overviewIndex"
+            f"?indexId=VN30&fromTime={from_ts}&toTime={to_ts}&resolution=D"
+        )
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept":     "application/json",
+            "Referer":    "https://iboard.ssi.com.vn/",
+        }
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        # SSI trả về {"data": {"t":[..], "c":[..], ...}}
+        inner = data.get("data", data)
+        times  = inner.get("t", [])
+        closes = inner.get("c", [])
+        if not times or not closes:
+            raise ValueError("SSI API trả về rỗng")
+        close = pd.Series([float(x) for x in closes])
+        return close, "VN30 (SSI)"
+
+    def _try_vnindex_cafef():
+        """Lấy VNINDEX từ cafef chart API."""
+        import time as _time
+        to_ts   = int(_time.time())
+        from_ts = to_ts - 90 * 86400
+        url = (
+            f"https://s.cafef.vn/Lich-su-giao-dich-VNINDEX-1.chn"
+        )
+        # cafef không có JSON API dễ dùng — thử entrade với mã VNINDEX
+        df = _price_from_entrade("VNINDEX", 90)
+        if df is not None and not df.empty:
+            close = df["close"].astype(float)
+            return close, "VNINDEX (Entrade)"
+        raise ValueError("VNINDEX từ Entrade rỗng")
+
+    # ── Fallback: mã ETF và blue-chip dùng làm proxy ─────────────────────────
+    proxy_symbols = [
+        ("VNINDEX",   "VN-Index"),
+        ("VN30",      "VN30 Index"),
+        ("E1VFVN30",  "ETF VN30"),
+        ("FUEVFVND",  "ETF VNDiamond"),
+        ("FUESSVFL",  "ETF SSIAM"),
+        ("VCB",       "Proxy VCB"),
+        ("HPG",       "Proxy HPG"),
+        ("FPT",       "Proxy FPT"),
+        ("VHM",       "Proxy VHM"),
     ]
 
-    last_err = "Tat ca symbols fail"
-    for symbol, label in symbols_to_try:
+    def _compute_result(close: pd.Series, label: str) -> dict:
+        """Tính market regime từ close series."""
+        if len(close) < 5:
+            raise ValueError(f"Khong du data ({len(close)} bars)")
+        curr = float(close.iloc[-1])
+        p5   = float(close.iloc[-5])  if len(close) >= 5  else curr
+        p20  = float(close.iloc[-20]) if len(close) >= 20 else curr
+        ma20 = float(close.rolling(20).mean().iloc[-1])
+        ma50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else None
+        return {
+            "success":    True,
+            "vnindex":    round(curr, 2),
+            "change_5d":  round((curr - p5)  / p5  * 100, 2),
+            "change_20d": round((curr - p20) / p20 * 100, 2),
+            "above_ma20": bool(curr > ma20),
+            "above_ma50": bool(curr > ma50) if ma50 else None,
+            "ma20":       round(ma20, 2),
+            "proxy":      label,
+        }
+
+    last_err = "Tat ca sources fail"
+
+    # Thử SSI direct trước
+    for fetcher, fname in [(_try_vnindex_direct, "SSI VN30"),
+                            (_try_vnindex_cafef,  "Entrade VNINDEX")]:
         try:
-            # Dùng lại _price_from_entrade đã hoạt động ổn thay vì parse thủ công
-            df = _price_from_entrade(symbol, 90)
-            if df is None or df.empty:
-                last_err = f"{symbol}: empty dataframe"
-                continue
-
-            close = df["close"].astype(float)
-            if len(close) < 5:
-                last_err = f"{symbol}: khong du du lieu ({len(close)} bars)"
-                continue
-
-            ma20 = close.rolling(20).mean().iloc[-1]
-            ma50 = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else None
-            curr = float(close.iloc[-1])
-            p5   = float(close.iloc[-5])  if len(close) >= 5  else curr
-            p20  = float(close.iloc[-20]) if len(close) >= 20 else curr
-
-            result = {
-                "success":    True,
-                "vnindex":    round(curr, 2),
-                "change_5d":  round((curr - p5)  / p5  * 100, 2),
-                "change_20d": round((curr - p20) / p20 * 100, 2),
-                "above_ma20": bool(curr > ma20),
-                "above_ma50": bool(curr > ma50) if ma50 else None,
-                "ma20":       round(float(ma20), 2),
-                "proxy":      label,
-            }
-            # Lưu cache thread-safe
+            close, label = fetcher()
+            result = _compute_result(close, label)
             with _market_cache_lock:
                 _market_cache["data"] = result
                 _market_cache["date"] = today
             return result
         except Exception as e:
-            last_err = f"{symbol}: {str(e)[:80]}"
+            last_err = f"{fname}: {str(e)[:60]}"
             continue
 
-    # Nếu tất cả fail nhưng có cache cũ → dùng cache (ngoài giờ GD)
+    # Fallback: proxy từng mã
+    for symbol, label in proxy_symbols:
+        try:
+            df = _price_from_entrade(symbol, 90)
+            if df is None or df.empty:
+                last_err = f"{symbol}: empty"; continue
+            close = df["close"].astype(float)
+            result = _compute_result(close, label)
+            with _market_cache_lock:
+                _market_cache["data"] = result
+                _market_cache["date"] = today
+            return result
+        except Exception as e:
+            last_err = f"{symbol}: {str(e)[:60]}"
+            continue
+
+    # Cache cũ
     with _market_cache_lock:
         if _market_cache["data"]:
             cached = dict(_market_cache["data"])
-            cached["proxy"] = cached.get("proxy","") + " [cached]"
+            cached["proxy"] = cached.get("proxy", "") + " [cached]"
             return cached
 
     return {"success": False, "error": last_err}
@@ -1545,21 +1600,30 @@ def _vibe_verdict(vibe: dict, ind: dict, market: dict, news: dict) -> dict:
         "sl_pct": sl_pct, "rr": rr,
     }
 
-    # ── LLM summary (chỉ viết 2 câu, không vote) ─────────────────────────
+    # ── LLM summary — chỉ diễn đạt lại số liệu, KHÔNG suy diễn ─────────────
     bull_agents = [k for k,v in signals.items() if v > 0]
     bear_agents = [k for k,v in signals.items() if v < 0]
+    neut_agents = [k for k,v in signals.items() if v == 0]
+
     sys_p = (
-        "Viet 2 dong tom tat phan tich co phieu bang tieng Viet khong dau. "
-        "Chi dua tren du lieu duoc cung cap, KHONG them thong tin moi. "
-        "Format:\nSUMMARY: <2 cau mo ta ket qua agents>\nNEGATIVE: <1 cau rui ro chinh>"
+        "Ban la bo phan viet bao cao ngan cho co phieu Viet Nam. "
+        "Nhiem vu: chi dien dat lai dung so lieu duoc cap, KHONG them thong tin ngoai. "
+        "TUYET DOI KHONG noi 'phan lon engine cho thay tang' neu so lieu KHONG ung ho dieu do. "
+        "Format bat buoc:\n"
+        "SUMMARY: <2 cau mo ta chinh xac so lieu: X/N bullish, Y/N bearish, ket luan la gi>\n"
+        "NEGATIVE: <1 cau ve rui ro chinh dua tren so lieu>"
     )
     user_p = (
         f"Co phieu: {ind.get('symbol','?')} | Gia: {_fmt_price(price)}\n"
-        f"Vibe-Trading 7 engines + 2 context: {bull}/{n_active} bullish, {bear}/{n_active} bearish\n"
-        f"Agents ung ho: {', '.join(bull_agents) or 'khong co'}\n"
-        f"Agents phan doi: {', '.join(bear_agents) or 'khong co'}\n"
-        f"RSI={ind['rsi']}, Vol={ind['volume_ratio']}x, "
-        f"Market={'UP' if signals.get('MarketRegime',0)>0 else 'DOWN' if signals.get('MarketRegime',0)<0 else 'SIDE'}"
+        f"KET LUAN: {verdict_label} (tin cay {conf_pct}%)\n"
+        f"So lieu chinh xac: {bull}/{n_active} agents BULLISH, {bear}/{n_active} BEARISH, "
+        f"{len(neut_agents)}/{n_active} NEUTRAL\n"
+        f"Agents BULLISH: {', '.join(bull_agents) or 'KHONG CO'}\n"
+        f"Agents BEARISH: {', '.join(bear_agents) or 'KHONG CO'}\n"
+        f"RSI={ind['rsi']} (14D) | Vol={ind['volume_ratio']}x TB20 | "
+        f"1W={ind['change_1w_pct']:+.1f}% | 1M={ind['change_1m_pct']:+.1f}%\n"
+        f"Market Regime: {'UPTREND' if signals.get('MarketRegime',0)>0 else 'DOWNTREND' if signals.get('MarketRegime',0)<0 else 'SIDEWAYS'}\n"
+        f"Viet SUMMARY phan anh CHINH XAC {bull}/{n_active} bullish va {bear}/{n_active} bearish."
     )
     try:
         llm_txt = call_deepseek(sys_p, user_p, max_tokens=200)
@@ -1570,15 +1634,26 @@ def _vibe_verdict(vibe: dict, ind: dict, market: dict, news: dict) -> dict:
             elif ls.upper().startswith("NEGATIVE:"): neg_txt = ls[9:].strip()
         if not summary: summary = llm_txt[:150].strip()
     except Exception:
-        summary = f"Vibe-Trading {bull}/{n_active} bullish, {bear}/{n_active} bearish."
+        # Fallback hoàn toàn rule-based nếu LLM fail
+        if verdict_label in ("DONG THUAN MUA", "NGHIENG MUA"):
+            summary = (f"{bull}/{n_active} agents ung ho MUA ({', '.join(bull_agents[:3])}). "
+                       f"RSI={ind['rsi']}, Vol={ind['volume_ratio']}x.")
+        elif verdict_label in ("DONG THUAN BAN", "NGHIENG BAN"):
+            summary = (f"{bear}/{n_active} agents canh bao BAN ({', '.join(bear_agents[:3])}). "
+                       f"RSI={ind['rsi']}, xu huong yeu.")
+        else:
+            summary = (f"Tin hieu lan lon: {bull}/{n_active} bullish, {bear}/{n_active} bearish. "
+                       f"Can them xac nhan truoc khi hanh dong.")
         neg_txt = ""
 
     if not neg_txt:
         parts = []
-        if ind["volume_ratio"] < 0.7: parts.append(f"vol thap {ind['volume_ratio']}x")
-        if ind["rsi"] > 68: parts.append(f"RSI={ind['rsi']} overbought")
-        if bear > 0: parts.append(f"{bear} agents phan doi")
-        neg_txt = "Luu y: " + ", ".join(parts) if parts else "Theo doi them tin hieu xac nhan."
+        if ind["volume_ratio"] < 0.7: parts.append(f"vol thap {ind['volume_ratio']}x TB20")
+        if ind["rsi"] > 68: parts.append(f"RSI={ind['rsi']} gan vung qua mua")
+        if ind["rsi"] < 35: parts.append(f"RSI={ind['rsi']} oversold, co the con giam")
+        if bear > 0: parts.append(f"{bear} agent phan doi ({', '.join(bear_agents[:2])})")
+        if ind["change_1m_pct"] < -10: parts.append(f"giam {ind['change_1m_pct']:.1f}% trong 1 thang")
+        neg_txt = "Luu y: " + ", ".join(parts) if parts else "Theo doi them de xac nhan tin hieu."
 
     return {
         "verdict_label": verdict_label, "confidence_pct": conf_pct,
@@ -1782,7 +1857,7 @@ def analyze_stock_full(symbol: str) -> tuple:
     """
     # 1. Thu thập data (bỏ fundamental và foreign_flow)
     with ThreadPoolExecutor(max_workers=3) as ex:
-        f_price  = ex.submit(get_price_data,  symbol, 90)
+        f_price  = ex.submit(get_price_data,  symbol, 500)  # 500 ngày: đủ cho Seasonal(3yr) + Volatility(252d)
         f_market = ex.submit(get_market_data)
         f_news   = ex.submit(get_news_data,   symbol)
         price_data  = f_price.result()
@@ -1876,7 +1951,7 @@ def analyze_stock_full(symbol: str) -> tuple:
 def analyze_stock(symbol: str) -> str:
     """Phân tích mã chứng khoán dùng Vibe-Trading 7 engines + 2 context agents."""
     with ThreadPoolExecutor(max_workers=3) as ex:
-        f_price  = ex.submit(get_price_data,  symbol, 120)
+        f_price  = ex.submit(get_price_data,  symbol, 500)  # 500 ngày: đủ cho Seasonal(3yr) + Volatility(252d)
         f_market = ex.submit(get_market_data)
         f_news   = ex.submit(get_news_data,   symbol)
         price_data  = f_price.result()
@@ -1918,7 +1993,7 @@ def analyze_stock(symbol: str) -> str:
 def analyze_stock_full(symbol: str) -> tuple:
     """Trả về (msg, metadata) cho bot.py — metadata dùng để lưu DB."""
     with ThreadPoolExecutor(max_workers=3) as ex:
-        f_price  = ex.submit(get_price_data,  symbol, 120)
+        f_price  = ex.submit(get_price_data,  symbol, 500)  # 500 ngày: đủ cho Seasonal(3yr) + Volatility(252d)
         f_market = ex.submit(get_market_data)
         f_news   = ex.submit(get_news_data,   symbol)
         price_data  = f_price.result()
