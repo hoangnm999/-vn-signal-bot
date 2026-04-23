@@ -373,6 +373,10 @@ def get_market_data() -> dict:
                 if df is not None and not df.empty:
                     df.columns = [c.lower() for c in df.columns]
                     close = df["close"].astype(float)
+                    # vnstock KBS đôi khi trả về giá đã chia 1000
+                    # (1.87 thay vì 1870) — chuẩn hoá lại
+                    if len(close) > 0 and close.iloc[-1] < 100:
+                        close = close * 1000
                     if len(close) >= 5:
                         result = _compute_result(close, f"VNINDEX (vnstock {src})")
                         with _market_cache_lock:
@@ -1364,11 +1368,17 @@ def _format_action_plan(verdict_label: str, ap: dict) -> str:
             f"  R:R   = 1:{ap['rr']}"
         )
     elif "BAN" in verdict_label:
+        r_lo  = ap.get("resist_low",  ap["entry_high"])
+        r_hi  = ap.get("resist_high", ap["tp"])
+        e_lo  = ap.get("exit_low",    ap["entry_low"])
+        e_hi  = ap.get("exit_high",   ap["entry_high"])
+        h_sl  = ap.get("hard_sl",     ap["sl"])
+        h_pct = ap.get("hard_sl_pct", ap["sl_pct"])
         return (
             f"ACTION PLAN (BAN / THOAT HANG):\n"
-            f"  Vung khang cu: {_fmt_price(ap['entry_high'])} - {_fmt_price(ap['tp'])}\n"
-            f"  Diem thoat hang: {_fmt_price(ap['entry_low'])} - {_fmt_price(ap['entry_high'])}\n"
-            f"  Ho tro tiep theo: {_fmt_price(ap['sl'])} ({ap['sl_pct']:+.1f}% vs gia hien tai)\n"
+            f"  Vung khang cu (KHONG mua them): {_fmt_price(r_lo)} - {_fmt_price(r_hi)}\n"
+            f"  Vung thoat hang: {_fmt_price(e_lo)} - {_fmt_price(e_hi)}\n"
+            f"  Cat lo cuong buc: Pha xuong {_fmt_price(h_sl)} ({h_pct:+.1f}%) → THOAT NGAY\n"
             f"  Khong nen mua them — cho tin hieu dao chieu"
         )
     else:
@@ -1697,11 +1707,25 @@ def _vibe_verdict(vibe: dict, ind: dict, market: dict, news: dict) -> dict:
     risk   = price - sl; reward = tp - price
     rr     = round(reward / risk, 1) if risk > 0 else 0
 
+    # Tính thêm các mức cho action plan BÁN (thoát hàng)
+    # resist_zone: vùng kháng cự trên giá hiện tại
+    # exit_zone:   vùng thoát hàng (gần giá hiện tại)
+    # hard_sl:     cắt lỗ cứng nếu thủng hỗ trợ
+    hard_sl = round(sup * 0.99, 2)  # thủng support 1% → thoát ngay
+    hard_sl_pct = round((hard_sl - price) / price * 100, 1)
+
     action_plan = {
-        "entry_low": e_lo, "entry_high": e_hi,
-        "tp": tp, "sl": sl,
-        "tp_pct": round((tp - price) / price * 100, 1),
-        "sl_pct": sl_pct, "rr": rr,
+        "entry_low":    e_lo,   "entry_high": e_hi,
+        "tp":           tp,     "sl":         sl,
+        "tp_pct":       round((tp - price) / price * 100, 1),
+        "sl_pct":       sl_pct, "rr":         rr,
+        # Sell-side fields
+        "resist_low":   round(price * 1.00, 2),   # cận dưới kháng cự (giá hiện tại)
+        "resist_high":  round(res * 0.995, 2),     # cận trên kháng cự
+        "exit_low":     round(price * 0.985, 2),   # thoát hàng nếu phá xuống
+        "exit_high":    round(price * 1.005, 2),   # thoát hàng gần giá hiện tại
+        "hard_sl":      hard_sl,
+        "hard_sl_pct":  hard_sl_pct,
     }
 
     # ── LLM summary — chỉ diễn đạt lại số liệu, KHÔNG suy diễn ─────────────
@@ -1759,12 +1783,38 @@ def _vibe_verdict(vibe: dict, ind: dict, market: dict, news: dict) -> dict:
         if ind["change_1m_pct"] < -10: parts.append(f"giam {ind['change_1m_pct']:.1f}% trong 1 thang")
         neg_txt = "Luu y: " + ", ".join(parts) if parts else "Theo doi them de xac nhan tin hieu."
 
+    # ── Relative Weakness Alert ────────────────────────────────────────
+    # Phân kỳ: thị trường UPTREND nhưng cổ phiếu yếu về kỹ thuật
+    # Điều kiện: MarketRegime=MUA (1) + phần lớn kỹ thuật BAN + giá giảm
+    mr_signal   = signals.get("MarketRegime", 0)
+    tech_agents = ["Candlestick","Ichimoku","TechnicalBasic","ElliottWave",
+                   "CrossMarket","PriceMomentum","Breakout"]
+    tech_bear = sum(1 for a in tech_agents if signals.get(a, 0) < 0)
+    tech_bull = sum(1 for a in tech_agents if signals.get(a, 0) > 0)
+
+    relative_weakness = (
+        mr_signal > 0               # thị trường tăng
+        and tech_bear >= 3          # >= 3 agent kỹ thuật báo BAN
+        and tech_bear > tech_bull   # kỹ thuật nghiêng về giảm
+        and ind["change_1w_pct"] < 0  # giá đang giảm
+    )
+    relative_weakness_note = ""
+    if relative_weakness:
+        relative_weakness_note = (
+            f"⚠️ CANH BAO PHAN KY: Co phieu dang YEU hon thi truong chung "
+            f"(Market UPTREND nhung {tech_bear}/{len(tech_agents)} Agent ky thuat bao BAN). "
+            f"Day la dau hieu Co phieu mat suc manh tuong doi (Relative Weakness) — "
+            f"rui ro cao hon binh thuong du thi truong chung dang tang."
+        )
+
     return {
         "verdict_label": verdict_label, "confidence_pct": conf_pct,
         "bull_count": bull, "bear_count": bear, "active_agents": n_active,
         "signals": signals,
         "context_details": context_details,
         "summary": summary, "negative": neg_txt, "action_plan": action_plan,
+        "relative_weakness": relative_weakness,
+        "relative_weakness_note": relative_weakness_note,
     }
 
 
@@ -1820,13 +1870,19 @@ def _build_vibe_message(
             f"  R:R   = 1:{ap['rr']}\n"
         )
     elif "BAN" in fv:
-        # BÁN: không hiển thị vùng mua — hiển thị kháng cự và điểm thoát
+        # BÁN: kháng cự / thoát hàng / cắt lỗ cứng — không hiển thị vùng mua
+        r_lo  = ap.get("resist_low",  ap["entry_high"])
+        r_hi  = ap.get("resist_high", ap["tp"])
+        e_lo  = ap.get("exit_low",    ap["entry_low"])
+        e_hi  = ap.get("exit_high",   ap["entry_high"])
+        h_sl  = ap.get("hard_sl",     ap["sl"])
+        h_pct = ap.get("hard_sl_pct", ap["sl_pct"])
         action_block = (
             f"ACTION PLAN (BAN / THOAT HANG):\n"
-            f"  Vung khang cu: {_fmt_price(ap['entry_high'])} - {_fmt_price(ap['tp'])}\n"
-            f"  Diem thoat hang: {_fmt_price(ap['entry_low'])} - {_fmt_price(ap['entry_high'])}\n"
-            f"  Ho tro tiep theo: {_fmt_price(ap['sl'])} ({ap['sl_pct']:+.1f}% vs gia hien tai)\n"
-            f"  Khong nen mua them khi chua co tin hieu dao chieu\n"
+            f"  Vung khang cu (KHONG mua them): {_fmt_price(r_lo)} - {_fmt_price(r_hi)}\n"
+            f"  Vung thoat hang (dat lenh ban): {_fmt_price(e_lo)} - {_fmt_price(e_hi)}\n"
+            f"  Cat lo cuong buc: Pha xuong {_fmt_price(h_sl)} ({h_pct:+.1f}%) → THOAT NGAY\n"
+            f"  Khong nen mua them — cho tin hieu dao chieu (RSI<35 + Vol xac nhan)\n"
         )
     else:
         # TRUNG LAP: chờ xác nhận, không hành động
@@ -1848,9 +1904,12 @@ def _build_vibe_message(
         detail_lines.append(f"  [{name}] {short}")
     detail_block = "\nCHI TIET:\n" + "\n".join(detail_lines) if detail_lines else ""
 
+    # Thêm cảnh báo Relative Weakness nếu có
+    rw_note = verdict.get("relative_weakness_note", "")
     footer = (
         f"\nLUU Y: {verdict['negative']}\n"
-        f"{'='*32}"
+        + (f"\n{rw_note}\n" if rw_note else "")
+        + f"{'='*32}"
     )
 
     # Smart truncate
@@ -2012,6 +2071,14 @@ def analyze_stock_full(symbol: str) -> tuple:
                    if market_data.get("success") else "N/A")
     now = datetime.now().strftime("%d/%m %H:%M")
 
+    # Đảm bảo vnindex_str nhất quán với MarketRegime detail
+    # Lấy từ market_data đã được _vibe_verdict xử lý
+    if market_data.get("success"):
+        _vn = market_data["vnindex"]
+        _c5 = market_data["change_5d"]
+        vnindex_str = f"{_vn:,.1f} ({_c5:+.1f}% 5D)"
+    else:
+        vnindex_str = "N/A"
     msg = _build_vibe_message(emoji, symbol, now, ind, vnindex_str, vibe, verdict)
 
     # 5. Metadata cho DB

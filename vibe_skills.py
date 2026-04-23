@@ -904,19 +904,40 @@ class MLStrategyEngine:
 
     def _build_features(self, df):
         c = df["close"]; v = df.get("volume", pd.Series(1, index=df.index))
+        h = df.get("high", c); l = df.get("low", c)
         ret = c.pct_change()
         feat = pd.DataFrame(index=df.index)
-        feat["f_ret_5d"]      = c.pct_change(5)
-        feat["f_ret_20d"]     = c.pct_change(20)
-        feat["f_vol_20d"]     = ret.rolling(20).std()
-        feat["f_ma_ratio"]    = c / c.rolling(20).mean()
-        feat["f_volume_ratio"]= v / v.rolling(20).mean()
+        # Price momentum — multi-timeframe (quan trọng cho VN)
+        feat["f_ret_1d"]        = c.pct_change(1)
+        feat["f_ret_5d"]        = c.pct_change(5)
+        feat["f_ret_20d"]       = c.pct_change(20)
+        feat["f_ret_60d"]       = c.pct_change(60)
+        # Volatility
+        feat["f_vol_10d"]       = ret.rolling(10).std()
+        feat["f_vol_20d"]       = ret.rolling(20).std()
+        # Trend (MA cross)
+        feat["f_ma_ratio_20"]   = c / c.rolling(20).mean()
+        feat["f_ma_ratio_50"]   = c / c.rolling(50).mean()
+        feat["f_ma5_20_cross"]  = c.rolling(5).mean() / c.rolling(20).mean()
+        # RSI — Wilder SMA để nhất quán với compute_indicators
         delta = c.diff()
-        gain  = delta.clip(lower=0).rolling(14).mean()
-        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        gain  = delta.where(delta > 0, 0).rolling(14).mean()
+        loss  = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rs    = gain / loss.replace(0, np.nan)
-        feat["f_rsi_14"] = 100 - (100 / (1 + rs))
-        feat["f_bb_pos"] = (c - c.rolling(20).mean()) / (c.rolling(20).std().replace(0, np.nan))
+        feat["f_rsi_14"]        = 100 - (100 / (1 + rs))
+        # Bollinger position
+        feat["f_bb_pos"]        = (c - c.rolling(20).mean()) / (c.rolling(20).std().replace(0, np.nan))
+        # Volume — đặc biệt quan trọng cho TTCK VN (thanh khoản thấp)
+        feat["f_vol_ratio_20"]  = v / v.rolling(20).mean()
+        feat["f_vol_ratio_5"]   = v / v.rolling(5).mean()
+        # Volume-price momentum: ngày tăng volume cao hơn ngày giảm → bullish
+        vp = (c.pct_change() * (v / v.rolling(20).mean()))
+        feat["f_vp_momentum"]   = vp.rolling(5).sum()
+        # OBV trend — smart money flow
+        obv = (v * np.sign(c.diff())).fillna(0).cumsum()
+        feat["f_obv_ratio"]     = obv / obv.rolling(20).mean().replace(0, np.nan)
+        # High-Low range (intraday volatility)
+        feat["f_hl_ratio"]      = (h - l) / c.replace(0, np.nan)
         return feat.replace([np.inf, -np.inf], np.nan)
 
     def _one(self, df):
