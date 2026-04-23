@@ -13,7 +13,7 @@ try:
     from vibe_client import (
         is_available as vibe_available,
         start_swarm, poll_swarm, format_swarm_result,
-        SWARM_ALIASES, SWARM_LABELS, SWARM_GROUPS,
+        SWARM_ALIASES, SWARM_LABELS, SWARM_GROUPS, QUICK_ALIASES, resolve_alias,
     )
     _VIBE_CLIENT = True
 except ImportError:
@@ -439,7 +439,7 @@ async def vibe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Nếu không có args → hiện menu
     if not context.args:
-        lines = ["VIBE-TRADING — 29 Swarms / 113 Agents", ""]
+        lines = ["VIBE-TRADING — 35 Swarms / 71 Skills / 69 Agents", ""]
         for group, aliases in SWARM_GROUPS.items():
             lines.append(f"{group}:")
             for a in aliases:
@@ -455,13 +455,15 @@ async def vibe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not valid:
         await update.message.reply_text("Ma khong hop le (VD: VCB, HPG, FPT)."); return
 
-    alias = context.args[1].lower() if len(context.args) > 1 else "technical"
-    if alias not in SWARM_ALIASES:
-        close = [a for a in SWARM_ALIASES if alias in a]
+    raw_alias = context.args[1].lower() if len(context.args) > 1 else "technical"
+    alias = resolve_alias(raw_alias)
+    if not alias:
+        close = [a for a in SWARM_ALIASES if raw_alias in a]
         tip = f"Y ban noi: {', '.join(close[:3])}?" if close else ""
         await update.message.reply_text(
-            f"Swarm '{alias}' khong ton tai. {tip}\n"
-            f"Goi /vibe de xem danh sach 29 swarms."
+            f"Swarm '{raw_alias}' khong ton tai. {tip}\n"
+            f"Goi /vibe de xem danh sach 35 swarms.\n"
+            f"Quick alias: ta, wave, vol, cs, vi_mo, tamly, quant, rui_ro, danh_muc..."
         ); return
 
     if not vibe_available():
@@ -628,7 +630,7 @@ async def vibe_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  URL    : {_vibe_url or 'CHUA SET VIBE_API_URL'}",
         f"  Status : {'Online ✓' if online else 'OFFLINE ✗'}",
         f"  API Key: {'Co' if os.environ.get('VIBE_API_KEY') else 'Chua set (dev mode)'}",
-        f"  Swarms : {len(SWARM_ALIASES)} presets / 113 agents",
+        f"  Swarms : {len(SWARM_ALIASES)} presets | 71 skills | 69 agents",
     ]
     if not online:
         lines += [

@@ -1,14 +1,17 @@
 """
-vibe_client.py — HTTP client gọi Vibe-Trading API (29 swarms / 113 agents).
+vibe_client.py — HTTP client gọi Vibe-Trading API (HKUDS/Vibe-Trading)
 
-Env vars cần set trên Railway (bot service):
+Cấu trúc Vibe-Trading thực tế:
+  71 Skills  : Technical(25) | Fundamental(15) | Macro(10) |
+               Sentiment(8)  | Quant(10)       | Risk(5)   | Portfolio(8)
+  69 Agents  : Leader / Researcher / Critic / Secretary per swarm
+  7 Archetypes: Strategists | Technical Experts | Value Hunters |
+                Macro Watchers | Risk Controllers | Sentiment Analysts | Backtester
+  35 Swarms  : mỗi swarm gộp nhiều skills + agents liên quan
+
+Env vars (Railway bot service):
     VIBE_API_URL  = https://vibe-trading-xxxx.railway.app
-    VIBE_API_KEY  = (giá trị API_AUTH_KEY bên Vibe service)
-
-Dùng:
-    from vibe_client import run_swarm_sync, format_swarm_result, SWARM_ALIASES
-    result = run_swarm_sync("technical", "VCB", progress_callback=cb)
-    text   = format_swarm_result(result, "VCB", "technical")
+    VIBE_API_KEY  = <API_AUTH_KEY bên Vibe service>
 """
 
 from __future__ import annotations
@@ -17,171 +20,367 @@ from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
 
+
 def _normalize_url(url: str) -> str:
-    """Đảm bảo URL có scheme https:// và không có trailing slash."""
     url = url.strip().rstrip("/")
     if url and not url.startswith("http"):
         url = "https://" + url
     return url
 
 
-VIBE_API_URL = _normalize_url(os.environ.get("VIBE_API_URL", ""))
-VIBE_API_KEY = os.environ.get("VIBE_API_KEY", "")
+VIBE_API_URL    = _normalize_url(os.environ.get("VIBE_API_URL", ""))
+VIBE_API_KEY    = os.environ.get("VIBE_API_KEY", "")
+POLL_TIMEOUT    = 900
+POLL_INTERVAL   = 8
+REQUEST_TIMEOUT = 30
 
-POLL_TIMEOUT    = 900   # 15 phút max poll
-POLL_INTERVAL   = 8     # check mỗi 8 giây
-REQUEST_TIMEOUT = 30    # HTTP request timeout (giây)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SKILLS COVERAGE — 71 skills map vào từng swarm
+# ══════════════════════════════════════════════════════════════════════════════
+
+SKILLS_COVERAGE: dict[str, list[str]] = {
+    # Technical Analysis (25 skills) — 4 swarms
+    "technical": [
+        "candlestick_patterns", "chart_pattern_recognition",
+        "moving_average_systems", "momentum_indicators", "trend_following",
+        "ichimoku_cloud", "bollinger_bands", "volume_analysis",
+        "support_resistance", "breakout_detection", "price_action",
+        "gap_analysis", "divergence_detection", "multi_timeframe_analysis",
+        "relative_strength",
+    ],
+    "elliott_harmonic": [
+        "elliott_wave", "harmonic_patterns", "fibonacci_analysis",
+        "chart_pattern_recognition",
+    ],
+    "volatility_seasonal": [
+        "volatility_analysis", "seasonal_patterns", "market_breadth",
+        "mean_reversion", "intermarket_analysis",
+    ],
+    "market_microstructure": [
+        "market_microstructure", "options_flow", "volume_analysis",
+        "market_breadth",
+    ],
+    # Fundamental Analysis (15 skills) — 4 swarms
+    "fundamental": [
+        "financial_statement_analysis", "ratio_analysis", "dcf_valuation",
+        "comparable_analysis", "earnings_quality",
+    ],
+    "earnings": [
+        "earnings_quality", "revenue_analysis", "margin_analysis",
+        "growth_analysis", "financial_statement_analysis",
+    ],
+    "equity": [
+        "comparable_analysis", "competitive_moat", "management_assessment",
+        "industry_analysis", "esg_scoring",
+    ],
+    "valuation": [
+        "dcf_valuation", "ratio_analysis", "cash_flow_analysis",
+        "dividend_analysis", "debt_analysis",
+    ],
+    # Macro Policy (10 skills) — 7 swarms
+    "macro": [
+        "interest_rate_analysis", "inflation_analysis",
+        "monetary_policy", "global_liquidity",
+    ],
+    "macro_rates": [
+        "interest_rate_analysis", "currency_analysis",
+        "fiscal_policy", "trade_policy",
+    ],
+    "sector":          ["industry_analysis", "commodity_macro", "intermarket_analysis"],
+    "geopolitical":    ["geopolitical_risk", "trade_policy", "currency_analysis"],
+    "commodity":       ["commodity_macro", "inflation_analysis", "intermarket_analysis"],
+    "global_alloc":    ["global_liquidity", "gdp_growth_analysis", "monetary_policy", "fiscal_policy"],
+    "global_equities": ["gdp_growth_analysis", "currency_analysis", "intermarket_analysis", "global_liquidity"],
+    # Sentiment Analysis (8 skills) — 3 swarms
+    "sentiment":    ["news_sentiment", "analyst_sentiment", "market_fear_greed", "retail_sentiment"],
+    "social_alpha": ["social_media_sentiment", "retail_sentiment", "market_fear_greed"],
+    "insider_flow": ["insider_trading", "fund_flow_analysis", "options_sentiment"],
+    # Quant & Optimization (10 skills) — 6 swarms
+    "quant":        ["factor_investing", "momentum_factor", "value_factor", "quality_factor"],
+    "factor":       ["factor_investing", "momentum_factor", "value_factor", "quality_factor", "ml_signal_generation"],
+    "pairs":        ["pairs_trading", "statistical_arbitrage", "correlation_analysis"],
+    "stat_arb":     ["statistical_arbitrage", "pairs_trading", "mean_reversion"],
+    "ml_quant":     ["ml_signal_generation", "backtesting_engine", "factor_investing"],
+    "event_driven": ["backtesting_engine", "momentum_factor", "earnings_quality"],
+    # Risk Management (5 skills) — 1 swarm
+    "risk":         ["var_calculation", "drawdown_analysis", "stress_testing", "correlation_analysis", "position_sizing"],
+    # Portfolio Utility (8 skills) — 3 swarms
+    "investment":    ["portfolio_construction", "allocation_optimization", "benchmark_comparison", "performance_attribution"],
+    "portfolio":     ["portfolio_construction", "rebalancing", "liquidity_management", "performance_attribution"],
+    "portfolio_opt": ["portfolio_optimization", "risk_parity", "allocation_optimization", "tax_optimization", "reporting_generation"],
+    # Asset Class
+    "etf":              ["allocation_optimization", "benchmark_comparison", "liquidity_management"],
+    "credit":           ["debt_analysis", "var_calculation", "stress_testing"],
+    "derivatives":      ["options_flow", "options_sentiment", "var_calculation"],
+    "fund_select":      ["performance_attribution", "benchmark_comparison", "ratio_analysis"],
+    "convertible_bond": ["debt_analysis", "options_flow", "ratio_analysis"],
+    # Crypto
+    "crypto_research":  ["momentum_indicators", "social_media_sentiment", "market_fear_greed"],
+    "crypto_trading":   ["breakout_detection", "volume_analysis", "momentum_indicators"],
+}
 
 
-def is_available() -> bool:
-    """Kiểm tra Vibe-Trading service có online không. Log lỗi chi tiết."""
-    if not VIBE_API_URL:
-        logger.warning("is_available: VIBE_API_URL chua duoc set")
-        return False
-    health_url = f"{VIBE_API_URL}/health"
-    try:
-        r = requests.get(health_url, timeout=REQUEST_TIMEOUT)
-        if r.status_code == 200:
-            return True
-        logger.warning(f"is_available: /health tra ve HTTP {r.status_code} (URL={health_url})")
-        return False
-    except requests.exceptions.ConnectionError as e:
-        logger.error(f"is_available: Connection failed to {health_url}: {e}")
-        return False
-    except requests.exceptions.Timeout:
-        logger.error(f"is_available: Timeout sau {REQUEST_TIMEOUT}s ({health_url})")
-        return False
-    except Exception as e:
-        logger.error(f"is_available: Unexpected error: {type(e).__name__}: {e}")
-        return False
-# Nhóm TECHNICAL (phân tích kỹ thuật)
-# Nhóm FUNDAMENTAL (phân tích cơ bản)
-# Nhóm MACRO (vĩ mô)
-# Nhóm QUANT (định lượng)
-# Nhóm RISK (rủi ro)
-# Nhóm PORTFOLIO (danh mục)
-# Nhóm SENTIMENT (tâm lý)
-# Nhóm CRYPTO (tiền mã hoá)
-# Nhóm SPECIAL (chuyên biệt)
+# ══════════════════════════════════════════════════════════════════════════════
+# AGENT INFO — 69 agents, 4 roles per swarm, 7 archetypes
+# ══════════════════════════════════════════════════════════════════════════════
+
+AGENT_ROLES = {
+    "Leader":     "Điều phối, ra kết luận cuối, tổng hợp debate",
+    "Researcher": "Phân tích dữ liệu, tính toán, lập luận từ data",
+    "Critic":     "Phản biện, tìm điểm yếu trong luận điểm",
+    "Secretary":  "Ghi chép, tổng hợp, format output",
+}
+
+AGENT_ARCHETYPES = {
+    "the_strategists":    "Xu hướng dài hạn, chiến lược vĩ mô, asset allocation",
+    "technical_experts":  "Phân tích kỹ thuật, chart patterns, timing",
+    "value_hunters":      "Định giá cơ bản, tìm cổ phiếu undervalued",
+    "macro_watchers":     "Vĩ mô, lãi suất, tỷ giá, chính sách",
+    "risk_controllers":   "Quản lý rủi ro, VaR, drawdown, sizing",
+    "sentiment_analysts": "Tâm lý thị trường, news flow, social",
+    "the_backtester":     "Backtest, validate signal, performance stats",
+}
+
+# swarm alias → (archetype, n_agents)
+SWARM_AGENT_INFO: dict[str, tuple[str, int]] = {
+    "technical":            ("technical_experts",  6),
+    "elliott_harmonic":     ("technical_experts",  4),
+    "volatility_seasonal":  ("technical_experts",  4),
+    "market_microstructure":("technical_experts",  4),
+    "fundamental":          ("value_hunters",       4),
+    "earnings":             ("value_hunters",       4),
+    "equity":               ("value_hunters",       4),
+    "valuation":            ("value_hunters",       4),
+    "macro":                ("macro_watchers",      4),
+    "macro_rates":          ("macro_watchers",      4),
+    "sector":               ("macro_watchers",      4),
+    "geopolitical":         ("macro_watchers",      4),
+    "commodity":            ("macro_watchers",      3),
+    "global_alloc":         ("the_strategists",     4),
+    "global_equities":      ("the_strategists",     4),
+    "sentiment":            ("sentiment_analysts",  4),
+    "social_alpha":         ("sentiment_analysts",  4),
+    "insider_flow":         ("sentiment_analysts",  3),
+    "quant":                ("the_backtester",      4),
+    "factor":               ("the_backtester",      4),
+    "pairs":                ("the_backtester",      4),
+    "stat_arb":             ("the_backtester",      4),
+    "ml_quant":             ("the_backtester",      3),
+    "event_driven":         ("the_backtester",      3),
+    "risk":                 ("risk_controllers",    4),  # + position_sizing = 5 skills
+    "investment":           ("the_strategists",     4),
+    "portfolio":            ("the_strategists",     4),
+    "portfolio_opt":        ("the_strategists",     4),
+    "etf":                  ("the_strategists",     4),
+    "credit":               ("risk_controllers",    4),
+    "derivatives":          ("risk_controllers",    3),
+    "fund_select":          ("the_strategists",     3),
+    "convertible_bond":     ("value_hunters",       4),
+    "crypto_research":      ("technical_experts",   4),
+    "crypto_trading":       ("technical_experts",   4),
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SWARM ALIASES — alias → preset name trong Vibe-Trading server
+# ══════════════════════════════════════════════════════════════════════════════
 
 SWARM_ALIASES: dict[str, str] = {
-    # ── Technical ──────────────────────────────────────────────────────────
-    "technical":        "technical_analysis_panel",
-    # ── Fundamental ────────────────────────────────────────────────────────
-    "fundamental":      "fundamental_research_team",
-    "earnings":         "earnings_research_desk",
-    "equity":           "equity_research_team",
-    # ── Macro ──────────────────────────────────────────────────────────────
-    "macro":            "macro_strategy_forum",
-    "macro_rates":      "macro_rates_fx_desk",
-    "sector":           "sector_rotation_team",
-    "geopolitical":     "geopolitical_war_room",
-    "commodity":        "commodity_research_team",
-    "global_alloc":     "global_allocation_committee",
-    "global_equities":  "global_equities_desk",
-    # ── Quant ──────────────────────────────────────────────────────────────
-    "quant":            "quant_strategy_desk",
-    "factor":           "factor_research_committee",
-    "pairs":            "pairs_research_lab",
-    "stat_arb":         "statistical_arbitrage_desk",
-    "ml_quant":         "ml_quant_lab",
-    "event_driven":     "event_driven_task_force",
-    # ── Risk & Portfolio ───────────────────────────────────────────────────
-    "risk":             "risk_committee",
-    "investment":       "investment_committee",
-    "portfolio":        "portfolio_review_board",
-    # ── Sentiment ──────────────────────────────────────────────────────────
-    "sentiment":        "sentiment_intelligence_team",
-    "social_alpha":     "social_alpha_team",
-    # ── Asset class ────────────────────────────────────────────────────────
-    "etf":              "etf_allocation_desk",
-    "credit":           "credit_research_team",
-    "derivatives":      "derivatives_strategy_desk",
-    "fund_select":      "fund_selection_panel",
-    "convertible_bond": "convertible_bond_team",
-    # ── Crypto ─────────────────────────────────────────────────────────────
-    "crypto_research":  "crypto_research_lab",
-    "crypto_trading":   "crypto_trading_desk",
+    # Technical (4 swarms)
+    "technical":             "technical_analysis_panel",
+    "elliott_harmonic":      "elliott_harmonic_panel",
+    "volatility_seasonal":   "volatility_seasonal_desk",
+    "market_microstructure": "market_microstructure_desk",
+    # Fundamental (4 swarms)
+    "fundamental":           "fundamental_research_team",
+    "earnings":              "earnings_research_desk",
+    "equity":                "equity_research_team",
+    "valuation":             "valuation_committee",
+    # Macro (7 swarms)
+    "macro":                 "macro_strategy_forum",
+    "macro_rates":           "macro_rates_fx_desk",
+    "sector":                "sector_rotation_team",
+    "geopolitical":          "geopolitical_war_room",
+    "commodity":             "commodity_research_team",
+    "global_alloc":          "global_allocation_committee",
+    "global_equities":       "global_equities_desk",
+    # Sentiment (3 swarms)
+    "sentiment":             "sentiment_intelligence_team",
+    "social_alpha":          "social_alpha_team",
+    "insider_flow":          "insider_flow_desk",
+    # Quant (6 swarms)
+    "quant":                 "quant_strategy_desk",
+    "factor":                "factor_research_committee",
+    "pairs":                 "pairs_research_lab",
+    "stat_arb":              "statistical_arbitrage_desk",
+    "ml_quant":              "ml_quant_lab",
+    "event_driven":          "event_driven_task_force",
+    # Risk (1 swarm)
+    "risk":                  "risk_committee",
+    # Portfolio (3 swarms)
+    "investment":            "investment_committee",
+    "portfolio":             "portfolio_review_board",
+    "portfolio_opt":         "portfolio_optimization_desk",
+    # Asset Class (5 swarms)
+    "etf":                   "etf_allocation_desk",
+    "credit":                "credit_research_team",
+    "derivatives":           "derivatives_strategy_desk",
+    "fund_select":           "fund_selection_panel",
+    "convertible_bond":      "convertible_bond_team",
+    # Crypto (2 swarms)
+    "crypto_research":       "crypto_research_lab",
+    "crypto_trading":        "crypto_trading_desk",
 }
 
-# Human-readable labels
+
 SWARM_LABELS: dict[str, str] = {
-    "technical":       "Technical Analysis Panel (6 agents)",
-    "fundamental":     "Fundamental Research Team (4 agents)",
-    "earnings":        "Earnings Research Desk (4 agents)",
-    "equity":          "Equity Research Team (4 agents)",
-    "macro":           "Macro Strategy Forum (4 agents)",
-    "macro_rates":     "Macro Rates & FX Desk (4 agents)",
-    "sector":          "Sector Rotation Team (4 agents)",
-    "geopolitical":    "Geopolitical War Room (4 agents)",
-    "commodity":       "Commodity Research Team (3 agents)",
-    "global_alloc":    "Global Allocation Committee (4 agents)",
-    "global_equities": "Global Equities Desk (4 agents)",
-    "quant":           "Quant Strategy Desk (4 agents)",
-    "factor":          "Factor Research Committee (4 agents)",
-    "pairs":           "Pairs Research Lab (4 agents)",
-    "stat_arb":        "Statistical Arbitrage Desk (4 agents)",
-    "ml_quant":        "ML Quant Lab (3 agents)",
-    "event_driven":    "Event-Driven Task Force (3 agents)",
-    "risk":            "Risk Committee (4 agents)",
-    "investment":      "Investment Committee (4 agents)",
-    "portfolio":       "Portfolio Review Board (4 agents)",
-    "sentiment":       "Sentiment Intelligence Team (4 agents)",
-    "social_alpha":    "Social Alpha Team (4 agents)",
-    "etf":             "ETF Allocation Desk (4 agents)",
-    "credit":          "Credit Research Team (4 agents)",
-    "derivatives":     "Derivatives Strategy Desk (3 agents)",
-    "fund_select":     "Fund Selection Panel (3 agents)",
-    "convertible_bond":"Convertible Bond Team (4 agents)",
-    "crypto_research": "Crypto Research Lab (4 agents)",
-    "crypto_trading":  "Crypto Trading Desk (4 agents)",
+    "technical":             "Technical Analysis Panel (6 agents)",
+    "elliott_harmonic":      "Elliott & Harmonic Panel (4 agents)",
+    "volatility_seasonal":   "Volatility & Seasonal Desk (4 agents)",
+    "market_microstructure": "Market Microstructure Desk (4 agents)",
+    "fundamental":           "Fundamental Research Team (4 agents)",
+    "earnings":              "Earnings Research Desk (4 agents)",
+    "equity":                "Equity Research Team (4 agents)",
+    "valuation":             "Valuation Committee (4 agents)",
+    "macro":                 "Macro Strategy Forum (4 agents)",
+    "macro_rates":           "Macro Rates & FX Desk (4 agents)",
+    "sector":                "Sector Rotation Team (4 agents)",
+    "geopolitical":          "Geopolitical War Room (4 agents)",
+    "commodity":             "Commodity Research Team (3 agents)",
+    "global_alloc":          "Global Allocation Committee (4 agents)",
+    "global_equities":       "Global Equities Desk (4 agents)",
+    "sentiment":             "Sentiment Intelligence Team (4 agents)",
+    "social_alpha":          "Social Alpha Team (4 agents)",
+    "insider_flow":          "Insider & Fund Flow Desk (3 agents)",
+    "quant":                 "Quant Strategy Desk (4 agents)",
+    "factor":                "Factor Research Committee (4 agents)",
+    "pairs":                 "Pairs Research Lab (4 agents)",
+    "stat_arb":              "Statistical Arbitrage Desk (4 agents)",
+    "ml_quant":              "ML Quant Lab (3 agents)",
+    "event_driven":          "Event-Driven Task Force (3 agents)",
+    "risk":                  "Risk Committee (4 agents)",
+    "investment":            "Investment Committee (4 agents)",
+    "portfolio":             "Portfolio Review Board (4 agents)",
+    "portfolio_opt":         "Portfolio Optimization Desk (4 agents)",
+    "etf":                   "ETF Allocation Desk (4 agents)",
+    "credit":                "Credit Research Team (4 agents)",
+    "derivatives":           "Derivatives Strategy Desk (3 agents)",
+    "fund_select":           "Fund Selection Panel (3 agents)",
+    "convertible_bond":      "Convertible Bond Team (4 agents)",
+    "crypto_research":       "Crypto Research Lab (4 agents)",
+    "crypto_trading":        "Crypto Trading Desk (4 agents)",
 }
 
-# Nhóm để hiển thị trong /help
+# Nhóm hiển thị trong /vibe (không arg) — dùng emoji + skill count
 SWARM_GROUPS: dict[str, list[str]] = {
-    "Technical":   ["technical"],
-    "Fundamental": ["fundamental", "earnings", "equity"],
-    "Macro":       ["macro", "macro_rates", "sector", "geopolitical",
-                    "commodity", "global_alloc", "global_equities"],
-    "Quant":       ["quant", "factor", "pairs", "stat_arb", "ml_quant", "event_driven"],
-    "Risk/Portf":  ["risk", "investment", "portfolio"],
-    "Sentiment":   ["sentiment", "social_alpha"],
-    "Asset Class": ["etf", "credit", "derivatives", "fund_select", "convertible_bond"],
-    "Crypto":      ["crypto_research", "crypto_trading"],
+    "📊 Technical (25 skills)": [
+        "technical", "elliott_harmonic",
+        "volatility_seasonal", "market_microstructure",
+    ],
+    "📈 Fundamental (15 skills)": [
+        "fundamental", "earnings", "equity", "valuation",
+    ],
+    "🌍 Macro (10 skills)": [
+        "macro", "macro_rates", "sector", "geopolitical",
+        "commodity", "global_alloc", "global_equities",
+    ],
+    "💬 Sentiment (8 skills)": [
+        "sentiment", "social_alpha", "insider_flow",
+    ],
+    "🔢 Quant (10 skills)": [
+        "quant", "factor", "pairs",
+        "stat_arb", "ml_quant", "event_driven",
+    ],
+    "🛡️ Risk (5 skills)": ["risk"],
+    "💼 Portfolio (8 skills)": [
+        "investment", "portfolio", "portfolio_opt",
+    ],
+    "🏦 Asset Class": [
+        "etf", "credit", "derivatives",
+        "fund_select", "convertible_bond",
+    ],
+    "₿ Crypto": ["crypto_research", "crypto_trading"],
 }
 
-# user_vars builder — mỗi preset cần biến khác nhau
+# Quick alias — viết tắt thân thiện cho /vibe <symbol> <keyword>
+QUICK_ALIASES: dict[str, str] = {
+    "ta": "technical", "ky_thuat": "technical", "chart": "technical",
+    "wave": "elliott_harmonic", "harmonic": "elliott_harmonic", "elliott": "elliott_harmonic",
+    "vol": "volatility_seasonal", "seasonal": "volatility_seasonal", "hv": "volatility_seasonal",
+    "flow": "market_microstructure", "micro": "market_microstructure",
+    "cs": "fundamental", "co_ban": "fundamental",
+    "dcf": "valuation", "gia_tri": "valuation",
+    "loi_nhuan": "earnings", "eps": "earnings",
+    "vi_mo": "macro", "lai_suat": "macro_rates", "ty_gia": "macro_rates",
+    "nganh": "sector", "geo": "geopolitical", "hang_hoa": "commodity",
+    "toan_cau": "global_alloc", "global": "global_equities",
+    "tamly": "sentiment", "news": "sentiment",
+    "social": "social_alpha", "insider": "insider_flow",
+    "ml": "ml_quant", "arb": "stat_arb", "event": "event_driven",
+    "rui_ro": "risk", "var": "risk",
+    "danh_muc": "portfolio", "optimize": "portfolio_opt",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# USER VARS BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _infer_sector(symbol: str) -> str:
+    _MAP = {
+        frozenset(["VCB","BID","CTG","TCB","MBB","VPB","ACB","HDB","STB","LPB",
+                   "TPB","MSB","VIB","OCB","SHB","EIB"]): "banking",
+        frozenset(["VIC","VHM","NVL","DXG","PDR","KDH","BCM","DIG","HDC"]): "real_estate",
+        frozenset(["FPT","MWG","DGW","CMG","VGI","ELC"]): "technology_retail",
+        frozenset(["HPG","HSG","NKG","TLH","VGS","SMC","POM"]): "steel_materials",
+        frozenset(["GAS","PLX","PVD","PVS","BSR","OIL"]): "energy",
+        frozenset(["VNM","SAB","MCH","MSN","QNS","KDC","SBT"]): "consumer",
+        frozenset(["SSI","VND","HCM","VCI","BSI","FTS","MBS"]): "securities",
+    }
+    for s, sector in _MAP.items():
+        if symbol in s:
+            return sector
+    return "diversified"
+
+
 def _build_user_vars(alias: str, symbol: str, market: str,
                      timeframe: str, extra: dict) -> dict:
-    """Build user_vars dict phù hợp với YAML template của từng preset."""
     vn_market = market or "Vietnam HOSE/HNX"
+    skills    = SKILLS_COVERAGE.get(alias, [])
+    archetype, n_agents = SWARM_AGENT_INFO.get(alias, ("the_strategists", 4))
     base = {
-        # Biến chung — hầu hết preset dùng ít nhất 1 trong số này
-        "target":          f"{symbol} ({vn_market})",
-        "market":          vn_market,
-        "timeframe":       timeframe or "daily",
-        "horizon":         "1 month",
-        "goal":            f"Phan tich co phieu {symbol} tren {vn_market}",
-        "risk_tolerance":  "medium",
-        # Biến đặc biệt theo nhóm
-        "commodity":       symbol,
-        "crisis":          f"Tac dong den co phieu {symbol}",
-        "factor_type":     "momentum,value,quality",
-        "sector":          "financials",
-        "event_type":      "earnings,macro,policy",
-        "view":            f"Neutral to slightly bullish on {symbol}",
-        "fund_type":       "equity",
-        "strategy_type":   "balanced",
-        "target_variable": "5-day forward return",
-        "portfolio":       f"{symbol} position",
-        "review_period":   "last 30 days",
-        "risk_profile":    "balanced",
+        "target":           f"{symbol} ({vn_market})",
+        "market":           vn_market,
+        "timeframe":        timeframe or "daily",
+        "horizon":          "1 month",
+        "goal":             f"Phan tich co phieu {symbol} tren {vn_market}",
+        "risk_tolerance":   "medium",
+        "agent_archetype":  archetype,
+        "n_agents":         str(n_agents),
+        "skills_used":      ", ".join(skills[:8]),
+        "commodity":        symbol,
+        "crisis":           f"Tac dong den co phieu {symbol}",
+        "factor_type":      "momentum, value, quality",
+        "sector":           _infer_sector(symbol),
+        "event_type":       "earnings, macro, policy",
+        "view":             f"Neutral — phan tich khach quan {symbol}",
+        "fund_type":        "equity",
+        "strategy_type":    "balanced",
+        "target_variable":  "5-day forward return",
+        "portfolio":        f"{symbol} position",
+        "review_period":    "last 30 days",
+        "risk_profile":     "balanced",
+        "pair_asset":       "VNINDEX",
+        "benchmark":        "VNINDEX",
     }
     base.update(extra)
     return base
 
 
-# ── HTTP helpers ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# HTTP HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _headers() -> dict:
     h = {"Content-Type": "application/json"}
@@ -192,12 +391,23 @@ def _headers() -> dict:
 
 def is_available() -> bool:
     if not VIBE_API_URL:
+        logger.warning("is_available: VIBE_API_URL chua duoc set")
         return False
+    health_url = f"{VIBE_API_URL}/health"
     try:
-        r = requests.get(f"{VIBE_API_URL}/health",
-                         timeout=REQUEST_TIMEOUT)
-        return r.status_code == 200
-    except Exception:
+        r = requests.get(health_url, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 200:
+            return True
+        logger.warning(f"is_available: /health HTTP {r.status_code}")
+        return False
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"is_available: Connection failed: {e}")
+        return False
+    except requests.exceptions.Timeout:
+        logger.error(f"is_available: Timeout sau {REQUEST_TIMEOUT}s")
+        return False
+    except Exception as e:
+        logger.error(f"is_available: {type(e).__name__}: {e}")
         return False
 
 
@@ -214,27 +424,35 @@ def list_presets() -> list[dict]:
         return []
 
 
-# ── Core functions ────────────────────────────────────────────────────────────
+def resolve_alias(alias: str) -> Optional[str]:
+    """Resolve alias → canonical alias (hỗ trợ quick alias + partial match)."""
+    alias = alias.lower().strip()
+    canonical = QUICK_ALIASES.get(alias, alias)
+    if canonical in SWARM_ALIASES:
+        return canonical
+    for key in SWARM_ALIASES:
+        if alias in key or key.startswith(alias):
+            return key
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def start_swarm(alias: str, symbol: str,
                 market: str = "Vietnam HOSE/HNX",
                 timeframe: str = "daily",
                 extra_vars: Optional[dict] = None) -> Optional[str]:
-    """
-    Khởi động swarm run.
-    Trả về run_id hoặc None nếu lỗi.
-    """
     if not VIBE_API_URL:
         logger.error("VIBE_API_URL chua set")
         return None
-
-    preset_name = SWARM_ALIASES.get(alias)
-    if not preset_name:
-        logger.error(f"Alias '{alias}' khong ton tai. Dung: {list(SWARM_ALIASES)}")
+    canonical = resolve_alias(alias)
+    if not canonical:
+        logger.error(f"Alias '{alias}' khong ton tai")
         return None
-
-    user_vars = _build_user_vars(alias, symbol, market, timeframe, extra_vars or {})
-
+    preset_name = SWARM_ALIASES[canonical]
+    user_vars   = _build_user_vars(canonical, symbol, market, timeframe, extra_vars or {})
     try:
         r = requests.post(
             f"{VIBE_API_URL}/swarm/runs",
@@ -253,29 +471,18 @@ def start_swarm(alias: str, symbol: str,
 
 def poll_swarm(run_id: str,
                progress_callback: Optional[Callable] = None) -> dict:
-    """
-    Poll swarm run đến khi xong.
-    Chờ tasks xuất hiện trước (run mới tạo có tasks=[]).
-    Trả về dict: {status, final_report, tasks, elapsed_seconds}
-    """
     if not VIBE_API_URL:
         return {"status": "error", "error": "VIBE_API_URL chua set"}
-
-    start    = time.time()
-    last_done = -1
-    # Chờ tối đa 30s để tasks xuất hiện (swarm cần thời gian init)
+    start          = time.time()
+    last_done      = -1
     tasks_appeared = False
-
     while True:
         elapsed = time.time() - start
         if elapsed > POLL_TIMEOUT:
-            return {"status": "error",
-                    "error": f"Timeout sau {int(POLL_TIMEOUT/60)} phut"}
-
+            return {"status": "error", "error": f"Timeout sau {int(POLL_TIMEOUT/60)} phut"}
         try:
-            r = requests.get(
-                f"{VIBE_API_URL}/swarm/runs/{run_id}",
-                headers=_headers(), timeout=REQUEST_TIMEOUT)
+            r = requests.get(f"{VIBE_API_URL}/swarm/runs/{run_id}",
+                             headers=_headers(), timeout=REQUEST_TIMEOUT)
             r.raise_for_status()
             data = r.json()
         except Exception as e:
@@ -283,11 +490,10 @@ def poll_swarm(run_id: str,
             time.sleep(POLL_INTERVAL)
             continue
 
-        status = data.get("status", "")
-        tasks  = data.get("tasks", [])
+        status  = data.get("status", "")
+        tasks   = data.get("tasks", [])
         n_tasks = len(tasks)
 
-        # Chờ tasks xuất hiện (swarm đang init)
         if n_tasks == 0 and not tasks_appeared and elapsed < 60:
             if progress_callback and int(elapsed) % 10 == 0:
                 try: progress_callback(f"Khoi dong agents... ({int(elapsed)}s)")
@@ -297,26 +503,21 @@ def poll_swarm(run_id: str,
         if n_tasks > 0:
             tasks_appeared = True
 
-        # Đếm done — status là string ("completed", "in_progress"...)
         done = sum(1 for t in tasks
                    if t.get("status") in ("completed", "failed", "cancelled"))
 
-        # Progress update
         if progress_callback and done != last_done:
-            last_done = done
-            in_prog = [t.get("agent_id", t.get("id","?")) for t in tasks
-                       if t.get("status") == "in_progress"]
-            done_agents = [t.get("agent_id", t.get("id","?")) for t in tasks
-                           if t.get("status") == "completed"][-3:]
+            last_done  = done
+            in_prog    = [t.get("agent_id", t.get("id","?")) for t in tasks
+                          if t.get("status") == "in_progress"]
+            done_last3 = [t.get("agent_id", t.get("id","?")) for t in tasks
+                          if t.get("status") == "completed"][-3:]
             try:
-                prog_lines = [f"Agents: {done}/{n_tasks} xong ({int(elapsed)}s)"]
-                if in_prog:
-                    prog_lines.append(f"Dang chay: {', '.join(in_prog[:3])}")
-                if done_agents:
-                    prog_lines.append(f"Vua xong: {', '.join(done_agents)}")
-                progress_callback("\n".join(prog_lines))
-            except Exception:
-                pass
+                lines = [f"Agents: {done}/{n_tasks} xong ({int(elapsed)}s)"]
+                if in_prog:    lines.append(f"Dang chay: {', '.join(in_prog[:3])}")
+                if done_last3: lines.append(f"Vua xong: {', '.join(done_last3)}")
+                progress_callback("\n".join(lines))
+            except Exception: pass
 
         if status == "completed":
             return {
@@ -327,18 +528,10 @@ def poll_swarm(run_id: str,
                 "elapsed_seconds": round(elapsed),
             }
         if status in ("failed", "cancelled"):
-            # Lấy thông tin lỗi từ tasks
-            failed_tasks = [t for t in tasks if t.get("status") == "failed"]
-            err_detail = ""
-            if failed_tasks:
-                err_detail = f" | Task loi: {failed_tasks[0].get('error','')[:100]}"
-            return {
-                "status":  status,
-                "error":   f"Swarm {status}{err_detail}",
-                "tasks":   tasks,
-                "elapsed_seconds": round(elapsed),
-            }
-
+            failed = [t for t in tasks if t.get("status") == "failed"]
+            err    = f" | {failed[0].get('error','')[:100]}" if failed else ""
+            return {"status": status, "error": f"Swarm {status}{err}",
+                    "tasks": tasks, "elapsed_seconds": round(elapsed)}
         time.sleep(POLL_INTERVAL)
 
 
@@ -347,8 +540,12 @@ def run_swarm_sync(alias: str, symbol: str,
                    timeframe: str = "daily",
                    extra_vars: Optional[dict] = None,
                    progress_callback: Optional[Callable] = None) -> dict:
-    """Start + poll trong 1 lệnh."""
-    run_id = start_swarm(alias, symbol, market, timeframe, extra_vars)
+    """Start + poll trong 1 lệnh. Hỗ trợ quick alias."""
+    canonical = resolve_alias(alias)
+    if not canonical:
+        return {"status": "error",
+                "error": f"Alias '{alias}' khong hop le. Dung /vibe de xem danh sach."}
+    run_id = start_swarm(canonical, symbol, market, timeframe, extra_vars)
     if not run_id:
         return {"status": "error",
                 "error": "Khong khoi dong duoc swarm. Kiem tra VIBE_API_URL va VIBE_API_KEY."}
@@ -356,43 +553,61 @@ def run_swarm_sync(alias: str, symbol: str,
 
 
 def format_swarm_result(result: dict, symbol: str, alias: str) -> str:
-    """Format kết quả swarm thành text Telegram-ready (< 4000 ký tự)."""
-    status = result.get("status", "unknown")
+    """Format kết quả swarm thành text Telegram-ready (<=4000 ký tự)."""
+    canonical = resolve_alias(alias) or alias
+    label     = SWARM_LABELS.get(canonical, canonical.upper())
+    status    = result.get("status", "unknown")
 
     if status != "completed":
         err = result.get("error", "Unknown error")
-        label = SWARM_LABELS.get(alias, alias.upper())
-        return (f"Vibe-Trading — {label}\n"
-                f"Ma: {symbol} | Trang thai: {status}\n"
-                f"Loi: {err}")
+        return (f"Vibe-Trading — {label}\nMa: {symbol} | {status}\nLoi: {err}")
 
     elapsed  = result.get("elapsed_seconds", 0)
     tasks    = result.get("tasks", [])
     n_done   = sum(1 for t in tasks if t.get("status") == "completed")
     n_total  = len(tasks)
-    label    = SWARM_LABELS.get(alias, alias.upper())
+    skills   = SKILLS_COVERAGE.get(canonical, [])
+    archetype, _ = SWARM_AGENT_INFO.get(canonical, ("", 0))
+    arch_desc    = AGENT_ARCHETYPES.get(archetype, "")
 
     header = (
         f"VIBE-TRADING — {label}\n"
-        f"Ma: {symbol} | {n_done}/{n_total} agents | "
-        f"{elapsed//60}p{elapsed%60}s\n"
+        f"Ma: {symbol} | {n_done}/{n_total} agents | {elapsed//60}p{elapsed%60}s\n"
+        f"Skills: {', '.join(skills[:5])}{'...' if len(skills)>5 else ''}\n"
+        f"Role: {arch_desc}\n"
         f"{'='*36}\n\n"
     )
 
     final_report = result.get("final_report", "")
     if not final_report:
-        # Fallback: lấy output agent cuối
         completed = [t for t in tasks if t.get("status") == "completed"]
         if completed:
-            last  = completed[-1]
-            output = (last.get("output") or "")[:800]
-            final_report = f"[{last.get('agent_id','?')}]\n{output}"
+            last         = completed[-1]
+            final_report = f"[{last.get('agent_id','?')}]\n{(last.get('output') or '')[:800]}"
         else:
             final_report = "Khong co bao cao."
 
     max_body = 4000 - len(header) - 60
-    body = final_report[:max_body]
+    body     = final_report[:max_body]
     if len(final_report) > max_body:
         body += "\n...[xem day du tren Vibe-Trading dashboard]"
-
     return header + body
+
+
+def get_swarm_info(alias: str) -> str:
+    """Trả về thông tin chi tiết về 1 swarm (dùng cho /vibestatus <alias>)."""
+    canonical = resolve_alias(alias)
+    if not canonical:
+        return f"Alias '{alias}' khong tim thay. Dung /vibe de xem danh sach."
+    label            = SWARM_LABELS.get(canonical, canonical)
+    skills           = SKILLS_COVERAGE.get(canonical, [])
+    archetype, n_ag  = SWARM_AGENT_INFO.get(canonical, ("?", 0))
+    arch_desc        = AGENT_ARCHETYPES.get(archetype, "")
+    preset           = SWARM_ALIASES.get(canonical, "?")
+    return "\n".join([
+        f"Swarm: {label}",
+        f"Preset: {preset}",
+        f"Agents: {n_ag} ({archetype})",
+        f"Archetype: {arch_desc}",
+        f"Skills ({len(skills)}): {', '.join(skills)}",
+    ])
