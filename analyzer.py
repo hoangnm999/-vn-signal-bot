@@ -6,13 +6,8 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
-# ── Vibe-Trading 10 engines (candlestick, ichimoku, smc, elliott, harmonic,
-#    technical-basic, volatility, seasonal, cross-market, multi-factor) ───────
-try:
-    from vibe_skills import run_vibe_agents as _run_vibe
-    _VIBE_AVAILABLE = True
-except Exception:
-    _VIBE_AVAILABLE = False
+# ── Vibe-Trading availability check — import thực sự ở dòng ~840 ─────────────
+_VIBE_AVAILABLE = False  # placeholder, sẽ được set lại khi import thực tế bên dưới
 
 DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY")
 DEEPSEEK_URL      = "https://api.deepseek.com/v1/chat/completions"
@@ -1315,7 +1310,7 @@ def _build_message_safe(
             # Nếu cả short cũng không vừa → bỏ qua agent này
 
     detail_section = detail_header + "\n".join(detail_parts)
-    return header + detail_section + vibe_section + footer
+    return header + detail_section + footer
 
 
 def _fmt_price(p):
@@ -1525,37 +1520,70 @@ def _vibe_verdict(vibe: dict, ind: dict, market: dict, news: dict) -> dict:
     Tổng hợp verdict từ kết quả Vibe-Trading engines.
     Thêm 2 context signals: Market Regime + News Sentiment.
     """
-    signals = dict(vibe["signals"])  # 7 Vibe signals
+    signals = dict(vibe["signals"])  # 14 Vibe signals
+    context_details = {}  # detail text cho MarketRegime + NewsSentiment
 
     # ── Context signal: Market Regime ─────────────────────────────────────
     if market.get("success"):
         chg_5d  = market["change_5d"]
         above   = market.get("above_ma20", False)
         chg_20d = market.get("change_20d", 0)
+        proxy   = market.get("proxy", "proxy")
         bull_mkt = sum([chg_5d > 1, chg_20d > 3, above])
         bear_mkt = sum([chg_5d < -1, chg_20d < -3, not above])
-        if bull_mkt >= 2:   signals["MarketRegime"] = 1
-        elif bear_mkt >= 2: signals["MarketRegime"] = -1
-        else:               signals["MarketRegime"] = 0
+        if bull_mkt >= 2:
+            signals["MarketRegime"] = 1
+            mr_label = "UPTREND"
+        elif bear_mkt >= 2:
+            signals["MarketRegime"] = -1
+            mr_label = "DOWNTREND"
+        else:
+            signals["MarketRegime"] = 0
+            mr_label = "SIDEWAYS"
+        context_details["MarketRegime"] = (
+            f"{proxy} {market['vnindex']:,.1f} | "
+            f"5D={chg_5d:+.1f}% 20D={chg_20d:+.1f}% | "
+            f"{'Tren' if above else 'Duoi'} MA20 | Regime={mr_label} "
+            f"(bull={bull_mkt}/3 bear={bear_mkt}/3)"
+        )
     else:
         signals["MarketRegime"] = 0
+        context_details["MarketRegime"] = f"Khong lay duoc data thi truong: {market.get('error','unknown')}"
 
     # ── Context signal: News Sentiment ────────────────────────────────────
+    # Dung keyword cu the hon de tranh false positive
+    _POS_KW = [
+        "loi nhuan tang", "tang truong", "ket qua kinh doanh tot",
+        "vuot ke hoach", "khuyen nghi mua", "co tuc",
+        "hop dong lon", "don hang moi", "dot pha doanh thu",
+        "tich cuc", "phuc hoi", "tang manh",
+    ]
+    _NEG_KW = [
+        "thua lo", "loi nhuan giam", "doanh thu giam", "sut giam manh",
+        "khuyen nghi ban", "canh bao rui ro", "vi pham", "bi phat",
+        "no xau tang", "mat thanh khoan", "sa thai hang loat",
+        "tieu cuc", "suy giam", "giam manh",
+    ]
     if news.get("success") and news.get("headlines"):
         text_all = " ".join(news["headlines"]).lower()
-        pos = sum(1 for kw in [
-            "tang","loi nhuan","tang truong","ket qua tot","tich cuc",
-            "mua vao","co tuc","hop dong lon","vuot ke hoach","dot pha",
-        ] if kw in text_all)
-        neg = sum(1 for kw in [
-            "giam","thua lo","sut giam","tieu cuc","ban ra","rui ro",
-            "canh bao","vi pham","no xau","mat thanh khoan","sa thai",
-        ] if kw in text_all)
-        if pos > neg * 1.5:   signals["NewsSentiment"] = 1
-        elif neg > pos * 1.5: signals["NewsSentiment"] = -1
-        else:                 signals["NewsSentiment"] = 0
+        pos = sum(1 for kw in _POS_KW if kw in text_all)
+        neg = sum(1 for kw in _NEG_KW if kw in text_all)
+        total_hl = len(news["headlines"])
+        if pos > neg * 1.5 and pos >= 2:
+            signals["NewsSentiment"] = 1
+            ns_label = "TICH CUC"
+        elif neg > pos * 1.5 and neg >= 2:
+            signals["NewsSentiment"] = -1
+            ns_label = "TIEU CUC"
+        else:
+            signals["NewsSentiment"] = 0
+            ns_label = "TRUNG LAP"
+        context_details["NewsSentiment"] = (
+            f"{total_hl} headlines | pos={pos} neg={neg} | {ns_label}"
+        )
     else:
         signals["NewsSentiment"] = 0
+        context_details["NewsSentiment"] = "Khong lay duoc tin tuc"
 
     # ── Tổng hợp vote ─────────────────────────────────────────────────────
     n_active = len(signals)
@@ -1659,6 +1687,7 @@ def _vibe_verdict(vibe: dict, ind: dict, market: dict, news: dict) -> dict:
         "verdict_label": verdict_label, "confidence_pct": conf_pct,
         "bull_count": bull, "bear_count": bear, "active_agents": n_active,
         "signals": signals,
+        "context_details": context_details,
         "summary": summary, "negative": neg_txt, "action_plan": action_plan,
     }
 
@@ -1724,11 +1753,13 @@ def _build_vibe_message(
         )
 
     # Vibe details (rút gọn cho vừa Telegram)
-    details = vibe.get("details", {})
+    # Gộp: 14 engine details + 2 context agent details
+    details = dict(vibe.get("details", {}))
+    details.update(verdict.get("context_details", {}))
     detail_lines = []
-    for name, desc in details.items():
-        sig = sigs.get(name, 0)
-        short = desc[:80].replace("\n", " ")
+    for name, v in sigs.items():
+        desc = details.get(name, "")
+        short = desc[:100].replace("\n", " ")
         detail_lines.append(f"  [{name}] {short}")
     detail_block = "\nCHI TIET:\n" + "\n".join(detail_lines) if detail_lines else ""
 
@@ -1852,10 +1883,10 @@ def scan_watchlist(watchlist: list) -> str:
 
 def analyze_stock_full(symbol: str) -> tuple:
     """
-    Giống analyze_stock() nhưng trả về tuple (msg, metadata).
-    metadata dùng để lưu DB qua save_signal() trong bot.py.
+    Phân tích dùng Vibe-Trading 14 engines + 2 context (16 agents tổng).
+    Trả về (msg, metadata) — metadata dùng để lưu DB qua save_signal() trong bot.py.
     """
-    # 1. Thu thập data (bỏ fundamental và foreign_flow)
+    # 1. Thu thập data song song
     with ThreadPoolExecutor(max_workers=3) as ex:
         f_price  = ex.submit(get_price_data,  symbol, 500)  # 500 ngày: đủ cho Seasonal(3yr) + Volatility(252d)
         f_market = ex.submit(get_market_data)
@@ -1869,145 +1900,11 @@ def analyze_stock_full(symbol: str) -> tuple:
 
     try:
         ind = compute_indicators(price_data["df"])
-    except Exception as e:
-        return f"Loi tinh indicators {symbol}: {e}", None
-
-    # 2. Chạy 6 rule-based agents + 10 Vibe-Trading engines (song song)
-    try:
-        with ThreadPoolExecutor(max_workers=7) as ex:
-            f1 = ex.submit(run_trend_agent,         symbol, ind)
-            f2 = ex.submit(run_volume_agent,        symbol, ind)
-            f3 = ex.submit(run_risk_agent,          symbol, ind)
-            f4 = ex.submit(run_news_agent,          symbol, news_data)
-            f5 = ex.submit(run_market_regime_agent, market_data)
-            f6 = ex.submit(run_macro_agent,         news_data)
-            # Vibe-Trading engines chạy song song
-            f_vibe = ex.submit(_run_vibe_safe, symbol, price_data["df"]) if _VIBE_AVAILABLE else None
-            trend_txt,  trend_v  = f1.result()
-            volume_txt, volume_v = f2.result()
-            risk_txt,   risk_v   = f3.result()
-            news_txt,   news_v   = f4.result()
-            market_txt, market_v = f5.result()
-            macro_txt,  macro_v  = f6.result()
-            vibe_result = f_vibe.result() if f_vibe else None
-    except Exception as e:
-        return f"Loi khi chay agents {symbol}: {e}", None
-
-    agent_verdicts = {
-        "trend": trend_v, "volume": volume_v, "risk": risk_v,
-        "news": news_v, "market": market_v, "macro": macro_v,
-    }
-
-    # 3. Verdict từ 6 rule-based agents
-    try:
-        verdict = run_verdict_agent(symbol, agent_verdicts, ind)
-    except Exception as e:
-        return f"Loi verdict {symbol}: {e}", None
-
-    # 4. Format
-    final_v  = verdict["verdict_label"]
-    conf_pct = verdict["confidence_pct"]
-    ap       = verdict["action_plan"]
-    summary  = verdict["summary"]
-    negative = verdict["negative"]
-    bull     = verdict["bull_count"]
-    bear     = verdict["bear_count"]
-    n_agents = verdict["active_agents"]
-
-    emoji = {
-        "DONG THUAN MUA": "🟢", "NGHIENG MUA": "🟢",
-        "DONG THUAN BAN": "🔴", "NGHIENG BAN": "🔴",
-        "TRUNG LAP": "🟡",
-    }.get(final_v, "🟡")
-
-    vnindex_str = (f"{market_data['vnindex']:,} ({market_data['change_5d']:+.1f}% 5D)"
-                   if market_data.get("success") else "N/A")
-    now = datetime.now().strftime("%d/%m %H:%M")
-
-    agents_list = [
-        ("Xu huong", trend_v,  trend_txt),
-        ("Volume",   volume_v, volume_txt),
-        ("Rui ro",   risk_v,   risk_txt),
-        ("News",     news_v,   news_txt),
-        ("Market",   market_v, market_txt),
-        ("Macro",    macro_v,  macro_txt),
-    ]
-
-    msg = _build_message_safe_v2(
-        emoji, symbol, now, ind, vnindex_str,
-        agents_list, final_v, conf_pct, bull, bear, n_agents,
-        summary, ap, negative,
-        vibe_result=vibe_result,
-    )
-
-    metadata = {
-        "verdict":        verdict,
-        "ind":            ind,
-        "agent_verdicts": agent_verdicts,
-        "macro_v":        macro_v,
-        "vibe_result":    vibe_result,
-    }
-    return msg, metadata
-def analyze_stock(symbol: str) -> str:
-    """Phân tích mã chứng khoán dùng Vibe-Trading 7 engines + 2 context agents."""
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        f_price  = ex.submit(get_price_data,  symbol, 500)  # 500 ngày: đủ cho Seasonal(3yr) + Volatility(252d)
-        f_market = ex.submit(get_market_data)
-        f_news   = ex.submit(get_news_data,   symbol)
-        price_data  = f_price.result()
-        market_data = f_market.result()
-        news_data   = f_news.result()
-
-    if not price_data["success"]:
-        return f"Khong lay duoc du lieu gia {symbol}: {price_data['error']}"
-    try:
-        ind = compute_indicators(price_data["df"])
-        ind["symbol"] = symbol
-    except Exception as e:
-        return f"Loi tinh indicators {symbol}: {e}"
-
-    # ── Chạy Vibe-Trading 7 engines ──────────────────────────────────────────
-    if not _VIBE_AVAILABLE:
-        return "vibe_skills.py chua duoc deploy. Them file vibe_skills.py vao project."
-    try:
-        vibe = _run_vibe_agents(symbol, price_data["df"])
-    except Exception as e:
-        return f"Loi Vibe-Trading engines: {e}"
-
-    # ── Tổng hợp verdict (bao gồm Market + News context) ─────────────────────
-    try:
-        verdict = _vibe_verdict(vibe, ind, market_data, news_data)
-    except Exception as e:
-        return f"Loi tong hop verdict: {e}"
-
-    fv   = verdict["verdict_label"]
-    emoji = {"DONG THUAN MUA":"🟢","NGHIENG MUA":"🟢",
-             "DONG THUAN BAN":"🔴","NGHIENG BAN":"🔴","TRUNG LAP":"🟡"}.get(fv,"🟡")
-    vnindex_str = (f"{market_data['vnindex']:,} ({market_data['change_5d']:+.1f}% 5D)"
-                   if market_data.get("success") else "N/A")
-    now = datetime.now().strftime("%d/%m %H:%M")
-
-    return _build_vibe_message(emoji, symbol, now, ind, vnindex_str, vibe, verdict)
-
-
-def analyze_stock_full(symbol: str) -> tuple:
-    """Trả về (msg, metadata) cho bot.py — metadata dùng để lưu DB."""
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        f_price  = ex.submit(get_price_data,  symbol, 500)  # 500 ngày: đủ cho Seasonal(3yr) + Volatility(252d)
-        f_market = ex.submit(get_market_data)
-        f_news   = ex.submit(get_news_data,   symbol)
-        price_data  = f_price.result()
-        market_data = f_market.result()
-        news_data   = f_news.result()
-
-    if not price_data["success"]:
-        return f"Khong lay duoc du lieu gia {symbol}: {price_data['error']}", None
-    try:
-        ind = compute_indicators(price_data["df"])
         ind["symbol"] = symbol
     except Exception as e:
         return f"Loi tinh indicators {symbol}: {e}", None
 
+    # 2. Chạy 14 Vibe-Trading engines
     if not _VIBE_AVAILABLE:
         return "vibe_skills.py chua duoc deploy cung project.", None
     try:
@@ -2015,31 +1912,33 @@ def analyze_stock_full(symbol: str) -> tuple:
     except Exception as e:
         return f"Loi Vibe-Trading engines: {e}", None
 
+    # 3. Tổng hợp verdict (14 Vibe + 2 context = 16 agents)
     try:
         verdict = _vibe_verdict(vibe, ind, market_data, news_data)
     except Exception as e:
         return f"Loi tong hop verdict: {e}", None
 
-    fv   = verdict["verdict_label"]
-    emoji = {"DONG THUAN MUA":"🟢","NGHIENG MUA":"🟢",
-             "DONG THUAN BAN":"🔴","NGHIENG BAN":"🔴","TRUNG LAP":"🟡"}.get(fv,"🟡")
+    # 4. Format message
+    fv    = verdict["verdict_label"]
+    emoji = {"DONG THUAN MUA": "🟢", "NGHIENG MUA": "🟢",
+             "DONG THUAN BAN": "🔴", "NGHIENG BAN": "🔴",
+             "TRUNG LAP": "🟡"}.get(fv, "🟡")
     vnindex_str = (f"{market_data['vnindex']:,} ({market_data['change_5d']:+.1f}% 5D)"
                    if market_data.get("success") else "N/A")
     now = datetime.now().strftime("%d/%m %H:%M")
 
     msg = _build_vibe_message(emoji, symbol, now, ind, vnindex_str, vibe, verdict)
 
-    # agent_verdicts theo format db.py expect
-    agent_verdicts = {k: ("MUA" if v>0 else "BAN" if v<0 else "TRUNG LAP")
-                      for k,v in verdict["signals"].items()}
-
+    # 5. Metadata cho DB
+    agent_verdicts = {k: ("MUA" if v > 0 else "BAN" if v < 0 else "TRUNG LAP")
+                      for k, v in verdict["signals"].items()}
     metadata = {
         "verdict":        verdict,
         "ind":            ind,
         "agent_verdicts": agent_verdicts,
-        "macro_v":        "THUAN LOI" if verdict["signals"].get("MarketRegime",0)>0
-                          else "RUI RO" if verdict["signals"].get("MarketRegime",0)<0
-                          else "TRUNG TINH",
+        "macro_v":        ("THUAN LOI" if verdict["signals"].get("MarketRegime", 0) > 0
+                           else "RUI RO" if verdict["signals"].get("MarketRegime", 0) < 0
+                           else "TRUNG TINH"),
         "vibe_result":    vibe,
     }
     return msg, metadata

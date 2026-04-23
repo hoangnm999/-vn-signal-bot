@@ -400,7 +400,9 @@ class ElliottEngine:
                     end_idx=wave["end"]; d=wave["dir"]
                     sig[(df.index>=wave["start"])&(df.index<=end_idx)]=d
                     sig[df.index>end_idx]=-d  # After wave5 → expect correction
-                    det=(f"5-song {'tang' if d>0 else 'giam'} phat hien. "
+                    cur_sig = _last(sig)
+                    phase = "dang song" if cur_sig == d else "dieu chinh sau song 5"
+                    det=(f"5-song {'tang' if d>0 else 'giam'} phat hien ({phase}). "
                          f"W1={round(wave['w1'],2)} W3={round(wave['w3'],2)} W5={round(wave['w5'],2)}")
             except Exception as e:
                 det=f"Loi: {e}"
@@ -548,9 +550,12 @@ class SeasonalEngine:
                 elif pw<=(1-self.th): sig[dt]=-1
         import datetime; cm=datetime.datetime.now().month
         mn=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-        bias=int(round(stats.get(cm,0.5)*100))
+        stats_dict = stats.to_dict()
+        bias=int(round(stats_dict.get(cm, 0.5)*100))
         cur_sig=_last(sig)
-        det=(f"Thang {mn[cm-1]}: lich su tang {bias}% lan. "
+        count_up = sum(1 for m_ret in hist[hist.index.month == cm] if m_ret > 0)
+        count_total = sum(1 for _ in hist[hist.index.month == cm])
+        det=(f"Thang {mn[cm-1]}: lich su tang {count_up}/{count_total} lan ({bias}%). "
              +("Thang nay thuong TANG." if cur_sig>0 else
                "Thang nay thuong GIAM." if cur_sig<0 else
                "Khong co xu huong ro rang."))
