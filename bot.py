@@ -90,7 +90,7 @@ def _validate_symbol(raw: str) -> tuple[bool, str]:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _get_watchlist(context) -> list:
     default = [s.strip() for s in
-               os.environ.get("WATCHLIST", "VCB,HPG,FPT,VNM,MWG,TCB").split(",")]
+               os.environ.get("WATCHLIST", "VCB,HPG,FPT,VNM,MWG,TCB ,STB, VCI, VIX, HHS, QCG, CTS, HAH, HTG, LPB, ORS, GIL, VDS, PC1, HPG, FRT, MCH, DGC, VND, BSR, BSI, PDR, CNG, GAS, DPM, DVP, FPT, HBC, VIC, AGG, VCB, CSV, CTG, VTP, DCM, PHP, DXS, HCM, NKG, SSI, MWG, HDB, POW, OCB, MBS, SHS, SZC").split(",")]
     return context.bot_data.get("watchlist", default)
 
 
@@ -176,8 +176,8 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ma khong hop le (2-10 chu cai/so, VD: VCB)."); return
 
     wl = _get_watchlist(context)
-    if len(wl) >= 20:
-        await update.message.reply_text("Watchlist da day (toi da 20 ma). Xoa bot roi them."); return
+    if len(wl) >= 100:
+        await update.message.reply_text("Watchlist da day (toi da 100 ma). Xoa bot roi them."); return
     if symbol not in wl:
         wl.append(symbol)
         context.bot_data["watchlist"] = wl
