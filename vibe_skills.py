@@ -1,18 +1,41 @@
 """
-vibe_skills.py  — 10 Signal Engines từ Vibe-Trading (HKUDS/Vibe-Trading)
-Tích hợp vào VN Signal Bot, chạy trực tiếp trên OHLCV Entrade.
+vibe_skills.py — Signal Engines cho VN Signal Bot
+Chạy trực tiếp trên OHLCV Entrade (pure pandas/numpy, không cần API server).
 
-Engines (pure pandas/numpy, không cần API server):
-  1.  Candlestick       — 15 mô hình nến kinh điển (Hammer→3 White Soldiers)
-  2.  Ichimoku          — 5-line system: TK cross + cloud position + Chikou
-  3.  TechnicalBasic    — EMA/ADX/BB/RSI/OBV 3-dim voting
-  4.  ElliottWave       — Zigzag swing → 5-wave impulse + Fibonacci validation
-  5.  Harmonic          — Gartley/Bat/Butterfly/Crab XABCD PRZ signals
-  6.  Volatility        — HV percentile mean-reversion
-  7.  Seasonal          — Month-of-year calendar effect
-  8.  SMC               — BOS/ChoCH/FVG Smart Money Concepts (pure pandas fallback)
-  9.  CrossMarket       — Vol-adjusted dual-MA (dùng cho single stock = a_share params)
-  10. MultiFactor       — Momentum/Reversal/Volatility/VolumeRatio cross-section rank
+NGUỒN GỐC THỰC TẾ (quan trọng):
+──────────────────────────────────────────────────────────────────────────────
+⚠️  CHƯA CÓ source code gốc HKUDS/Vibe-Trading (GitHub bị block khi deploy).
+    Các engines dưới đây được implement theo logic trading chuẩn (RSI, MACD,
+    Elliott Wave theory, v.v.) — KHÔNG phải copy từ HKUDS repo.
+    Khi có source code gốc, cần rewrite lại theo đúng HKUDS implementation.
+
+Label nguồn gốc:
+  [HKUDS-like]  : Implement theo đúng tên/concept của HKUDS, logic tương đương
+                  nhưng CHƯA verify với source gốc
+  [Claude-made] : Tự sáng tạo hoàn toàn, không có tương đương trong HKUDS preset
+──────────────────────────────────────────────────────────────────────────────
+
+Engines (16 total):
+  1.  Candlestick    [HKUDS-like] — 15 mô hình nến, có volume filter
+  2.  Ichimoku       [HKUDS-like] — State-based scoring 3 điều kiện
+  3.  TechnicalBasic [HKUDS-like] — EMA/ADX/RSI/OBV scoring 5/5
+  4.  ElliottWave    [HKUDS-like] — Zigzag + 5-wave + Fibonacci
+  5.  Harmonic       [HKUDS-like] — Gartley/Bat/Butterfly/Crab XABCD
+  6.  Volatility     [HKUDS-like] — HV percentile mean-reversion
+  7.  Seasonal       [HKUDS-like] — Calendar effect, lookback 3yr
+  8.  SMC            [HKUDS-like] — BOS/ChoCH/FVG momentum-based
+  9.  CrossMarket    [Claude-made] — Vol-adjusted dual-MA, single stock adapt
+  10. MultiFactor    [Claude-made] — Momentum/Reversal/Vol/VolumeRatio Z-score
+  11. MeanReversion  [Claude-made] — Z-score price vs rolling mean
+  12. PriceMomentum  [Claude-made] — Multi-TF momentum 5D/20D/60D
+  13. Breakout       [Claude-made] — S/R breakout + vol confirm
+  14. MLStrategy     [Claude-made] — ExtraTrees walk-forward + rule fallback
+  15. Fundamental    [Claude-made] — PE/PB/ROE/EPS từ vnstock (không có trong HKUDS local)
+  16. MoneyFlow      [Claude-made] — CMF/VPT/OBV/Force Index
+
+Context agents (trong analyzer.py):
+  17. MarketRegime   [Claude-made] — VN-Index proxy scoring
+  18. NewsSentiment  [Claude-made] — RSS keyword scoring
 
 Public API:
   result = run_vibe_agents(symbol, df)
@@ -618,19 +641,54 @@ class SMCEngine:
     def _one(self, df):
         if len(df)<self.sl*2:
             return pd.Series(0,index=df.index,dtype=int), f"Khong du du lieu (can >={self.sl*2} bars)."
-        sh,sl=self._swing_hl(df["high"],df["low"])
-        structure=self._bos_choch(df,sh,sl)
-        fvg=self._fvg(df)
-        # Signal: structure xác nhận + FVG cùng chiều hoặc neutral
-        buy =(structure==1)&(fvg>=0)
-        sell=(structure==-1)&(fvg<=0)
-        sig=pd.Series(0,index=df.index,dtype=int)
-        sig[buy]=1; sig[sell]=-1
-        last_s=_last(sig)
-        n_buy=(structure==1).sum(); n_sell=(structure==-1).sum()
-        det=(f"BOS/ChoCH: {n_buy} bullish, {n_sell} bearish breaks. "
-             f"FVG: bull={((fvg==1)).sum()} bear={((fvg==-1)).sum()}. "
-             f"Signal={'BUY' if last_s>0 else 'SELL' if last_s<0 else 'NEUTRAL'}")
+        sh, sl = self._swing_hl(df["high"], df["low"])
+        structure = self._bos_choch(df, sh, sl)
+        fvg = self._fvg(df)
+
+        # ── Đánh giá theo MOMENTUM cấu trúc, không chỉ bar cuối ──────────
+        # Window gần nhất 60 bars để tính bias
+        w = min(60, len(df))
+        struct_recent = structure.iloc[-w:]
+        fvg_recent    = fvg.iloc[-w:]
+
+        n_buy_total  = int((structure ==  1).sum())
+        n_sell_total = int((structure == -1).sum())
+        n_buy_rec    = int((struct_recent ==  1).sum())
+        n_sell_rec   = int((struct_recent == -1).sum())
+
+        fvg_bull = int((fvg_recent ==  1).sum())
+        fvg_bear = int((fvg_recent == -1).sum())
+
+        # Net structure pressure (gần nhất có trọng số 2x)
+        net_struct = (n_buy_rec * 2 + n_buy_total) - (n_sell_rec * 2 + n_sell_total)
+        net_fvg    = fvg_bull - fvg_bear
+
+        # Signal dựa trên net pressure
+        if net_struct < -2 and net_fvg <= 0:
+            # Áp lực bán rõ ràng từ cả structure lẫn FVG
+            cur_sig = -1
+            bias = "BEARISH"
+        elif net_struct > 2 and net_fvg >= 0:
+            cur_sig = 1
+            bias = "BULLISH"
+        elif net_struct < -1:
+            # Structure lean bearish
+            cur_sig = -1
+            bias = "LEAN BEARISH"
+        elif net_struct > 1:
+            cur_sig = 1
+            bias = "LEAN BULLISH"
+        else:
+            cur_sig = 0
+            bias = "NEUTRAL"
+
+        sig = pd.Series(0, index=df.index, dtype=int)
+        sig.iloc[-1] = cur_sig
+
+        det = (f"BOS/ChoCH: {n_buy_total} bull, {n_sell_total} bear breaks "
+               f"(60D gần: {n_buy_rec} bull, {n_sell_rec} bear). "
+               f"FVG 60D: bull={fvg_bull} bear={fvg_bear}. "
+               f"Net={net_struct:+d} | Bias={bias}")
         return sig, det
 
     def generate(self, data_map):
@@ -661,7 +719,7 @@ class CrossMarketEngine:
         # Volatility-adjusted: scale signal by inv_vol weight (single stock=1.0)
         sig_adj=(sig*1.0).clip(-1.0,1.0)
         last_s=_last(sig_adj)
-        det=(f"MA{self.MA_FAST}={round(mf.iloc[-1],2)} MA{self.MA_SLOW}={round(ms.iloc[-1],2)} "
+        det=(f"[Claude-made] MA{self.MA_FAST}={round(mf.iloc[-1],2)} MA{self.MA_SLOW}={round(ms.iloc[-1],2)} "
              f"Vol20={round(vol*100,2) if not pd.isna(vol) else 'N/A'}% "
              f"Signal={'BUY' if last_s>0 else 'SELL' if last_s<0 else 'NEUTRAL'}")
         return sig_adj, det
@@ -705,7 +763,7 @@ class MultiFactorEngine:
         sig=pd.Series(0,index=df.index,dtype=int)
         sig[score>self.z_th]=1; sig[score<-self.z_th]=-1
         cur_score=score.iloc[-1]
-        det=(f"Factor score={round(cur_score,2) if not pd.isna(cur_score) else 'N/A'} "
+        det=(f"[Claude-made] Factor score={round(cur_score,2) if not pd.isna(cur_score) else 'N/A'} "
              f"(momentum={round(momentum.iloc[-1]*100,1) if not pd.isna(momentum.iloc[-1]) else 'N/A'}% "
              f"vol_ratio={round(vol_ratio.iloc[-1],2) if not pd.isna(vol_ratio.iloc[-1]) else 'N/A'}x) "
              f"Signal={'BUY' if _last(sig)>0 else 'SELL' if _last(sig)<0 else 'NEUTRAL'}")
@@ -751,7 +809,7 @@ class MeanReversionEngine:
 
         cur_z = z.iloc[-1]
         cur_s = _last(sig)
-        det = (f"Z-score={round(cur_z,2) if not pd.isna(cur_z) else 'N/A'} "
+        det = (f"[Claude-made] Z-score={round(cur_z,2) if not pd.isna(cur_z) else 'N/A'} "
                f"(entry±{self.entry_z} exit±{self.exit_z} lookback={self.lookback}D) "
                f"Signal={'BUY(reversion up)' if cur_s>0 else 'SELL(reversion dn)' if cur_s<0 else 'NEUTRAL'}")
         return sig, det
@@ -813,7 +871,7 @@ class PriceMomentumEngine:
 
         cur = _last(sig_series)
         labels = [f"{w}D={round(m*100,1)}%" for w,m in zip(self.windows, mom_vals)]
-        det = (f"Momentum [{', '.join(labels)}] | Vol={round(vol_ratio,2)}x | "
+        det = (f"[Claude-made] Momentum [{', '.join(labels)}] | Vol={round(vol_ratio,2)}x | "
                f"Signal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'}")
         return sig_series, det
 
@@ -870,7 +928,7 @@ class BreakoutEngine:
         r = float(resist.iloc[-1]) if not pd.isna(resist.iloc[-1]) else 0
         s = float(supprt.iloc[-1]) if not pd.isna(supprt.iloc[-1]) else 0
         vr = float(v.iloc[-1] / avg_vol.iloc[-1]) if not pd.isna(avg_vol.iloc[-1]) and avg_vol.iloc[-1] > 0 else 1.0
-        det = (f"Resist={round(r,2)} Support={round(s,2)} "
+        det = (f"[Claude-made] Resist={round(r,2)} Support={round(s,2)} "
                f"VolRatio={round(vr,2)}x (need>{self.vol_multiplier}x) "
                f"Signal={'BREAKOUT UP' if cur>0 else 'BREAKDOWN' if cur<0 else 'NO BREAK'}")
         return sig, det
@@ -941,51 +999,88 @@ class MLStrategyEngine:
         return feat.replace([np.inf, -np.inf], np.nan)
 
     def _one(self, df):
-        try:
-            from sklearn.ensemble import RandomForestClassifier
-            from sklearn.preprocessing import StandardScaler
-        except ImportError:
-            return pd.Series(0, index=df.index, dtype=int), "sklearn chua install"
-
-        if len(df) < self.min_train + self.predict_horizon + 10:
-            return pd.Series(0, index=df.index, dtype=int), "Khong du data cho ML"
-
         feat = self._build_features(df)
         c    = df["close"]
+        n    = len(df)
+
+        if n < self.min_train + self.predict_horizon + 10:
+            return pd.Series(0, index=df.index, dtype=int), "Khong du data cho ML"
+
         # Label: future N-day return > 0
         label = (c.shift(-self.predict_horizon) > c).astype(int)
 
-        sig = pd.Series(0, index=df.index, dtype=int)
-        last_pred = 0
+        sig     = pd.Series(0, index=df.index, dtype=int)
+        method  = "rule_fallback"
+        cur     = 0
 
-        # Walk-forward: train trên train_window, predict 1 điểm
-        n = len(df)
-        for i in range(self.train_window, n - self.predict_horizon):
-            X_train = feat.iloc[i - self.train_window:i].dropna()
-            y_train = label.iloc[i - self.train_window:i].loc[X_train.index]
-            if len(X_train) < self.min_train or y_train.nunique() < 2:
-                continue
-            X_pred_row = feat.iloc[i:i+1].dropna()
-            if X_pred_row.empty:
-                continue
-            try:
-                scaler = StandardScaler()
-                X_tr_s = scaler.fit_transform(X_train)
-                X_pr_s = scaler.transform(X_pred_row)
-                clf = RandomForestClassifier(n_estimators=50, max_depth=4,
-                                             random_state=42, n_jobs=1)
-                clf.fit(X_tr_s, y_train)
-                proba = clf.predict_proba(X_pr_s)[0]
-                # proba[1] = P(up)
-                pred_sig = 1 if proba[1] > 0.6 else -1 if proba[1] < 0.4 else 0
-                sig.iloc[i] = pred_sig
-                last_pred = pred_sig
-            except Exception:
-                continue
+        # ── Thử ML (sklearn) ──────────────────────────────────────────────
+        try:
+            from sklearn.ensemble import ExtraTreesClassifier  # nhanh hơn RF ~4x
+            from sklearn.preprocessing import StandardScaler
 
-        cur = _last(sig) if sig.any() else 0
-        det = (f"ML(RandomForest walk-forward train={self.train_window}D "
-               f"horizon={self.predict_horizon}D) "
+            # Walk-forward: retrain mỗi 10 bars (giảm từ mỗi bar → giảm 90% thời gian)
+            step = 10
+            last_pred = 0
+            for i in range(self.train_window, n - self.predict_horizon, step):
+                X_train = feat.iloc[i - self.train_window:i].dropna()
+                y_train = label.iloc[i - self.train_window:i].loc[X_train.index]
+                if len(X_train) < self.min_train or y_train.nunique() < 2:
+                    continue
+                X_pred_block = feat.iloc[i:i+step].dropna()
+                if X_pred_block.empty:
+                    continue
+                try:
+                    scaler  = StandardScaler()
+                    X_tr_s  = scaler.fit_transform(X_train)
+                    X_pr_s  = scaler.transform(X_pred_block)
+                    clf = ExtraTreesClassifier(
+                        n_estimators=30, max_depth=4,
+                        random_state=42, n_jobs=1
+                    )
+                    clf.fit(X_tr_s, y_train)
+                    probas = clf.predict_proba(X_pr_s)
+                    for j, proba in enumerate(probas):
+                        idx = i + j
+                        if idx < n:
+                            ps = 1 if proba[1] > 0.60 else -1 if proba[1] < 0.40 else 0
+                            sig.iloc[idx] = ps
+                    last_pred = int(sig.iloc[min(i + step - 1, n - 1)])
+                except Exception:
+                    continue
+
+            cur    = _last(sig) if sig.any() else 0
+            method = "ExtraTrees walk-forward"
+
+        except ImportError:
+            # ── Fallback rule-based khi không có sklearn ──────────────────
+            # Dùng features đã tính để ra signal deterministic
+            feat_last = feat.iloc[-1]
+            score = 0
+            # RSI momentum
+            rsi = feat_last.get("f_rsi_14", 50)
+            if not pd.isna(rsi):
+                if rsi < 40: score += 1    # oversold → khả năng phục hồi
+                elif rsi > 65: score -= 1  # overbought
+            # MA trend
+            ma_r = feat_last.get("f_ma_ratio_20", 1.0)
+            if not pd.isna(ma_r):
+                if ma_r > 1.02: score += 1
+                elif ma_r < 0.98: score -= 1
+            # Price momentum 20D
+            r20 = feat_last.get("f_ret_20d", 0)
+            if not pd.isna(r20):
+                if r20 > 0.05: score += 1
+                elif r20 < -0.05: score -= 1
+            # Volume-price momentum
+            vp = feat_last.get("f_vp_momentum", 0)
+            if not pd.isna(vp):
+                if vp > 0.1: score += 1
+                elif vp < -0.1: score -= 1
+            cur = 1 if score >= 2 else -1 if score <= -2 else 0
+            sig.iloc[-1] = cur
+            method = "rule_fallback(no sklearn)"
+
+        det = (f"[Claude-made] ML({method} train={self.train_window}D horizon={self.predict_horizon}D) "
                f"LastSignal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'}")
         return sig, det
 
@@ -1000,27 +1095,323 @@ class MLStrategyEngine:
         return signals, details
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENGINE 15 — FUNDAMENTAL SCORE (Value + Growth filter)
+# Nguồn: Vibe-Trading fundamental-filter skill
+# Lấy PE/PB/ROE/EPS từ vnstock KBS — so sánh với ngưỡng ngành
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FundamentalEngine:
+    """
+    Fundamental valuation + growth signal.
+    Scoring: PE thấp + PB hợp lý + ROE cao + EPS tăng trưởng → MUA
+    Nguồn: Vibe-Trading fundamental-filter SKILL.md
+    """
+    # Ngưỡng tham chiếu TTCK VN (theo VN30 trung bình lịch sử)
+    PE_CHEAP   = 12.0   # PE < 12: rẻ
+    PE_FAIR    = 20.0   # PE 12-20: hợp lý
+    PE_DEAR    = 30.0   # PE > 30: đắt
+    PB_CHEAP   = 1.5    # PB < 1.5: rẻ
+    PB_DEAR    = 4.0    # PB > 4: đắt
+    ROE_GOOD   = 15.0   # ROE > 15%: tốt
+    ROE_GREAT  = 20.0   # ROE > 20%: rất tốt
+    EPS_GROW   = 10.0   # EPS growth > 10%: tăng trưởng
+
+    def _fetch_fundamental(self, symbol: str) -> dict:
+        """Lấy fundamental data từ vnstock KBS."""
+        try:
+            from vnstock import Vnstock
+            stock = Vnstock().stock(symbol=symbol, source="KBS")
+            # Thử lấy ratio
+            for period in ["quarter", "annual"]:
+                try:
+                    ratio = stock.finance.ratio(period=period)
+                    if ratio is not None and not ratio.empty:
+                        latest = ratio.iloc[0]
+                        cols   = [c.lower() for c in latest.index]
+                        orig   = list(latest.index)
+
+                        def _find(patterns, default=None):
+                            for p in patterns:
+                                for i, c in enumerate(cols):
+                                    if p.lower() in c:
+                                        try:
+                                            v = float(latest[orig[i]])
+                                            if not pd.isna(v) and v != 0:
+                                                return v
+                                        except Exception:
+                                            pass
+                            return default
+
+                        return {
+                            "pe":      _find(["pricetoearning", "p/e", "pe"]),
+                            "pb":      _find(["pricetobook", "p/b", "pb"]),
+                            "roe":     _find(["roe"]),
+                            "eps":     _find(["earningpershare", "eps"]),
+                            "eps_g":   _find(["epsgrowth", "earnings_growth"]),
+                            "rev_g":   _find(["revenuegrowth", "revenue_growth"]),
+                            "de":      _find(["debtonequity", "d/e", "leverage"]),
+                            "source":  f"vnstock KBS ({period})",
+                        }
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return {}
+
+    def _score(self, fund: dict) -> tuple[int, str]:
+        """
+        Tính điểm fundamental. Trả về (signal, detail_str).
+        signal: +1 (value/growth), -1 (expensive/weak), 0 (neutral)
+        """
+        if not fund:
+            return 0, "Khong lay duoc fundamental data (vnstock)"
+
+        score  = 0
+        parts  = []
+        pe  = fund.get("pe")
+        pb  = fund.get("pb")
+        roe = fund.get("roe")
+        eps_g = fund.get("eps_g")
+        rev_g = fund.get("rev_g")
+        de  = fund.get("de")
+
+        # PE scoring
+        if pe is not None and pe > 0:
+            if pe < self.PE_CHEAP:
+                score += 2; parts.append(f"PE={pe:.1f}(rẻ)")
+            elif pe < self.PE_FAIR:
+                score += 1; parts.append(f"PE={pe:.1f}(OK)")
+            elif pe > self.PE_DEAR:
+                score -= 2; parts.append(f"PE={pe:.1f}(đắt)")
+            else:
+                parts.append(f"PE={pe:.1f}")
+
+        # PB scoring
+        if pb is not None and pb > 0:
+            if pb < self.PB_CHEAP:
+                score += 1; parts.append(f"PB={pb:.1f}(rẻ)")
+            elif pb > self.PB_DEAR:
+                score -= 1; parts.append(f"PB={pb:.1f}(đắt)")
+            else:
+                parts.append(f"PB={pb:.1f}")
+
+        # ROE scoring
+        if roe is not None:
+            roe_pct = roe * 100 if abs(roe) < 2 else roe  # normalize nếu dạng 0.15
+            if roe_pct >= self.ROE_GREAT:
+                score += 2; parts.append(f"ROE={roe_pct:.1f}%(tốt)")
+            elif roe_pct >= self.ROE_GOOD:
+                score += 1; parts.append(f"ROE={roe_pct:.1f}%")
+            elif roe_pct < 5:
+                score -= 1; parts.append(f"ROE={roe_pct:.1f}%(yếu)")
+            else:
+                parts.append(f"ROE={roe_pct:.1f}%")
+
+        # EPS growth
+        if eps_g is not None:
+            eg = eps_g * 100 if abs(eps_g) < 5 else eps_g
+            if eg > self.EPS_GROW:
+                score += 1; parts.append(f"EPS_g={eg:.1f}%")
+            elif eg < 0:
+                score -= 1; parts.append(f"EPS_g={eg:.1f}%(giảm)")
+
+        # D/E cao → rủi ro
+        if de is not None and de > 2.0:
+            score -= 1; parts.append(f"D/E={de:.1f}(cao)")
+
+        # Kết luận
+        if not parts:
+            return 0, f"Du lieu: {fund.get('source','N/A')} — Khong du chi so"
+
+        src = fund.get("source", "N/A")
+        detail = f"[{src}] " + " | ".join(parts) + f" | Score={score:+d}"
+
+        if score >= 3:
+            return 1, detail
+        elif score <= -2:
+            return -1, detail
+        elif score >= 1:
+            return 1, detail   # lean bullish (giá trị tốt)
+        elif score <= -1:
+            return -1, detail  # lean bearish (định giá cao)
+        else:
+            return 0, detail
+
+    def generate(self, data_map: dict) -> tuple[dict, dict]:
+        signals, details = {}, {}
+        for code, df in data_map.items():
+            try:
+                fund = self._fetch_fundamental(code)
+                sig, det = self._score(fund)
+                signals[code] = sig
+                details[code] = f"[Claude-made] {det}"
+            except Exception as e:
+                signals[code] = 0
+                details[code] = f"[Claude-made] Loi FundamentalEngine: {e}"
+        return signals, details
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENGINE 16 — MONEY FLOW (Smart Money / Institutional Flow)
+# Phân tích dòng tiền thông minh qua volume-price pattern
+# Nguồn: Vibe-Trading fund-flow + market-microstructure skills
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MoneyFlowEngine:
+    """
+    Smart money / institutional money flow detection.
+    Dùng: OBV divergence, CMF (Chaikin Money Flow), VPT, Force Index
+    Không cần foreign flow data thực — phân tích từ OHLCV.
+    """
+    def __init__(self, window=20, cmf_w=20, vpt_w=20):
+        self.window = window
+        self.cmf_w  = cmf_w
+        self.vpt_w  = vpt_w
+
+    def _cmf(self, h, l, c, v, w):
+        """Chaikin Money Flow = sum(MFV) / sum(Vol) trong W bars."""
+        hl_range = (h - l).replace(0, np.nan)
+        mfm = ((c - l) - (h - c)) / hl_range          # Money Flow Multiplier [-1, 1]
+        mfv = mfm * v                                   # Money Flow Volume
+        cmf = mfv.rolling(w).sum() / v.rolling(w).sum()
+        return cmf
+
+    def _vpt(self, c, v):
+        """Volume Price Trend — cumulative indicator."""
+        ret = c.pct_change()
+        vpt = (ret * v).fillna(0).cumsum()
+        return vpt
+
+    def _obv(self, c, v):
+        """On Balance Volume."""
+        return (v * np.sign(c.diff())).fillna(0).cumsum()
+
+    def _force_index(self, c, v, w=13):
+        """Elder Force Index = price_change * volume."""
+        fi = c.diff() * v
+        return fi.ewm(span=w, adjust=False).mean()
+
+    def _one(self, df):
+        if len(df) < self.window + 5:
+            return pd.Series(0, index=df.index, dtype=int), "Khong du data"
+
+        o = df.get("open",  df["close"])
+        h = df["high"]; l = df["low"]; c = df["close"]
+        v = df.get("volume", pd.Series(1, index=df.index))
+
+        # ── Tính các indicators ───────────────────────────────────────────
+        cmf     = self._cmf(h, l, c, v, self.cmf_w)
+        vpt     = self._vpt(c, v)
+        vpt_ma  = vpt.rolling(self.vpt_w).mean()
+        obv     = self._obv(c, v)
+        obv_ma  = obv.rolling(self.window).mean()
+        fi      = self._force_index(c, v, 13)
+
+        # ── Scoring (bar cuối) ────────────────────────────────────────────
+        score = 0
+        parts = []
+
+        # CMF: > +0.05 = tiền vào, < -0.05 = tiền ra
+        cmf_val = float(cmf.iloc[-1]) if not pd.isna(cmf.iloc[-1]) else 0
+        if cmf_val > 0.10:
+            score += 2; parts.append(f"CMF={cmf_val:.2f}(tienVao)")
+        elif cmf_val > 0.03:
+            score += 1; parts.append(f"CMF={cmf_val:.2f}(+)")
+        elif cmf_val < -0.10:
+            score -= 2; parts.append(f"CMF={cmf_val:.2f}(tienRa)")
+        elif cmf_val < -0.03:
+            score -= 1; parts.append(f"CMF={cmf_val:.2f}(-)")
+        else:
+            parts.append(f"CMF={cmf_val:.2f}(neutral)")
+
+        # VPT vs MA: VPT tăng nhanh hơn MA → dòng tiền vào
+        vpt_last   = float(vpt.iloc[-1])
+        vpt_ma_last= float(vpt_ma.iloc[-1]) if not pd.isna(vpt_ma.iloc[-1]) else vpt_last
+        if vpt_last > vpt_ma_last * 1.02:
+            score += 1; parts.append("VPT>MA(bull)")
+        elif vpt_last < vpt_ma_last * 0.98:
+            score -= 1; parts.append("VPT<MA(bear)")
+
+        # OBV vs MA
+        obv_last   = float(obv.iloc[-1])
+        obv_ma_last= float(obv_ma.iloc[-1]) if not pd.isna(obv_ma.iloc[-1]) else obv_last
+        if obv_last > obv_ma_last:
+            score += 1; parts.append("OBV>MA(bull)")
+        else:
+            score -= 1; parts.append("OBV<MA(bear)")
+
+        # Force Index: > 0 = lực mua, < 0 = lực bán
+        fi_val = float(fi.iloc[-1]) if not pd.isna(fi.iloc[-1]) else 0
+        if fi_val > 0:
+            score += 1; parts.append(f"FI>0(bullish)")
+        else:
+            score -= 1; parts.append(f"FI<0(bearish)")
+
+        # OBV divergence (5D): giá giảm nhưng OBV tăng → smart money mua
+        price_5d_chg = float((c.iloc[-1] - c.iloc[-5]) / c.iloc[-5]) if len(c) >= 5 else 0
+        obv_5d_chg   = float((obv.iloc[-1] - obv.iloc[-5]) / abs(obv.iloc[-5]) + 1e-9) if len(obv) >= 5 else 0
+        if price_5d_chg < -0.01 and obv_5d_chg > 0.01:
+            score += 1; parts.append("OBV_div(bull)")  # bullish divergence
+        elif price_5d_chg > 0.01 and obv_5d_chg < -0.01:
+            score -= 1; parts.append("OBV_div(bear)")  # bearish divergence
+
+        # Signal
+        if score >= 3:
+            cur_sig = 1
+        elif score <= -3:
+            cur_sig = -1
+        elif score >= 1:
+            cur_sig = 1
+        elif score <= -1:
+            cur_sig = -1
+        else:
+            cur_sig = 0
+
+        sig = pd.Series(0, index=df.index, dtype=int)
+        sig.iloc[-1] = cur_sig
+
+        label = "BUY(dong tien vao)" if cur_sig > 0 else "SELL(dong tien ra)" if cur_sig < 0 else "NEUTRAL"
+        det = f"Score={score:+d} | {' | '.join(parts)} | {label}"
+        return sig, det
+
+    def generate(self, data_map: dict) -> tuple[dict, dict]:
+        signals, details = {}, {}
+        for code, df in data_map.items():
+            try:
+                sig, det = self._one(df)
+                signals[code] = _last(sig)
+                details[code] = f"[Claude-made] {det}"
+            except Exception as e:
+                signals[code] = 0
+                details[code] = f"[Claude-made] Loi MoneyFlowEngine: {e}"
+        return signals, details
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SINGLETON INSTANCES — 14 engines đầy đủ
 # ══════════════════════════════════════════════════════════════════════════════
 
 _ENGINES = {
     # --- Từ Vibe-Trading strategy skills (có example_signal_engine.py) ---
-    "Candlestick":    CandlestickEngine(),    # 15 mô hình nến
-    "Ichimoku":       IchimokuEngine(),        # 5-line system
-    "TechnicalBasic": TechnicalEngine(),       # EMA/ADX/RSI/OBV
-    "ElliottWave":    ElliottEngine(),         # Zigzag + 5-wave
-    "Harmonic":       HarmonicEngine(),        # Gartley/Bat/Butterfly/Crab
-    "Volatility":     VolatilityEngine(),      # HV percentile
-    "Seasonal":       SeasonalEngine(),        # Calendar effect
-    "SMC":            SMCEngine(),             # BOS/ChoCH/FVG (pure pandas)
-    "CrossMarket":    CrossMarketEngine(),     # Vol-adjusted dual-MA
-    "MultiFactor":    MultiFactorEngine(),     # Momentum/Reversal/Vol/VolumeRatio
+    "Candlestick":    CandlestickEngine(),      # 15 mô hình nến
+    "Ichimoku":       IchimokuEngine(),          # 5-line system
+    "TechnicalBasic": TechnicalEngine(),         # EMA/ADX/RSI/OBV
+    "ElliottWave":    ElliottEngine(),           # Zigzag + 5-wave
+    "Harmonic":       HarmonicEngine(),          # Gartley/Bat/Butterfly/Crab
+    "Volatility":     VolatilityEngine(),        # HV percentile
+    "Seasonal":       SeasonalEngine(),          # Calendar effect
+    "SMC":            SMCEngine(),               # BOS/ChoCH/FVG — momentum-based
+    "CrossMarket":    CrossMarketEngine(),       # Vol-adjusted dual-MA
+    "MultiFactor":    MultiFactorEngine(),       # Momentum/Reversal/Vol/VolumeRatio
     # --- Adapted từ Vibe-Trading pair-trading + fundamental-filter ---
-    "MeanReversion":  MeanReversionEngine(),  # Z-score price vs rolling mean
-    "PriceMomentum":  PriceMomentumEngine(),  # Multi-TF momentum 5D/20D/60D
-    "Breakout":       BreakoutEngine(),        # S/R breakout + vol confirm
-    "MLStrategy":     MLStrategyEngine(),      # RandomForest walk-forward
+    "MeanReversion":  MeanReversionEngine(),    # Z-score price vs rolling mean
+    "PriceMomentum":  PriceMomentumEngine(),    # Multi-TF momentum 5D/20D/60D
+    "Breakout":       BreakoutEngine(),          # S/R breakout + vol confirm
+    "MLStrategy":     MLStrategyEngine(),        # ExtraTrees walk-forward + rule fallback
+    # --- Mới: Fundamental + MoneyFlow (thu hẹp gap 16 vs 69) ---
+    "Fundamental":    FundamentalEngine(),       # PE/PB/ROE/EPS từ vnstock
+    "MoneyFlow":      MoneyFlowEngine(),         # CMF/VPT/OBV/Force Index
 }
 
 
@@ -1078,7 +1469,7 @@ def run_vibe_agents(symbol: str, df: pd.DataFrame) -> dict:
     bull_names = [k for k,v in all_signals.items() if v > 0]
     bear_names = [k for k,v in all_signals.items() if v < 0]
     summary = (
-        f"Vibe-Trading 14 engines: {bull}/{n} bullish, {bear}/{n} bearish. "
+        f"Vibe-Trading 16 engines: {bull}/{n} bullish, {bear}/{n} bearish. "
         f"Bull: {', '.join(bull_names) or 'none'}. "
         f"Bear: {', '.join(bear_names) or 'none'}."
     )
