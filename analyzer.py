@@ -312,17 +312,16 @@ def get_market_data() -> dict:
             return close, "VNINDEX (Entrade)"
         raise ValueError("VNINDEX từ Entrade rỗng")
 
-    # ── Fallback: mã ETF và blue-chip dùng làm proxy ─────────────────────────
+    # ── Fallback: chỉ dùng index/ETF — KHÔNG dùng cổ phiếu đơn lẻ
+    # Cổ phiếu đơn lẻ (VHM/VCB/FPT) không đại diện cho thị trường chung
     proxy_symbols = [
-        ("VNINDEX",   "VN-Index"),
+        ("VNINDEX",   "VN-Index Entrade"),
         ("VN30",      "VN30 Index"),
         ("E1VFVN30",  "ETF VN30"),
         ("FUEVFVND",  "ETF VNDiamond"),
         ("FUESSVFL",  "ETF SSIAM"),
-        ("VCB",       "Proxy VCB"),
-        ("HPG",       "Proxy HPG"),
-        ("FPT",       "Proxy FPT"),
-        ("VHM",       "Proxy VHM"),
+        ("FUESSV30",  "ETF SSI VN30"),
+        ("FUEVN100",  "ETF VN100"),
     ]
 
     def _compute_result(close: pd.Series, label: str) -> dict:
@@ -361,7 +360,35 @@ def get_market_data() -> dict:
             last_err = f"{fname}: {str(e)[:60]}"
             continue
 
-    # Fallback: proxy từng mã
+    # Fallback: vnstock VNINDEX
+    def _try_vnindex_vnstock():
+        """Lấy VNINDEX từ vnstock KBS/VCI — backup khi Entrade lỗi."""
+        from vnstock import Vnstock
+        end   = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+        for src in ["KBS", "VCI", "TCBS"]:
+            try:
+                stock = Vnstock().stock(symbol="VNINDEX", source=src)
+                df = stock.quote.history(start=start, end=end, interval="1D")
+                if df is not None and not df.empty:
+                    df.columns = [c.lower() for c in df.columns]
+                    close = df["close"].astype(float)
+                    if len(close) >= 5:
+                        result = _compute_result(close, f"VNINDEX (vnstock {src})")
+                        with _market_cache_lock:
+                            _market_cache["data"] = result
+                            _market_cache["date"] = today
+                        return result
+            except Exception:
+                continue
+        raise ValueError("vnstock VNINDEX fail all sources")
+
+    try:
+        return _try_vnindex_vnstock()
+    except Exception as e:
+        last_err = f"vnstock VNINDEX: {str(e)[:60]}"
+
+    # Fallback: proxy từng mã (chỉ ETF/Index)
     for symbol, label in proxy_symbols:
         try:
             df = _price_from_entrade(symbol, 90)
@@ -1323,29 +1350,33 @@ def _fmt_price(p):
 
 def _format_action_plan(verdict_label: str, ap: dict) -> str:
     """
-    Format Action Plan theo verdict:
-    - MUA/BAN: hiển thị đầy đủ Entry/TP/SL/RR
-    - TRUNG LAP/PHAN BAC: không thể quyết định mua/bán tại thời điểm này
+    Format Action Plan theo verdict — action plan khớp với hướng signal.
+    MUA  : Entry / Target / SL
+    BAN  : Kháng cự / Điểm thoát / Hỗ trợ tiếp theo
+    TRUNG LAP: Chờ xác nhận
     """
-    if "MUA" in verdict_label or "BAN" in verdict_label:
-        action = "MUA" if "MUA" in verdict_label else "BAN"
+    if "MUA" in verdict_label:
         return (
-            f"ACTION PLAN ({action}):\n"
+            f"ACTION PLAN (MUA):\n"
             f"  Entry:  {_fmt_price(ap['entry_low'])} - {_fmt_price(ap['entry_high'])}\n"
             f"  Target: {_fmt_price(ap['tp'])} ({ap['tp_pct']:+.1f}%)\n"
             f"  SL:     {_fmt_price(ap['sl'])} ({ap['sl_pct']:+.1f}%)\n"
-            f"  R:R   = 1:{ap['rr']}\n"
-            f"\n  Vung theo doi them: {_fmt_price(ap['sl'])} - {_fmt_price(ap['entry_low'])}"
+            f"  R:R   = 1:{ap['rr']}"
+        )
+    elif "BAN" in verdict_label:
+        return (
+            f"ACTION PLAN (BAN / THOAT HANG):\n"
+            f"  Vung khang cu: {_fmt_price(ap['entry_high'])} - {_fmt_price(ap['tp'])}\n"
+            f"  Diem thoat hang: {_fmt_price(ap['entry_low'])} - {_fmt_price(ap['entry_high'])}\n"
+            f"  Ho tro tiep theo: {_fmt_price(ap['sl'])} ({ap['sl_pct']:+.1f}% vs gia hien tai)\n"
+            f"  Khong nen mua them — cho tin hieu dao chieu"
         )
     else:
-        # TRUNG LAP hoac PHAN BAC
         return (
-            f"ACTION PLAN:\n"
-            f"  Khong the quyet dinh mua/ban tai thoi diem nay.\n"
-            f"  Vung co the xem xet mua khi co tin hieu:\n"
-            f"    Ho tro: {_fmt_price(ap['sl'])} - {_fmt_price(ap['entry_low'])}\n"
-            f"  Muc TP neu vao duoc: {_fmt_price(ap['tp'])} ({ap['tp_pct']:+.1f}%)\n"
-            f"  Dieu kien can them: RSI < 70 + Volume xac nhan + Market Regime UPTREND"
+            f"ACTION PLAN (CHO XAC NHAN):\n"
+            f"  Tin hieu lan lon — KHONG hanh dong ngay\n"
+            f"  Theo doi vung ho tro: {_fmt_price(ap['sl'])} - {_fmt_price(ap['entry_low'])}\n"
+            f"  Chi xem xet khi: >50% agents dong thuan + Volume xac nhan"
         )
 
 
@@ -1552,29 +1583,60 @@ def _vibe_verdict(vibe: dict, ind: dict, market: dict, news: dict) -> dict:
 
     # ── Context signal: News Sentiment ────────────────────────────────────
     # Dung keyword cu the hon de tranh false positive
+    # Keyword ngắn hơn, khớp được cả có dấu và không dấu
+    # Mỗi headline chỉ tính 1 điểm (không tính trùng)
     _POS_KW = [
-        "loi nhuan tang", "tang truong", "ket qua kinh doanh tot",
-        "vuot ke hoach", "khuyen nghi mua", "co tuc",
-        "hop dong lon", "don hang moi", "dot pha doanh thu",
-        "tich cuc", "phuc hoi", "tang manh",
+        # Lợi nhuận / doanh thu tăng
+        "tang truong", "tăng trưởng", "loi nhuan", "lợi nhuận",
+        "doanh thu tang", "doanh thu tăng", "vuot ke hoach", "vượt kế hoạch",
+        # Khuyến nghị / hành động mua
+        "khuyen nghi mua", "khuyến nghị mua", "mua vao", "mua vào",
+        "nang gia muc tieu", "nâng giá mục tiêu",
+        # Sự kiện tích cực
+        "co tuc", "cổ tức", "hop dong", "hợp đồng", "don hang", "đơn hàng",
+        "tang von", "tăng vốn", "phat hanh", "phát hành",
+        "tich cuc", "tích cực", "kha quan", "khả quan",
+        "phuc hoi", "phục hồi", "tang manh", "tăng mạnh",
+        "dot pha", "đột phá", "ky luc", "kỷ lục",
     ]
     _NEG_KW = [
-        "thua lo", "loi nhuan giam", "doanh thu giam", "sut giam manh",
-        "khuyen nghi ban", "canh bao rui ro", "vi pham", "bi phat",
-        "no xau tang", "mat thanh khoan", "sa thai hang loat",
-        "tieu cuc", "suy giam", "giam manh",
+        # Thua lỗ / sụt giảm
+        "thua lo", "thua lỗ", "lo rong", "lỗ ròng",
+        "giam manh", "giảm mạnh", "sut giam", "sụt giảm",
+        "doanh thu giam", "doanh thu giảm", "loi nhuan giam", "lợi nhuận giảm",
+        # Khuyến nghị bán / cảnh báo
+        "khuyen nghi ban", "khuyến nghị bán", "ban ra", "bán ra",
+        "ha gia muc tieu", "hạ giá mục tiêu",
+        "canh bao", "cảnh báo", "rui ro", "rủi ro",
+        # Sự kiện tiêu cực
+        "vi pham", "vi phạm", "bi phat", "bị phạt",
+        "no xau", "nợ xấu", "mat thanh khoan", "mất thanh khoản",
+        "dinh chi", "đình chỉ", "thu hoi", "thu hồi",
+        "tieu cuc", "tiêu cực", "suy giam", "suy giảm",
+        "khung hoang", "khủng hoảng",
     ]
     if news.get("success") and news.get("headlines"):
-        text_all = " ".join(news["headlines"]).lower()
-        pos = sum(1 for kw in _POS_KW if kw in text_all)
-        neg = sum(1 for kw in _NEG_KW if kw in text_all)
-        total_hl = len(news["headlines"])
-        if pos > neg * 1.5 and pos >= 2:
+        headlines = news["headlines"]
+        total_hl  = len(headlines)
+        pos = 0
+        neg = 0
+        # Đếm per-headline để tránh 1 bài báo count nhiều lần
+        for hl in headlines:
+            hl_lo = hl.lower()
+            if any(kw in hl_lo for kw in _POS_KW):
+                pos += 1
+            elif any(kw in hl_lo for kw in _NEG_KW):
+                neg += 1
+
+        if pos > neg and pos >= 2:
             signals["NewsSentiment"] = 1
             ns_label = "TICH CUC"
-        elif neg > pos * 1.5 and neg >= 2:
+        elif neg > pos and neg >= 2:
             signals["NewsSentiment"] = -1
             ns_label = "TIEU CUC"
+        elif pos > 0 and pos == neg:
+            signals["NewsSentiment"] = 0
+            ns_label = "TRUNG LAP"
         else:
             signals["NewsSentiment"] = 0
             ns_label = "TRUNG LAP"
@@ -1589,16 +1651,30 @@ def _vibe_verdict(vibe: dict, ind: dict, market: dict, news: dict) -> dict:
     n_active = len(signals)
     bull = sum(1 for v in signals.values() if v > 0)
     bear = sum(1 for v in signals.values() if v < 0)
-    majority = n_active / 2
+    threshold_strong = 0.5   # >50% để ra signal rõ ràng
+    threshold_lean   = 0.3   # >30% để ra "nghiêng"
 
-    if bull > majority and bear == 0:
-        verdict_label = "DONG THUAN MUA"
-    elif bull > majority:
-        verdict_label = "NGHIENG MUA"
-    elif bear > majority and bull == 0:
-        verdict_label = "DONG THUAN BAN"
-    elif bear > majority:
+    # Logic ưu tiên: bull=0 và có bear → không thể TRUNG LAP
+    if bull == 0 and bear > 0:
+        # Không có ai bullish, có người bearish → BAN
+        if bear / n_active >= threshold_strong:
+            verdict_label = "DONG THUAN BAN"
+        else:
+            verdict_label = "NGHIENG BAN"
+    elif bear == 0 and bull > 0:
+        # Không có ai bearish, có người bullish → MUA
+        if bull / n_active >= threshold_strong:
+            verdict_label = "DONG THUAN MUA"
+        else:
+            verdict_label = "NGHIENG MUA"
+    elif bull > bear and bull / n_active >= threshold_strong:
+        verdict_label = "DONG THUAN MUA" if bear == 0 else "NGHIENG MUA"
+    elif bear > bull and bear / n_active >= threshold_strong:
+        verdict_label = "DONG THUAN BAN" if bull == 0 else "NGHIENG BAN"
+    elif bear > bull and bear / n_active >= threshold_lean:
         verdict_label = "NGHIENG BAN"
+    elif bull > bear and bull / n_active >= threshold_lean:
+        verdict_label = "NGHIENG MUA"
     else:
         verdict_label = "TRUNG LAP"
 
@@ -1734,22 +1810,31 @@ def _build_vibe_message(
         f"TOM TAT: {verdict['summary']}\n\n"
     )
 
-    # Action plan
-    action_label = "MUA" if "MUA" in fv else "BAN" if "BAN" in fv else None
-    if action_label:
+    # Action plan — theo chiều verdict
+    if "MUA" in fv:
         action_block = (
-            f"ACTION PLAN ({action_label}):\n"
+            f"ACTION PLAN (MUA):\n"
             f"  Entry:  {_fmt_price(ap['entry_low'])} - {_fmt_price(ap['entry_high'])}\n"
             f"  Target: {_fmt_price(ap['tp'])} ({ap['tp_pct']:+.1f}%)\n"
             f"  SL:     {_fmt_price(ap['sl'])} ({ap['sl_pct']:+.1f}%)\n"
             f"  R:R   = 1:{ap['rr']}\n"
         )
-    else:
+    elif "BAN" in fv:
+        # BÁN: không hiển thị vùng mua — hiển thị kháng cự và điểm thoát
         action_block = (
-            f"ACTION PLAN (THEO DOI):\n"
-            f"  Vung mua neu co tin hieu: {_fmt_price(ap['entry_low'])} - {_fmt_price(ap['entry_high'])}\n"
-            f"  Muc TP neu vao: {_fmt_price(ap['tp'])} ({ap['tp_pct']:+.1f}%)\n"
-            f"  Dieu kien: > 50% agents dong thuan\n"
+            f"ACTION PLAN (BAN / THOAT HANG):\n"
+            f"  Vung khang cu: {_fmt_price(ap['entry_high'])} - {_fmt_price(ap['tp'])}\n"
+            f"  Diem thoat hang: {_fmt_price(ap['entry_low'])} - {_fmt_price(ap['entry_high'])}\n"
+            f"  Ho tro tiep theo: {_fmt_price(ap['sl'])} ({ap['sl_pct']:+.1f}% vs gia hien tai)\n"
+            f"  Khong nen mua them khi chua co tin hieu dao chieu\n"
+        )
+    else:
+        # TRUNG LAP: chờ xác nhận, không hành động
+        action_block = (
+            f"ACTION PLAN (CHO XAC NHAN):\n"
+            f"  Tin hieu lan lon — KHONG hanh dong ngay\n"
+            f"  Theo doi vung ho tro: {_fmt_price(ap['sl'])} - {_fmt_price(ap['entry_low'])}\n"
+            f"  Chi xem xet mua khi: >50% agents dong thuan + Volume xac nhan\n"
         )
 
     # Vibe details (rút gọn cho vừa Telegram)
