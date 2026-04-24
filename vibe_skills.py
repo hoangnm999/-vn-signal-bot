@@ -16,21 +16,21 @@ Label nguồn gốc:
 ──────────────────────────────────────────────────────────────────────────────
 
 Engines (16 total):
-  1.  Candlestick    [HKUDS-like] — 15 mô hình nến, có volume filter
-  2.  Ichimoku       [HKUDS-like] — State-based scoring 3 điều kiện
-  3.  TechnicalBasic [HKUDS-like] — EMA/ADX/RSI/OBV scoring 5/5
-  4.  ElliottWave    [HKUDS-like] — Zigzag + 5-wave + Fibonacci
-  5.  Harmonic       [HKUDS-like] — Gartley/Bat/Butterfly/Crab XABCD
-  6.  Volatility     [HKUDS-like] — HV percentile mean-reversion
-  7.  Seasonal       [HKUDS-like] — Calendar effect, lookback 3yr
-  8.  SMC            [HKUDS-like] — BOS/ChoCH/FVG momentum-based
+  1.  Candlestick    [HKUDS] — 15 mô hình nến, vectorized scoring, volume filter
+  2.  Ichimoku       [HKUDS] — TK Cross event + 3-filter (rewrite từ source gốc)
+  3.  TechnicalBasic [HKUDS] — 3-dim voting EMA/ADX+BB/RSI+OBV (rewrite từ source gốc)
+  4.  ElliottWave    [HKUDS] — Zigzag + 5-wave impulse + ABC correction + Fibonacci
+  5.  Harmonic       [HKUDS] — XABCD Gartley/Bat/Butterfly/Crab + pyharmonics fallback
+  6.  Volatility     [HKUDS] — HV percentile (lookback=120, low=20%, high=80%)
+  7.  Seasonal       [HKUDS] — Fixed month lists (rewrite từ source gốc)
+  8.  SMC            [HKUDS] — ChoCH priority + BOS + FVG filter (momentum fallback)
   9.  CrossMarket    [Claude-made] — Vol-adjusted dual-MA, single stock adapt
   10. MultiFactor    [Claude-made] — Momentum/Reversal/Vol/VolumeRatio Z-score
   11. MeanReversion  [Claude-made] — Z-score price vs rolling mean
   12. PriceMomentum  [Claude-made] — Multi-TF momentum 5D/20D/60D
   13. Breakout       [Claude-made] — S/R breakout + vol confirm
   14. MLStrategy     [Claude-made] — ExtraTrees walk-forward + rule fallback
-  15. Fundamental    [Claude-made] — PE/PB/ROE/EPS từ vnstock (không có trong HKUDS local)
+  15. Fundamental    [Claude-made] — PE/PB/ROE/EPS từ vnstock
   16. MoneyFlow      [Claude-made] — CMF/VPT/OBV/Force Index
 
 Context agents (trong analyzer.py):
@@ -218,149 +218,63 @@ class CandlestickEngine:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class IchimokuEngine:
+    """
+    Ichimoku Kinko Hyo — implement đúng theo HKUDS source.
+    [HKUDS] agent/src/skills/ichimoku/example_signal_engine.py
+
+    Logic: TK Cross event → 3-filter confirmation
+      1. tk_cross_up/down (trigger)
+      2. price above/below cloud (direction confirm)
+      3. cloud bullish/bearish direction (trend confirm)
+    """
     def __init__(self, tenkan=9, kijun=26, senkou_b=52, displacement=26):
-        self.tenkan=tenkan; self.kijun=kijun
-        self.senkou_b=senkou_b; self.displacement=displacement
+        self.tenkan      = tenkan
+        self.kijun       = kijun
+        self.senkou_b    = senkou_b
+        self.displacement= displacement
 
-    def _mid(self, s, p): return (s.rolling(p).max()+s.rolling(p).min())/2
-
-    def generate(self, data_map):
-        signals, details = {}, {}
-        warmup = self.senkou_b + self.displacement
-        for sym, df in data_map.items():
-            h,l,c = df["high"],df["low"],df["close"]
-            if len(df) < warmup:
-                signals[sym]=0; details[sym]="Khong du du lieu (can >= 78 bars)."; continue
-            tenkan = self._mid(h, self.tenkan)
-            kijun  = self._mid(h, self.kijun)
-            span_a = ((tenkan+kijun)/2).shift(self.displacement)
-            span_b = self._mid(h, self.senkou_b).shift(self.displacement)
-            cloud_top = pd.concat([span_a,span_b],axis=1).max(axis=1)
-            cloud_bot = pd.concat([span_a,span_b],axis=1).min(axis=1)
-
-            # ── STATE-BASED scoring (không chỉ dựa vào cross) ──────────────
-            # Mỗi điều kiện +1 bull hoặc +1 bear
-            tk_above_kijun = tenkan > kijun          # TK cross bullish state
-            price_above_cloud = c > cloud_top        # Giá trên mây
-            price_below_cloud = c < cloud_bot        # Giá dưới mây
-            bull_kumo = span_a > span_b              # Mây xanh (bullish)
-            bear_kumo = span_a < span_b              # Mây đỏ (bearish)
-
-            bull_score = (tk_above_kijun.astype(int) +
-                          price_above_cloud.astype(int) +
-                          bull_kumo.astype(int))
-            bear_score = ((~tk_above_kijun).astype(int) +
-                          price_below_cloud.astype(int) +
-                          bear_kumo.astype(int))
-
-            sig = pd.Series(0, index=df.index, dtype=int)
-            # Cần >= 2/3 điều kiện cùng chiều để ra signal
-            sig[bull_score >= 2] = 1
-            sig[bear_score >= 2] = -1
-            # Nếu cả 2 đều >= 2 (trong mây, lẫn lộn) → trung lập
-            sig[(bull_score >= 2) & (bear_score >= 2)] = 0
-
-            signals[sym] = _last(sig)
-
-            # Detail
-            t_v  = round(tenkan.iloc[-1],2)    if not pd.isna(tenkan.iloc[-1]) else "N/A"
-            k_v  = round(kijun.iloc[-1],2)     if not pd.isna(kijun.iloc[-1]) else "N/A"
-            ct   = round(cloud_top.iloc[-1],2) if not pd.isna(cloud_top.iloc[-1]) else "N/A"
-            cb   = round(cloud_bot.iloc[-1],2) if not pd.isna(cloud_bot.iloc[-1]) else "N/A"
-            cur_c = c.iloc[-1]
-            pos  = ("TREN may" if (ct != "N/A" and cur_c > ct) else
-                    "DUOI may"  if (cb != "N/A" and cur_c < cb) else "TRONG may")
-            tk_str = "bull" if tenkan.iloc[-1] > kijun.iloc[-1] else "bear"
-            bs = int(bull_score.iloc[-1]); es = int(bear_score.iloc[-1])
-            details[sym] = (f"TK={tk_str} | Tenkan={t_v} Kijun={k_v} | {pos} "
-                            f"(top={ct} bot={cb}) | Score bull={bs}/3 bear={es}/3")
-        return signals, details
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENGINE 3 — TECHNICAL BASIC (EMA/ADX/BB/RSI/OBV, from Vibe-Trading)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TechnicalEngine:
-    def __init__(self, ef=12, es=26, adx_p=14, adx_th=25.0,
-                 bb_w=20, bb_s=2.0, rsi_p=14, rsi_os=30, rsi_ob=70, vma=20):
-        self.ef=ef; self.es=es; self.adx_p=adx_p; self.adx_th=adx_th
-        self.bb_w=bb_w; self.bb_s=bb_s; self.rsi_p=rsi_p
-        self.rsi_os=rsi_os; self.rsi_ob=rsi_ob; self.vma=vma
-
-    def _rsi(self, c, p):
-        """Dùng rolling SMA (Wilder) giống compute_indicators để RSI nhất quán."""
-        d = c.diff()
-        gain = d.where(d > 0, 0).rolling(p).mean()
-        loss = (-d.where(d < 0, 0)).rolling(p).mean()
-        return 100 - 100 / (1 + gain / loss.replace(0, np.nan))
-
-    def _adx(self, h, l, c, p):
-        tr=pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
-        pdm=(h-h.shift()).where((h-h.shift())>(l.shift()-l),0).clip(lower=0)
-        ndm=(l.shift()-l).where((l.shift()-l)>(h-h.shift()),0).clip(lower=0)
-        atr=tr.ewm(alpha=1/p,adjust=False).mean()
-        pdi=100*pdm.ewm(alpha=1/p,adjust=False).mean()/atr.replace(0,np.nan)
-        ndi=100*ndm.ewm(alpha=1/p,adjust=False).mean()/atr.replace(0,np.nan)
-        dx=100*(pdi-ndi).abs()/(pdi+ndi).replace(0,np.nan)
-        return dx.ewm(alpha=1/p,adjust=False).mean(), pdi, ndi
+    def _donchian_mid(self, high, low, period):
+        return (high.rolling(period).max() + low.rolling(period).min()) / 2
 
     def _one(self, df):
-        o,h,l,c = df["open"],df["high"],df["low"],df["close"]
-        v = df.get("volume", pd.Series(1,index=df.index))
-        ef  = c.ewm(span=self.ef,adjust=False).mean()
-        es  = c.ewm(span=self.es,adjust=False).mean()
-        adx, pdi, ndi = self._adx(h,l,c,self.adx_p)
-        bm  = c.rolling(self.bb_w).mean()
-        bst = c.rolling(self.bb_w).std()
-        bu  = bm + self.bb_s*bst
-        bl  = bm - self.bb_s*bst
-        rsi = self._rsi(c, self.rsi_p)
-        obv = (v*np.sign(c.diff())).fillna(0).cumsum()
-        obv_ma = obv.rolling(self.vma).mean()
-        vm     = v.rolling(self.vma).mean()
+        if len(df) < self.senkou_b + self.displacement:
+            return pd.Series(0, index=df.index, dtype=int), "Khong du data"
 
-        # ── STATE-BASED scoring — mỗi chiều tối đa 4 điểm ──────────────────
-        # Dim 1: Trend (EMA + ADX)
-        trend_bull = (ef > es).astype(int)                         # EMA bull
-        trend_bear = (ef < es).astype(int)                         # EMA bear
-        trend_strong = (adx > self.adx_th).astype(int)            # Có xu hướng rõ
-        dir_bull = (pdi > ndi).astype(int)
-        dir_bear = (ndi > pdi).astype(int)
+        h = df["high"]; l = df["low"]; c = df["close"]
+        tenkan  = self._donchian_mid(h, l, self.tenkan)
+        kijun   = self._donchian_mid(h, l, self.kijun)
+        span_a  = ((tenkan + kijun) / 2).shift(self.displacement)
+        span_b  = self._donchian_mid(h, l, self.senkou_b).shift(self.displacement)
 
-        # Dim 2: Momentum (RSI)
-        mom_bull = (rsi > 50).astype(int)
-        mom_bear = (rsi < 50).astype(int)
-        mom_strong_bull = (rsi > 55).astype(int)
-        mom_strong_bear = (rsi < 45).astype(int)
+        # TK Cross events (HKUDS logic)
+        tk_cross_up   = (tenkan > kijun) & (tenkan.shift(1) <= kijun.shift(1))
+        tk_cross_down = (tenkan < kijun) & (tenkan.shift(1) >= kijun.shift(1))
 
-        # Dim 3: Volume-Price (OBV)
-        vp_bull = (obv > obv_ma).astype(int)
-        vp_bear = (obv < obv_ma).astype(int)
+        # Cloud position
+        cloud_top    = pd.concat([span_a, span_b], axis=1).max(axis=1)
+        cloud_bottom = pd.concat([span_a, span_b], axis=1).min(axis=1)
+        above_cloud  = c > cloud_top
+        below_cloud  = c < cloud_bottom
 
-        # Tổng hợp: cần >= 3/5 tín hiệu cùng chiều
-        bull_score = trend_bull + dir_bull + trend_strong*dir_bull + mom_bull + vp_bull
-        bear_score = trend_bear + dir_bear + trend_strong*dir_bear + mom_bear + vp_bear
+        # Cloud direction
+        bullish_cloud = span_a > span_b
+        bearish_cloud = span_a < span_b
 
-        sig = pd.Series(0, index=df.index, dtype=int)
-        # Overbought/oversold override
-        ob_mask = (c > bu) & (rsi > self.rsi_ob)  # Overbought → BÁN
-        os_mask = (c < bl) & (rsi < self.rsi_os)  # Oversold → MUA
-        sig[bull_score >= 3] = 1
-        sig[bear_score >= 3] = -1
-        sig[ob_mask] = -1   # Override: quá mua → bán
-        sig[os_mask] = 1    # Override: quá bán → mua
+        # 3-filter signal (HKUDS exact logic)
+        buy  = tk_cross_up   & above_cloud & bullish_cloud
+        sell = tk_cross_down & below_cloud & bearish_cloud
+        sig  = buy.astype(int) - sell.astype(int)
 
         # Detail
-        adx_v = round(adx.iloc[-1],1)
-        rsi_v = round(rsi.iloc[-1],1)
-        ef_v  = round(ef.iloc[-1],2)
-        es_v  = round(es.iloc[-1],2)
-        bs    = int(bull_score.iloc[-1])
-        es_sc = int(bear_score.iloc[-1])
-        trend = "bull" if ef.iloc[-1] > es.iloc[-1] else "bear"
-        det   = (f"EMA{self.ef}={ef_v} EMA{self.es}={es_v} ADX={adx_v} RSI={rsi_v} "
-                 f"trend={trend} | Score bull={bs}/5 bear={es_sc}/5")
+        tk_val = round(float(tenkan.iloc[-1]), 2) if not pd.isna(tenkan.iloc[-1]) else "N/A"
+        kj_val = round(float(kijun.iloc[-1]),  2) if not pd.isna(kijun.iloc[-1])  else "N/A"
+        ct_val = round(float(cloud_top.iloc[-1]),    2) if not pd.isna(cloud_top.iloc[-1])    else "N/A"
+        cb_val = round(float(cloud_bottom.iloc[-1]), 2) if not pd.isna(cloud_bottom.iloc[-1]) else "N/A"
+        pos    = "TREN may" if bool(above_cloud.iloc[-1]) else "DUOI may" if bool(below_cloud.iloc[-1]) else "TRONG may"
+        cloud_dir = "Tang(xanh)" if bool(bullish_cloud.iloc[-1]) else "Giam(do)"
+        cur   = _last(sig)
+        det   = (f"Tenkan={tk_val} Kijun={kj_val} | {pos} (top={ct_val} bot={cb_val}) "
+                 f"| May={cloud_dir} | TK_cross={'UP' if bool(tk_cross_up.iloc[-1]) else 'DOWN' if bool(tk_cross_down.iloc[-1]) else 'none'}")
         return sig, det
 
     def generate(self, data_map):
@@ -368,15 +282,133 @@ class TechnicalEngine:
         for code, df in data_map.items():
             try:
                 sig, det = self._one(df)
-                signals[code]=_last(sig); details[code]=det
+                signals[code] = _last(sig)
+                details[code] = det
             except Exception as e:
-                signals[code]=0; details[code]=f"Loi: {e}"
+                signals[code] = 0
+                details[code] = f"Loi IchimokuEngine: {e}"
         return signals, details
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ENGINE 4 — ELLIOTT WAVE (Zigzag + 5-wave + Fibonacci, from Vibe-Trading)
-# ══════════════════════════════════════════════════════════════════════════════
+class TechnicalEngine:
+    """
+    Technical Basic — implement đúng theo HKUDS source.
+    [HKUDS] agent/src/skills/technical-basic/example_signal_engine.py
+
+    Logic: 3-dim voting
+      Trend: EMA cross + ADX strength
+      MeanRev: BB + RSI oversold/overbought
+      VolPrice: OBV vs OBV-MA
+      Signal: (trend_bull|mr_oversold) & vol_bull & ~mr_overbought → BUY
+              (trend_bear|mr_overbought) & vol_bear & ~mr_oversold → SELL
+    """
+    def __init__(self, ema_fast=12, ema_slow=26, adx_period=14,
+                 adx_threshold=25.0, bb_window=20, bb_std=2.0,
+                 rsi_period=14, rsi_oversold=30, rsi_overbought=70,
+                 obv_ma_period=20):
+        self.ema_fast       = ema_fast
+        self.ema_slow       = ema_slow
+        self.adx_period     = adx_period
+        self.adx_threshold  = adx_threshold
+        self.bb_window      = bb_window
+        self.bb_std         = bb_std
+        self.rsi_period     = rsi_period
+        self.rsi_oversold   = rsi_oversold
+        self.rsi_overbought = rsi_overbought
+        self.obv_ma_period  = obv_ma_period
+
+    def _rsi(self, close, period):
+        """Wilder EWM RSI — theo HKUDS technical-basic source."""
+        delta = close.diff()
+        gain  = delta.clip(lower=0)
+        loss  = (-delta).clip(lower=0)
+        avg_g = gain.ewm(alpha=1/period, min_periods=period).mean()
+        avg_l = loss.ewm(alpha=1/period, min_periods=period).mean()
+        rs    = avg_g / avg_l
+        return 100 - 100 / (1 + rs)
+
+    def _adx(self, high, low, close, period):
+        """ADX + DI theo HKUDS source (Wilder EWM)."""
+        ph = high.shift(1); pl = low.shift(1); pc = close.shift(1)
+        up = high - ph; dn = pl - low
+        plus_dm  = pd.Series(0.0, index=high.index)
+        minus_dm = pd.Series(0.0, index=high.index)
+        plus_dm[(up > dn) & (up > 0)]   = up
+        minus_dm[(dn > up) & (dn > 0)]  = dn
+        tr = pd.concat([high-low, (high-pc).abs(), (low-pc).abs()], axis=1).max(axis=1)
+        alpha = 1/period
+        s_tr  = tr.ewm(alpha=alpha, min_periods=period).mean()
+        s_pdm = plus_dm.ewm(alpha=alpha, min_periods=period).mean()
+        s_mdm = minus_dm.ewm(alpha=alpha, min_periods=period).mean()
+        pdi   = 100 * s_pdm / s_tr.replace(0, np.nan)
+        mdi   = 100 * s_mdm / s_tr.replace(0, np.nan)
+        di_sum= (pdi + mdi).replace(0, np.nan)
+        dx    = 100 * (pdi - mdi).abs() / di_sum
+        adx   = dx.ewm(alpha=alpha, min_periods=period).mean()
+        return adx, pdi, mdi
+
+    def _obv(self, close, volume):
+        sign = close.diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+        return (volume * sign).cumsum()
+
+    def _one(self, df):
+        c = df["close"]; h = df["high"]; l = df["low"]
+        v = df.get("volume", pd.Series(1, index=df.index))
+
+        # Trend dim
+        ema_f = c.ewm(span=self.ema_fast, adjust=False).mean()
+        ema_s = c.ewm(span=self.ema_slow, adjust=False).mean()
+        adx, pdi, mdi = self._adx(h, l, c, self.adx_period)
+        trend_bull = (ema_f > ema_s) & (adx > self.adx_threshold)
+        trend_bear = (ema_f < ema_s) & (adx > self.adx_threshold)
+
+        # Mean reversion dim
+        bb_mid  = c.rolling(self.bb_window).mean()
+        bb_std  = c.rolling(self.bb_window).std()
+        bb_up   = bb_mid + self.bb_std * bb_std
+        bb_lo   = bb_mid - self.bb_std * bb_std
+        rsi     = self._rsi(c, self.rsi_period)
+        mr_over  = (c < bb_lo) & (rsi < self.rsi_oversold)
+        mr_over2 = (c > bb_up) & (rsi > self.rsi_overbought)
+
+        # Volume-price dim (OBV)
+        obv    = self._obv(c, v)
+        obv_ma = obv.rolling(self.obv_ma_period).mean()
+        vol_bull = obv > obv_ma
+        vol_bear = obv < obv_ma
+
+        # 3-dim voting (HKUDS exact logic)
+        buy  = (trend_bull | mr_over)  & vol_bull & ~mr_over2
+        sell = (trend_bear | mr_over2) & vol_bear & ~mr_over
+
+        sig = buy.astype(int) - sell.astype(int)
+        sig = sig.fillna(0).astype(int)
+
+        # Detail
+        cur_adx   = round(float(adx.iloc[-1]),  1) if not pd.isna(adx.iloc[-1])  else "N/A"
+        cur_ema_f = round(float(ema_f.iloc[-1]), 2) if not pd.isna(ema_f.iloc[-1]) else "N/A"
+        cur_ema_s = round(float(ema_s.iloc[-1]), 2) if not pd.isna(ema_s.iloc[-1]) else "N/A"
+        cur_rsi   = round(float(rsi.iloc[-1]),   1) if not pd.isna(rsi.iloc[-1])   else "N/A"
+        trend_str = "bull" if bool(trend_bull.iloc[-1]) else "bear" if bool(trend_bear.iloc[-1]) else "neutral"
+        cur       = _last(sig)
+        det = (f"EMA{self.ema_fast}={cur_ema_f} EMA{self.ema_slow}={cur_ema_s} "
+               f"ADX={cur_adx} RSI={cur_rsi} trend={trend_str} "
+               f"| OBV={'bull' if bool(vol_bull.iloc[-1]) else 'bear'} "
+               f"| Signal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'}")
+        return sig, det
+
+    def generate(self, data_map):
+        signals, details = {}, {}
+        for code, df in data_map.items():
+            try:
+                sig, det = self._one(df)
+                signals[code] = _last(sig)
+                details[code] = det
+            except Exception as e:
+                signals[code] = 0
+                details[code] = f"Loi TechnicalEngine: {e}"
+        return signals, details
+
 
 class ElliottEngine:
     FIBS = [0.236,0.382,0.5,0.618,0.786,1.0,1.272,1.414,1.618,2.0,2.618]
@@ -505,7 +537,7 @@ class HarmonicEngine:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class VolatilityEngine:
-    def __init__(self, hv_w=20, pct_w=252, lo_pct=20, hi_pct=80, ann=252):
+    def __init__(self, hv_w=20, pct_w=120, lo_pct=20, hi_pct=80, ann=252):  # [HKUDS] lookback=120
         self.hv_w=hv_w; self.pct_w=pct_w; self.lo_pct=lo_pct; self.hi_pct=hi_pct; self.ann=ann
 
     def _hv(self, c):
@@ -539,65 +571,72 @@ class VolatilityEngine:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SeasonalEngine:
-    def __init__(self, lookback_years=3, min_count=2, threshold=0.60):
-        """
-        lookback_years=3: cần 3 năm data (500 ngày đủ)
-        min_count=2: chỉ cần 2 lần lịch sử mỗi tháng để tính
-        """
-        self.lb=lookback_years; self.mc=min_count; self.th=threshold
+    """
+    Seasonal/Calendar Effect — implement đúng theo HKUDS source.
+    [HKUDS] agent/src/skills/SeasonalEngine/example_signal_engine.py
+
+    Logic: Fixed month lists (bullish/bearish months) + optional weekday effect.
+    VN market adaptation:
+      bullish_months: [1,2,3,10,11,12] — đầu năm + cuối năm (mùa kết quả kinh doanh)
+      bearish_months: [5,6,7,8,9]      — "Sell in May" effect
+    """
+    def __init__(self,
+                 bullish_months=None,
+                 bearish_months=None,
+                 use_weekday=False,
+                 bullish_weekdays=None,
+                 bearish_weekdays=None):
+        # VN market: [1,2,3,10,11,12] tích cực, [5,6,7,8,9] tiêu cực
+        self.bullish_months   = bullish_months   or [1, 2, 3, 10, 11, 12]
+        self.bearish_months   = bearish_months   or [5, 6, 7, 8, 9]
+        self.use_weekday      = use_weekday
+        self.bullish_weekdays = bullish_weekdays or [4]   # Friday
+        self.bearish_weekdays = bearish_weekdays or [0]   # Monday
 
     def _one(self, df):
-        c=df["close"]
-        # Cần index là DatetimeIndex để resample
-        if not isinstance(c.index, pd.DatetimeIndex):
-            try:
-                df = df.copy()
-                df.index = pd.to_datetime(df.index)
-                c = df["close"]
-            except Exception:
-                return pd.Series(0,index=df.index,dtype=int), "Khong the parse DatetimeIndex."
-        mret=c.resample("ME").last().pct_change().dropna()
-        sig=pd.Series(0,index=df.index,dtype=int)
-        # Cần ít nhất min_count*6 tháng (2*6=12 tháng = 1 năm)
-        if len(mret)<self.mc*6:
-            return sig, f"Khong du du lieu seasonal ({len(mret)} thang, can {self.mc*6})."
-        cutoff=mret.index[-1]-pd.DateOffset(years=self.lb)
-        hist=mret[mret.index>=cutoff]
-        stats=hist.groupby(hist.index.month).apply(
-            lambda x: (x>0).sum()/len(x) if len(x)>=self.mc else 0.5)
-        for dt in df.index:
-            m=dt.month
-            if m in stats.index:
-                pw=stats[m]
-                if pw>=self.th: sig[dt]=1
-                elif pw<=(1-self.th): sig[dt]=-1
-        import datetime; cm=datetime.datetime.now().month
-        mn=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-        stats_dict = stats.to_dict()
-        bias=int(round(stats_dict.get(cm, 0.5)*100))
-        cur_sig=_last(sig)
-        count_up = sum(1 for m_ret in hist[hist.index.month == cm] if m_ret > 0)
-        count_total = sum(1 for _ in hist[hist.index.month == cm])
-        det=(f"Thang {mn[cm-1]}: lich su tang {count_up}/{count_total} lan ({bias}%). "
-             +("Thang nay thuong TANG." if cur_sig>0 else
-               "Thang nay thuong GIAM." if cur_sig<0 else
-               "Khong co xu huong ro rang."))
-        return sig, det
+        idx    = df.index
+        month  = idx.month
+        signal = pd.Series(0, index=idx, dtype=int)
+
+        # Month effect (HKUDS exact logic)
+        signal[month.isin(self.bullish_months)] = 1
+        signal[month.isin(self.bearish_months)] = -1
+
+        # Weekday effect (optional — HKUDS double confirmation)
+        if self.use_weekday:
+            weekday = idx.weekday
+            wd_sig  = pd.Series(0, index=idx, dtype=int)
+            wd_sig[weekday.isin(self.bullish_weekdays)] = 1
+            wd_sig[weekday.isin(self.bearish_weekdays)] = -1
+            combined = signal + wd_sig
+            signal = pd.Series(0, index=idx, dtype=int)
+            signal[combined >= 2]  = 1
+            signal[combined <= -2] = -1
+
+        # Detail
+        import datetime
+        cm   = datetime.datetime.now().month
+        mn   = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+        bias = ("TANG" if cm in self.bullish_months else
+                "GIAM" if cm in self.bearish_months else "TRUNG LAP")
+        cur  = _last(signal)
+        det  = (f"Thang {mn[cm-1]}({cm}): thuong {bias}. "
+                f"Bull months={self.bullish_months} | Bear months={self.bearish_months}. "
+                f"Signal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'}")
+        return signal, det
 
     def generate(self, data_map):
         signals, details = {}, {}
         for code, df in data_map.items():
             try:
-                sig,det=self._one(df); signals[code]=_last(sig); details[code]=det
+                sig, det = self._one(df)
+                signals[code] = _last(sig)
+                details[code] = det
             except Exception as e:
-                signals[code]=0; details[code]=f"Loi: {e}"
+                signals[code] = 0
+                details[code] = f"Loi SeasonalEngine: {e}"
         return signals, details
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENGINE 8 — SMC (Smart Money Concepts — pure pandas fallback, from Vibe-Trading)
-# BOS/ChoCH/FVG không dùng external lib
-# ══════════════════════════════════════════════════════════════════════════════
 
 class SMCEngine:
     def __init__(self, swing_length=10, close_break=True):
