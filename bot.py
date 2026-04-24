@@ -27,6 +27,67 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
+# ── Message split helper ──────────────────────────────────────────────────────
+TELEGRAM_MAX = 4096
+
+def _smart_split(text: str) -> list:
+    """Tách text tại điểm tự nhiên, mỗi part <= TELEGRAM_MAX."""
+    if len(text) <= TELEGRAM_MAX:
+        return [text]
+    # Tách tại markers tự nhiên theo thứ tự ưu tiên
+    for marker in ["\nCHI TIET:", "\nLUU Y:", "\nRisk (", "\n================================"]:
+        idx = text.find(marker)
+        if 0 < idx < TELEGRAM_MAX:
+            part1 = text[:idx].rstrip()
+            part2 = text[idx:].lstrip('\n')
+            if len(part1) <= TELEGRAM_MAX:
+                return [part1] + _smart_split(part2)
+    # Tách tại dòng trống gần nhất
+    nl_idx = text.rfind('\n\n', 0, TELEGRAM_MAX - 100)
+    if nl_idx > 0:
+        return [text[:nl_idx].rstrip()] + _smart_split(text[nl_idx:].lstrip())
+    # Hard cut
+    return [text[:4000]] + _smart_split(text[4000:])
+
+
+async def _split_and_send(message, text: str):
+    """
+    Gửi text dài qua Telegram, tự động tách nếu > 4096 ký tự.
+    Phần đầu dùng reply_text, các phần sau reply tiếp để tạo thread.
+    """
+    parts = _smart_split(plain(text))
+    sent = None
+    for i, part in enumerate(parts):
+        if i == 0:
+            sent = await message.reply_text(part)
+        else:
+            # Reply vào message gốc (không phải part trước) để giữ context
+            sent = await message.reply_text(part)
+    return sent
+
+
+async def _edit_or_split(msg, message, text: str):
+    """
+    Với message đã gửi trước (loading indicator):
+      - Nếu chỉ 1 part: edit message cũ (trải nghiệm tốt hơn)
+      - Nếu nhiều parts: delete/edit part1 + send phần còn lại
+    """
+    parts = _smart_split(plain(text))
+    if len(parts) == 1:
+        try:
+            await msg.edit_text(parts[0])
+        except Exception:
+            await message.reply_text(parts[0])
+    else:
+        # Edit message loading thành part 1
+        try:
+            await msg.edit_text(parts[0])
+        except Exception:
+            await message.reply_text(parts[0])
+        # Gửi các phần còn lại
+        for part in parts[1:]:
+            await message.reply_text(part)
+
 # ── Authorization ─────────────────────────────────────────────────────────────
 def _allowed_ids() -> set:
     """
@@ -288,12 +349,7 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"NEWS: ERROR | {str(e)[:80]}")
 
     result = "\n".join(lines)
-    if len(result) > 3800:
-        result = result[:3800] + "\n...[truncated]"
-    try:
-        await msg.edit_text(result)
-    except Exception:
-        await msg.edit_text(plain(result))
+    await _edit_or_split(msg, update.message, result)
 
 
 # ── /check ────────────────────────────────────────────────────────────────────
@@ -315,10 +371,7 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(f"Dang phan tich {symbol}... (~30-60 giay)")
     try:
         result, meta = await asyncio.to_thread(analyze_stock_full, symbol)
-        result = plain(result)
-        if len(result) > 4000:
-            result = result[:3950] + "\n...[cat bot]"
-        await msg.edit_text(result)
+        await _edit_or_split(msg, update.message, result)
 
         if meta:
             try:
@@ -353,10 +406,7 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(f"Dang quet {len(wl)} ma... (~30 giay)")
     try:
         result = await asyncio.to_thread(scan_watchlist, wl)
-        result = plain(result)
-        if len(result) > 4000:
-            result = result[:3950] + "\n...[cat bot]"
-        await msg.edit_text(result)
+        await _edit_or_split(msg, update.message, result)
     except Exception as e:
         logger.error(f"Scan error: {e}")
         await msg.edit_text(f"Loi khi quet watchlist: {str(e)[:200]}")
@@ -374,9 +424,7 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 pass
         result = await asyncio.to_thread(get_report, days)
-        if len(result) > 4000:
-            result = result[:3950] + "\n...[cat bot]"
-        await msg.edit_text(result)
+        await _edit_or_split(msg, update.message, result)
     except Exception as e:
         await msg.edit_text(f"Loi khi lay report: {str(e)[:200]}")
 
@@ -394,9 +442,7 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(f"Dang lay lich su {symbol}...")
     try:
         result = await asyncio.to_thread(get_history, symbol)
-        if len(result) > 4000:
-            result = result[:3950] + "\n...[cat bot]"
-        await msg.edit_text(result)
+        await _edit_or_split(msg, update.message, result)
     except Exception as e:
         await msg.edit_text(f"Loi khi lay history {symbol}: {str(e)[:200]}")
 
@@ -561,7 +607,6 @@ async def vibe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if status == "completed":
                     final_report = data.get("final_report", "")
                     if not final_report and tasks:
-                        # Lấy output của agent cuối
                         done_tasks = [t for t in tasks if t.get("status")=="completed"]
                         if done_tasks:
                             last_t = done_tasks[-1]
@@ -571,12 +616,21 @@ async def vibe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                               f"Ma: {symbol} | {done}/{n} agents | "
                               f"{int(elapsed)//60}p{int(elapsed)%60}s\n"
                               f"{'='*32}\n\n")
-                    body = (final_report or "Khong co bao cao.")[:3800 - len(header)]
-                    output = header + body
-                    await context.bot.edit_message_text(
-                        chat_id=chat_id, message_id=msg_id,
-                        text=output[:4000]
-                    )
+                    full_output = header + (final_report or "Khong co bao cao.")
+                    parts = _smart_split(plain(full_output))
+
+                    # Edit message loading thành part 1
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id, message_id=msg_id,
+                            text=parts[0]
+                        )
+                    except Exception:
+                        await context.bot.send_message(chat_id=chat_id, text=parts[0])
+
+                    # Gửi phần còn lại (nếu có)
+                    for part in parts[1:]:
+                        await context.bot.send_message(chat_id=chat_id, text=part)
                     return
 
                 if status in ("failed", "cancelled"):

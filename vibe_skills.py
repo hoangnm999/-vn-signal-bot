@@ -1628,30 +1628,29 @@ class ChanlunEngine:
             ))
         return bars
 
-    def _get_czsc_signals(self, c):
-        """Compute Chanlun signals from CZSC object."""
+    def _get_czsc_signals(self, c) -> dict:
+        """Goi signal functions thu cong — compatible czsc 0.9.x va 0.10.x."""
         from czsc.signals.cxt import (
             cxt_first_buy_V221126, cxt_first_sell_V221126,
             cxt_bi_base_V230228, cxt_three_bi_V230618, cxt_five_bi_V230619,
         )
         s = {}
-        s.update(cxt_first_buy_V221126(c, di=1))
-        s.update(cxt_first_sell_V221126(c, di=1))
-        s.update(cxt_bi_base_V230228(c, di=1))
-        s.update(cxt_three_bi_V230618(c, di=1))
-        s.update(cxt_five_bi_V230619(c, di=1))
+        for fn in [cxt_first_buy_V221126, cxt_first_sell_V221126,
+                   cxt_bi_base_V230228, cxt_three_bi_V230618, cxt_five_bi_V230619]:
+            try: s.update(fn(c, di=1))
+            except Exception: pass
         return s
 
-    def _evaluate(self, c) -> int:
-        """Evaluate CZSC signals → {-1, 0, 1}."""
+    def _evaluate_dict(self, signals: dict, c) -> int:
+        """Evaluate Chanlun signals tu dict — dung cho czsc >= 0.10.x."""
+        if not signals:
+            return 0
         try:
             from czsc import ZS
-            signals = c.signals
-            if not signals: return 0
-            # 一买
+            # 一买 (yi mai)
             buy1 = [k for k in signals if "BUY1" in k]
             if buy1 and "一买" in str(signals.get(buy1[0], "")): return 1
-            # 一卖
+            # 一卖 (yi mai)
             sell1 = [k for k in signals if "SELL1" in k]
             if sell1 and "一卖" in str(signals.get(sell1[0], "")): return -1
             # 三笔形态
@@ -1666,11 +1665,11 @@ class ChanlunEngine:
                 v = str(signals.get(five[0], ""))
                 if "类一买" in v: return 1
                 if "类一卖" in v: return -1
-            # BI + ZS position
+            # BI base V230228 + ZS position
             bi_key = [k for k in signals if "V230228" in k]
             if bi_key and len(c.bi_list) >= 3:
                 v = str(signals.get(bi_key[0], ""))
-                for i in range(len(c.bi_list)-3, max(len(c.bi_list)-10,-1), -1):
+                for i in range(len(c.bi_list)-3, max(len(c.bi_list)-10, -1), -1):
                     try:
                         zs = ZS(bis=c.bi_list[i:i+3])
                         if zs.is_valid:
@@ -1684,23 +1683,43 @@ class ChanlunEngine:
             pass
         return 0
 
+
     def _one_czsc(self, df: pd.DataFrame, code: str) -> tuple:
-        """Full Chanlun via czsc library."""
+        """
+        Full Chanlun via czsc library.
+        API compatibility:
+          czsc <= 0.9.x : CZSC(bars, get_signals=fn) + streaming update()
+          czsc >= 0.10.x: CZSC(bars) roi goi signal fn thu cong, c.signals read-only
+        """
         from czsc import CZSC
-        bars  = self._df_to_bars(df, code)
-        sig   = pd.Series(0, index=df.index, dtype=int)
+        import inspect
+        bars = self._df_to_bars(df, code)
+        sig  = pd.Series(0, index=df.index, dtype=int)
         if len(bars) < self.min_bars:
             return sig, "Khong du bars cho Chanlun"
-        c = CZSC(bars[:self.min_bars], get_signals=self._get_czsc_signals)
-        for bar in bars[self.min_bars:]:
-            c.update(bar)
-            v = self._evaluate(c)
-            if v != 0:
-                sig.iloc[bar.id] = v
-        cur = _last(sig)
+
+        czsc_params = inspect.signature(CZSC).parameters
+        legacy_api  = "get_signals" in czsc_params  # czsc <= 0.9.x
+
+        if legacy_api:
+            c = CZSC(bars[:self.min_bars], get_signals=self._get_czsc_signals)
+            for bar in bars[self.min_bars:]:
+                c.update(bar)
+                v = self._evaluate_dict(self._get_czsc_signals(c), c)
+                if v != 0:
+                    sig.iloc[bar.id] = v
+            cur = _last(sig)
+        else:
+            # czsc >= 0.10.x: c.signals is read-only, pass dict directly to evaluate
+            c   = CZSC(bars)
+            smap = self._get_czsc_signals(c)
+            cur  = self._evaluate_dict(smap, c)
+            sig.iloc[-1] = cur
+
         n_bi = len(c.bi_list)
-        det = (f"[HKUDS] Chanlun(czsc) | BI count={n_bi} "
-               f"| Signal={'BUY(一买/盘背)' if cur>0 else 'SELL(一卖/盘背)' if cur<0 else 'NEUTRAL'}")
+        ver  = "legacy" if legacy_api else "new"
+        det  = (f"[HKUDS] Chanlun(czsc-{ver}) | BI={n_bi} "
+                f"| Signal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'}")
         return sig, det
 
     def _one_lite(self, df: pd.DataFrame) -> tuple:
