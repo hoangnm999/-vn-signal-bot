@@ -2,47 +2,34 @@
 vibe_skills.py — Signal Engines cho VN Signal Bot
 Chạy trực tiếp trên OHLCV Entrade (pure pandas/numpy, không cần API server).
 
-NGUỒN GỐC THỰC TẾ (quan trọng):
+TRẠNG THÁI VERIFY (cập nhật sau session cross-check với HKUDS source):
 ──────────────────────────────────────────────────────────────────────────────
-⚠️  CHƯA CÓ source code gốc HKUDS/Vibe-Trading (GitHub bị block khi deploy).
-    Các engines dưới đây được implement theo logic trading chuẩn (RSI, MACD,
-    Elliott Wave theory, v.v.) — KHÔNG phải copy từ HKUDS repo.
-    Khi có source code gốc, cần rewrite lại theo đúng HKUDS implementation.
-
-Label nguồn gốc:
-  [HKUDS-like]  : Implement theo đúng tên/concept của HKUDS, logic tương đương
-                  nhưng CHƯA verify với source gốc
-  [Claude-made] : Tự sáng tạo hoàn toàn, không có tương đương trong HKUDS preset
+[HKUDS verified] : Đã so sánh line-by-line với example_signal_engine.py gốc
+[HKUDS SKILL.md] : Không có .py gốc, implement theo SKILL.md spec
 ──────────────────────────────────────────────────────────────────────────────
 
-Engines (16 total):
-  1.  Candlestick    [HKUDS] — 15 mô hình nến, vectorized sum→sign, volume filter (verified source)
-  2.  Ichimoku       [HKUDS] — TK Cross event + 3-filter (rewrite từ source gốc)
-  3.  TechnicalBasic [HKUDS] — 3-dim voting EMA/ADX+BB/RSI+OBV (rewrite từ source gốc)
-  4.  ElliottWave    [HKUDS] — Zigzag + 5-wave + ABC + Fibonacci (verified source)
-  5.  Harmonic       [HKUDS] — XABCD Gartley/Bat/Butterfly/Crab + pyharmonics fallback (verified source)
-  6.  Volatility     [HKUDS] — HV percentile (lookback=120, low=20%, high=80%)
-  7.  Seasonal       [HKUDS] — Fixed month lists (rewrite từ source gốc)
-  8.  SMC            [HKUDS] — ChoCH priority + BOS + FVG filter (momentum fallback)
-  9.  CrossMarket    [HKUDS] — Vol-adjusted dual-MA, a_share params 5/20 MA (rewrite từ source gốc)
-  10. MultiFactor    [HKUDS] — 4-factor composite Z-score, adapted từ cross-section (rewrite từ source gốc)
-  11. MeanReversion  [HKUDS] — Z-score entry=2.0 exit=0.5 lookback=60D, adapted từ Pair Trading
-  12. PriceMomentum  [Claude-made] — Multi-TF momentum 5D/20D/60D
-  13. Breakout       [Claude-made] — S/R breakout + vol confirm
-  14. MLStrategy     [Claude-made] — ExtraTrees walk-forward + rule fallback
-  15. Fundamental    [Claude-made] — PE/PB/ROE/EPS từ vnstock
-  16. MoneyFlow      [Claude-made] — CMF/VPT/OBV/Force Index
+Engines (13 total — MeanReversion đã xóa do không có source gốc):
+  1.  Candlestick       [HKUDS verified] — 15 patterns, vectorized sum→sign, volume filter (VN)
+  2.  Ichimoku          [HKUDS verified] — TK Cross event + 3-filter (9/26/52)
+  3.  TechnicalBasic    [HKUDS verified] — 3-dim voting: trend/mr/vol-price
+  4.  ElliottWave       [HKUDS verified] — Zigzag(H/L) + 5-wave(3 Iron Rules) + ABC + Fib
+  5.  Harmonic          [HKUDS verified] — XABCD Gartley/Bat/Butterfly/Crab, d_retrace=AD/XA
+  6.  Volatility        [HKUDS verified] — HV percentile rolling.rank (lookback=120)
+  7.  Seasonal          [HKUDS verified] — Fixed month/weekday lists (tháng 10 = VN adaptation)
+  8.  SMC               [HKUDS verified] — smartmoneyconcepts lib → ChoCH+BOS+FVG; pandas fallback
+  9.  CrossMarket       [HKUDS verified] — Vol-adjusted dual-MA (a_share params: MA5/MA20)
+  10. MultiFactor       [HKUDS verified] — Cross-section zscore ranking (multi); ts-zscore (single)
+  11. MLStrategy        [HKUDS SKILL.md] — RandomForest n=100 walk-forward, 10 features, threshold=0.3
+  12. Chanlun           [HKUDS verified] — czsc: FX→BI→ZS→买卖点; pandas lite fallback
+  13. FundamentalFilter [HKUDS verified] — PE/PB/ROE, DataFrame columns first; 4-source fetch fallback
 
-Context agents (trong analyzer.py):
-  17. MarketRegime   [Claude-made] — VN-Index proxy scoring
-  18. NewsSentiment  [Claude-made] — RSS keyword scoring
+Context agents (trong analyzer.py, không phải engines):
+  MarketRegime, NewsSentiment, VNMacro, CommodityContext
 
 Public API:
   result = run_vibe_agents(symbol, df)
   result["signals"]  → {engine_name: int}   (+1 bull / -1 bear / 0 neutral)
   result["details"]  → {engine_name: str}   (mô tả ngắn)
-  result["verdict"]  → int
-  result["summary"]  → str
 """
 
 from __future__ import annotations
@@ -1452,129 +1439,6 @@ class MultiFactorEngine:
         return signals_out, details_out
 
 
-class MeanReversionEngine:
-    """
-    Mean Reversion + Cointegration Signal.
-    [HKUDS] agent/src/skills/Pair trading/example_signal_engine.py
-             agent/src/skills/correlation-analysis/SKILL.md
-
-    Combines 2 approaches:
-      1. Z-score vs rolling mean (HKUDS Pair Trading)
-         entry_z=2.0, exit_z=0.5, lookback=60D
-      2. Engle-Granger cointegration test vs VNINDEX proxy
-         (correlation-analysis SKILL) — upgrade khi có statsmodels
-
-    Cho TTCK VN: mã có cointegration với sector ETF/proxy
-    thường hội tụ về mean nhanh hơn → signal chất lượng cao hơn.
-    """
-    def __init__(self, lookback=60, entry_z=2.0, exit_z=0.5):
-        self.lookback = lookback
-        self.entry_z  = entry_z
-        self.exit_z   = exit_z
-        self._has_sm  = self._check_statsmodels()
-
-    @staticmethod
-    def _check_statsmodels() -> bool:
-        try:
-            from statsmodels.tsa.stattools import coint
-            return True
-        except ImportError:
-            return False
-
-    def _zscore_signal(self, c: pd.Series) -> tuple:
-        """HKUDS Pair Trading: Z-score vs rolling mean."""
-        mean = c.rolling(self.lookback).mean()
-        std  = c.rolling(self.lookback).std().replace(0, np.nan)
-        z    = (c - mean) / std
-        sig  = pd.Series(0, index=c.index, dtype=int)
-        sig[z < -self.entry_z] =  1   # oversold → BUY
-        sig[z >  self.entry_z] = -1   # overbought → SELL
-        sig[z.abs() < self.exit_z] = 0
-        return sig, z
-
-    def _cointegration_check(self, c: pd.Series, proxy: pd.Series) -> dict:
-        """
-        Engle-Granger cointegration test (correlation-analysis SKILL).
-        Trả về: {is_cointegrated, p_value, hedge_ratio, spread_z}
-        """
-        if not self._has_sm:
-            return {"is_cointegrated": False, "p": 1.0}
-        try:
-            from statsmodels.tsa.stattools import coint
-            import statsmodels.api as sm
-            # Align
-            df = pd.concat([c.rename("y"), proxy.rename("x")], axis=1).dropna()
-            if len(df) < self.lookback + 10:
-                return {"is_cointegrated": False, "p": 1.0}
-            y = df["y"]; x = df["x"]
-            # Engle-Granger test
-            _, p, _ = coint(y, x)
-            # OLS hedge ratio
-            x_c = sm.add_constant(x)
-            ols = sm.OLS(y, x_c).fit()
-            hr  = float(ols.params.iloc[1])
-            spread = y - hr * x
-            # Spread Z-score
-            sp_m = spread.rolling(self.lookback).mean()
-            sp_s = spread.rolling(self.lookback).std().replace(0, np.nan)
-            sp_z = (spread - sp_m) / sp_s
-            return {
-                "is_cointegrated": p < 0.05,
-                "p": round(float(p), 4),
-                "hedge_ratio": round(hr, 4),
-                "spread_z": sp_z,
-            }
-        except Exception:
-            return {"is_cointegrated": False, "p": 1.0}
-
-    def _one(self, df: pd.DataFrame, code: str,
-             proxy_df: pd.DataFrame = None) -> tuple:
-        if len(df) < self.lookback + 5:
-            return pd.Series(0, index=df.index, dtype=int), "Khong du data"
-
-        c = df["close"]
-        sig_zs, z = self._zscore_signal(c)
-        cur_z   = round(float(z.iloc[-1]), 3) if not pd.isna(z.iloc[-1]) else "N/A"
-
-        # Cointegration upgrade (nếu có proxy VNINDEX)
-        coint_info = ""
-        if proxy_df is not None and self._has_sm:
-            res = self._cointegration_check(c, proxy_df["close"])
-            if res.get("is_cointegrated"):
-                sp_z_last = round(float(res["spread_z"].iloc[-1]), 3)                             if res.get("spread_z") is not None and                                not pd.isna(res["spread_z"].iloc[-1]) else None
-                if sp_z_last is not None:
-                    # Override signal với spread Z-score (chất lượng cao hơn)
-                    if sp_z_last < -self.entry_z:
-                        sig_zs.iloc[-1] = 1
-                    elif sp_z_last > self.entry_z:
-                        sig_zs.iloc[-1] = -1
-                    elif abs(sp_z_last) < self.exit_z:
-                        sig_zs.iloc[-1] = 0
-                coint_info = (f" | Cointegrated(p={res['p']}) "
-                              f"hr={res.get('hedge_ratio','?')} "
-                              f"spread_z={sp_z_last}")
-            else:
-                coint_info = f" | No coint(p={res['p']})"
-
-        cur = _last(sig_zs)
-        det = (f"Z-score={cur_z} (entry±{self.entry_z} exit±{self.exit_z} "
-               f"lookback={self.lookback}D){coint_info} "
-               f"Signal={'BUY(oversold)' if cur>0 else 'SELL(overbought)' if cur<0 else 'NEUTRAL'}")
-        return sig_zs, det
-
-    def generate(self, data_map: dict) -> tuple:
-        signals, details = {}, {}
-        for code, df in data_map.items():
-            try:
-                sig, det = self._one(df, code)
-                signals[code] = _last(sig)
-                details[code] = det
-            except Exception as e:
-                signals[code] = 0
-                details[code] = f"Loi MeanReversionEngine: {e}"
-        return signals, details
-
-
 class MLStrategyEngine:
     """
     Machine-Learning Predictive Strategy.
@@ -1932,7 +1796,60 @@ class FundamentalFilterEngine:
         self.pb_max  = pb_max
         self.roe_min = roe_min
 
-    def _fetch_fundamentals_vnstock(self, symbol: str) -> dict:
+    def _fetch_fundamentals_fireant(self, symbol: str) -> dict:
+        """
+        Primary source: Fireant API với Bearer token.
+        Endpoint: https://restv2.fireant.vn/symbols/{symbol}/fundamental
+        FIREANT_TOKEN phải có trong Railway env vars.
+        Đây là source đáng tin nhất cho VN stocks (có NIM, NPL cho banking).
+        """
+        try:
+            import os, urllib.request, json
+            token = os.environ.get("FIREANT_TOKEN", "")
+            if not token:
+                return {}
+            url = f"https://restv2.fireant.vn/symbols/{symbol.upper()}/fundamental"
+            req = urllib.request.Request(url, headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read().decode())
+
+            if not isinstance(data, dict):
+                return {}
+
+            def _safe(keys):
+                for k in keys:
+                    v = data.get(k)
+                    if v is not None:
+                        try:
+                            f = float(v)
+                            if not pd.isna(f) and f != 0:
+                                return f
+                        except Exception:
+                            pass
+                return None
+
+            pe  = _safe(["pe", "PE", "priceToEarning", "ttmPE"])
+            pb  = _safe(["pb", "PB", "priceToBook"])
+            roe = _safe(["roe", "ROE", "returnOnEquity"])
+            # Fireant banking extras (STB, VCB, BID...)
+            npl = _safe(["nplRatio", "badDebtRatio", "npl"])  # Nợ xấu
+            nim = _safe(["nim", "netInterestMargin"])           # NIM
+            if roe is not None and abs(roe) < 2:
+                roe = roe * 100
+            if pe is not None or roe is not None:
+                result = {"pe": pe, "pb": pb, "roe": roe, "source": "Fireant"}
+                if npl is not None: result["npl"] = npl
+                if nim is not None: result["nim"] = nim
+                return result
+        except Exception:
+            pass
+        return {}
+
+
         """Lấy PE/PB/ROE từ vnstock KBS quarterly ratio."""
         try:
             from vnstock import Vnstock
@@ -1962,7 +1879,46 @@ class FundamentalFilterEngine:
                     pb  = _find(["pricetobook","p/b","pb"])
                     roe = _find(["roe"])
                     if pe is not None or roe is not None:
-                        # Normalize ROE nếu dạng 0.15 thay vì 15
+                        if roe is not None and abs(roe) < 2:
+                            roe = roe * 100
+                        return {"pe": pe, "pb": pb, "roe": roe,
+                                "source": f"vnstock KBS ({period})"}
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return {}
+
+    def _fetch_fundamentals_vnstock(self, symbol: str) -> dict:
+        """Fallback 1: lấy PE/PB/ROE từ vnstock KBS quarterly ratio."""
+        try:
+            from vnstock import Vnstock
+            stock = Vnstock().stock(symbol=symbol, source="KBS")
+            for period in ["quarter", "annual"]:
+                try:
+                    ratio = stock.finance.ratio(period=period)
+                    if ratio is None or ratio.empty:
+                        continue
+                    latest = ratio.iloc[0]
+                    cols   = [c.lower() for c in latest.index]
+                    orig   = list(latest.index)
+
+                    def _find(patterns):
+                        for p in patterns:
+                            for i, c in enumerate(cols):
+                                if p.lower() in c:
+                                    try:
+                                        v = float(latest[orig[i]])
+                                        if not pd.isna(v) and v != 0:
+                                            return v
+                                    except Exception:
+                                        pass
+                        return None
+
+                    pe  = _find(["pricetoearning","p/e","pe_ttm","pe"])
+                    pb  = _find(["pricetobook","p/b","pb"])
+                    roe = _find(["roe"])
+                    if pe is not None or roe is not None:
                         if roe is not None and abs(roe) < 2:
                             roe = roe * 100
                         return {"pe": pe, "pb": pb, "roe": roe,
@@ -1974,24 +1930,30 @@ class FundamentalFilterEngine:
         return {}
 
     def _fetch_fundamentals_yfinance(self, symbol: str) -> dict:
-        """Fallback: lấy từ yfinance (cho mã không có trong vnstock)."""
+        """Fallback: lấy từ yfinance với .VN suffix cho HOSE/HNX."""
         try:
             import yfinance as yf
-            info = yf.Ticker(symbol).info
-            pe   = info.get("trailingPE") or info.get("forwardPE")
-            pb   = info.get("priceToBook")
-            roe  = info.get("returnOnEquity")
+            # VN stocks cần suffix .VN trên Yahoo Finance (STB → STB.VN)
+            ticker_sym = f"{symbol.upper()}.VN"
+            info = yf.Ticker(ticker_sym).info
+            # Nếu không có data, thử không suffix
+            if not info.get("trailingPE") and not info.get("returnOnEquity"):
+                info = yf.Ticker(symbol.upper()).info
+            pe  = info.get("trailingPE") or info.get("forwardPE")
+            pb  = info.get("priceToBook")
+            roe = info.get("returnOnEquity")
             if roe is not None and abs(roe) < 2:
                 roe = roe * 100
-            return {"pe": pe, "pb": pb, "roe": roe, "source": "yfinance"}
+            if pe is not None or roe is not None:
+                return {"pe": pe, "pb": pb, "roe": roe, "source": "yfinance(.VN)"}
         except Exception:
-            return {}
+            pass
+        return {}
 
     def _fetch_fundamentals_cafef(self, symbol: str) -> dict:
         """
-        Fallback 3: crawl nhẹ CafeF API (JSON public, không cần auth).
-        Endpoint: https://s.cafef.vn/Ajax/Utilities/GetFinanceRatio.ashx?symbol=VCB
-        Trả về PE, PB, ROE từ dữ liệu trailing 12M.
+        Fallback: crawl CafeF API (JSON public, không cần auth).
+        Endpoint: https://s.cafef.vn/Ajax/Utilities/GetFinanceRatio.ashx?symbol=STB
         """
         try:
             import urllib.request, json
@@ -2000,12 +1962,8 @@ class FundamentalFilterEngine:
             with urllib.request.urlopen(req, timeout=5) as r:
                 data = json.loads(r.read().decode())
 
-            # CafeF trả về list, lấy phần tử đầu (TTM)
-            if isinstance(data, list) and data:
-                item = data[0]
-            elif isinstance(data, dict):
-                item = data
-            else:
+            item = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else {}
+            if not item:
                 return {}
 
             def _safe(keys):
@@ -2013,7 +1971,7 @@ class FundamentalFilterEngine:
                     v = item.get(k)
                     if v is not None:
                         try:
-                            f = float(str(v).replace(",",""))
+                            f = float(str(v).replace(",", ""))
                             if not pd.isna(f) and f != 0:
                                 return f
                         except Exception:
@@ -2033,7 +1991,7 @@ class FundamentalFilterEngine:
 
     def _fetch_fundamentals_entrade(self, symbol: str) -> dict:
         """
-        Fallback 4: Entrade/DNSE fundamental endpoint.
+        Fallback: Entrade/DNSE fundamental endpoint.
         https://services.entrade.com.vn/dnse-analysis-service/company/{symbol}/summary
         """
         try:
@@ -2043,7 +2001,6 @@ class FundamentalFilterEngine:
             with urllib.request.urlopen(req, timeout=5) as r:
                 data = json.loads(r.read().decode())
 
-            # Tìm PE/PB/ROE trong nested dict
             def _dig(d, keys):
                 if not isinstance(d, dict):
                     return None
@@ -2055,7 +2012,6 @@ class FundamentalFilterEngine:
                                 return v
                         except Exception:
                             pass
-                # Recursive search một level
                 for v in d.values():
                     if isinstance(v, dict):
                         r = _dig(v, keys)
@@ -2136,7 +2092,21 @@ class FundamentalFilterEngine:
             sig = 0
 
         parts = passed + [f"FAIL:{f}" for f in failed]
-        det   = f"[HKUDS][{src}] " + " | ".join(parts) +                 f" | {'PASS(value ok)' if sig>0 else 'BORDERLINE' if sig==0 else 'FAIL(overvalued/weak)'}"
+        # Banking extras từ Fireant
+        extra = []
+        if fund.get("npl") is not None:
+            npl = fund["npl"]
+            npl_pct = npl * 100 if npl < 1 else npl
+            extra.append(f"NPL={npl_pct:.2f}%({'OK' if npl_pct < 3 else 'CAO'})")
+        if fund.get("nim") is not None:
+            nim = fund["nim"]
+            nim_pct = nim * 100 if nim < 1 else nim
+            extra.append(f"NIM={nim_pct:.2f}%")
+        if extra:
+            parts += extra
+
+        det = (f"[HKUDS][{src}] " + " | ".join(parts) +
+               f" | {'PASS(value ok)' if sig>0 else 'BORDERLINE' if sig==0 else 'FAIL(overvalued/weak)'}")
         return sig, det
 
     def _extract_from_df(self, df: pd.DataFrame) -> dict:
@@ -2171,21 +2141,34 @@ class FundamentalFilterEngine:
         fund = self._extract_from_df(df)
 
         # Fallback: fetch external nếu không có columns
+        fetch_log = []
         if not fund:
             for fetch_fn in [
-                self._fetch_fundamentals_vnstock,
-                self._fetch_fundamentals_entrade,
-                self._fetch_fundamentals_cafef,
-                self._fetch_fundamentals_yfinance,
+                self._fetch_fundamentals_fireant,    # Primary: có token, data xịn nhất
+                self._fetch_fundamentals_vnstock,    # Fallback 1: vnstock KBS
+                self._fetch_fundamentals_entrade,    # Fallback 2: Entrade DNSE
+                self._fetch_fundamentals_cafef,      # Fallback 3: CafeF JSON
+                self._fetch_fundamentals_yfinance,   # Fallback 4: yfinance .VN
             ]:
+                src_name = fetch_fn.__name__.replace("_fetch_fundamentals_", "")
                 try:
                     fund = fetch_fn(code)
-                except Exception:
+                    if fund and (fund.get("pe") is not None or fund.get("roe") is not None):
+                        fetch_log.append(f"{src_name}=OK")
+                        break
+                    else:
+                        fetch_log.append(f"{src_name}=empty")
+                        fund = {}
+                except Exception as e:
+                    fetch_log.append(f"{src_name}=ERR({type(e).__name__}:{str(e)[:40]})")
                     fund = {}
-                if fund and (fund.get("pe") is not None or fund.get("roe") is not None):
-                    break
 
         sig_val, det = self._score(fund)
+
+        # Nếu không lấy được data → đính kèm fetch log để debug
+        if not fund:
+            det = f"Khong lay duoc fundamental data [{', '.join(fetch_log)}]"
+
         sig = pd.Series(sig_val, index=df.index, dtype=int)
         return sig, det
 
@@ -2218,7 +2201,6 @@ _ENGINES = {
     "SMC":            SMCEngine(),            # [HKUDS] ChoCH priority + BOS + FVG
     "CrossMarket":    CrossMarketEngine(),    # [HKUDS] Vol-adjusted dual-MA a_share 5/20
     "MultiFactor":    MultiFactorEngine(),    # [HKUDS] 4-factor composite Z-score
-    "MeanReversion":  MeanReversionEngine(),  # [HKUDS] Z-score entry=2.0 exit=0.5
     "MLStrategy":     MLStrategyEngine(),     # [HKUDS] RandomForest walk-forward SKILL.md
     "Chanlun":        ChanlunEngine(),         # [HKUDS] 缠中说禅 FX→BI→ZS→buy/sell points
     "FundamentalFilter": FundamentalFilterEngine(), # [HKUDS] PE/PB/ROE value screen
@@ -2232,7 +2214,7 @@ _ENGINES = {
 
 def run_vibe_agents(symbol: str, df: pd.DataFrame) -> dict:
     """
-    Chạy tất cả 14 Vibe-Trading engines trên OHLCV DataFrame.
+    Chạy tất cả 13 Vibe-Trading engines trên OHLCV DataFrame.
 
     Args:
         symbol : mã cổ phiếu (VD: "VCB")
