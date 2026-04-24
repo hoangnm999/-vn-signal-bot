@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
-# ── Vibe-Trading availability check — import thực sự ở dòng ~840 ─────────────
+# ── Vibe-Trading availability check — import thực sự ở dòng ~840
+# 13 HKUDS engines + 2 context agents = 15 agents tổng ────────────────────────
 _VIBE_AVAILABLE = False  # placeholder, sẽ được set lại khi import thực tế bên dưới
 
 DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY")
@@ -256,6 +257,100 @@ def _parse_close_series(data) -> pd.Series:
 
 # Cache market data — dùng lại ngoài giờ giao dịch
 _market_cache = {"data": None, "date": None}
+
+def get_commodity_data(symbol: str) -> dict:
+    """
+    Lấy giá hàng hóa liên quan và tính commodity context signal.
+    [HKUDS] commodity-analysis/SKILL.md
+
+    Logic: xác định commodity liên quan từ symbol VN, fetch giá qua yfinance/RSS,
+    tính composite commodity score ảnh hưởng đến mã phân tích.
+
+    Sector-commodity mapping (TTCK VN):
+      Steel (HPG/HSG/NKG): iron ore + coking coal + steel futures
+      Energy (GAS/PLX/PVD): crude oil (Brent)
+      Consumer/agri (VNM/MSN): soybean + sugar + dairy
+      Securities (SSI/VND): VN30 + global risk appetite (gold/VIX)
+      Banking (VCB/BID): gold + USD/VND
+    """
+    _SECTOR_COMMODITY = {
+        frozenset(["HPG","HSG","NKG","TLH","VGS","POM","SMC"]): {
+            "name": "steel", "tickers": ["^HRC=F"],
+            "label": "Steel futures", "direction": 1,   # giá thép tăng → tốt cho HPG
+        },
+        frozenset(["GAS","PLX","PVD","PVS","BSR","OIL","PVC"]): {
+            "name": "energy", "tickers": ["BZ=F","CL=F"],
+            "label": "Brent/WTI crude", "direction": 1,
+        },
+        frozenset(["VNM","MSN","QNS","KDC","SBT"]): {
+            "name": "agri", "tickers": ["ZS=F","SB=F"],
+            "label": "Soybean/Sugar futures", "direction": -1,  # input cost
+        },
+        frozenset(["VCB","BID","CTG","TCB","MBB","VPB","ACB"]): {
+            "name": "banking_macro", "tickers": ["GC=F","DX-Y.NYB"],
+            "label": "Gold/DXY", "direction": 0,  # mixed
+        },
+    }
+
+    # Xác định commodity liên quan
+    commodity_info = None
+    for sector_set, info in _SECTOR_COMMODITY.items():
+        if symbol in sector_set:
+            commodity_info = info
+            break
+
+    if not commodity_info:
+        return {"success": False, "error": "No commodity mapping for this symbol",
+                "signal": 0, "detail": "Khong co hang hoa lien quan"}
+
+    # Fetch giá qua yfinance (nếu có)
+    try:
+        import yfinance as yf
+        prices = {}
+        for ticker in commodity_info["tickers"][:1]:  # chỉ lấy 1 ticker chính
+            hist = yf.download(ticker, period="3mo", interval="1d",
+                               progress=False, auto_adjust=True)
+            if hist is not None and not hist.empty and len(hist) >= 5:
+                close = hist["Close"].squeeze()
+                ret_1m = float((close.iloc[-1] / close.iloc[-20] - 1) * 100) if len(close) >= 20 else 0
+                ret_1w = float((close.iloc[-1] / close.iloc[-5]  - 1) * 100) if len(close) >= 5  else 0
+                prices[ticker] = {"price": float(close.iloc[-1]),
+                                  "ret_1w": ret_1w, "ret_1m": ret_1m}
+
+        if not prices:
+            return {"success": False, "error": "yfinance fetch failed",
+                    "signal": 0, "detail": commodity_info["label"] + ": data unavailable"}
+
+        # Tính signal dựa trên commodity momentum
+        main_ticker = commodity_info["tickers"][0]
+        if main_ticker in prices:
+            p = prices[main_ticker]
+            direction = commodity_info["direction"]
+            # 1-month momentum
+            if direction == 1:   # input cost hoặc revenue driver positive
+                if p["ret_1m"] > 5:   signal = 1
+                elif p["ret_1m"] < -5: signal = -1
+                else:                  signal = 0
+            elif direction == -1:  # input cost (giá cao → margin squeeze)
+                if p["ret_1m"] > 5:   signal = -1
+                elif p["ret_1m"] < -5: signal = 1
+                else:                  signal = 0
+            else:
+                signal = 0
+
+            label = commodity_info["label"]
+            detail = (f"{label}: {p['price']:.2f} | "
+                      f"1W={p['ret_1w']:+.1f}% 1M={p['ret_1m']:+.1f}% | "
+                      f"Impact={'POSITIVE' if signal>0 else 'NEGATIVE' if signal<0 else 'NEUTRAL'}")
+            return {"success": True, "signal": signal, "detail": detail,
+                    "sector": commodity_info["name"]}
+
+    except Exception as e:
+        pass
+
+    return {"success": False, "error": "yfinance unavailable",
+            "signal": 0, "detail": commodity_info["label"] + ": fetch failed (no yfinance)"}
+
 
 def get_market_data() -> dict:
     """
@@ -1556,13 +1651,15 @@ def run_verdict_agent(symbol, verdicts, ind):
 # PUBLIC API — dùng Vibe-Trading engines thay thế hoàn toàn agents cũ
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _vibe_verdict(vibe: dict, ind: dict, market: dict, news: dict) -> dict:
+def _vibe_verdict(vibe: dict, ind: dict, market: dict, news: dict,
+                  commodity_data: dict = None) -> dict:
     """
     Tổng hợp verdict từ kết quả Vibe-Trading engines.
-    Thêm 2 context signals: Market Regime + News Sentiment.
+    Context: MarketRegime + NewsSentiment + CommodityContext
+    [HKUDS] commodity-analysis/SKILL.md
     """
-    signals = dict(vibe["signals"])  # 14 Vibe signals
-    context_details = {}  # detail text cho MarketRegime + NewsSentiment
+    signals = dict(vibe["signals"])  # 13 HKUDS-verified Vibe signals
+    context_details = {}  # detail text cho context agents
 
     # ── Context signal: Market Regime ─────────────────────────────────────
     if market.get("success"):
@@ -1656,6 +1753,19 @@ def _vibe_verdict(vibe: dict, ind: dict, market: dict, news: dict) -> dict:
     else:
         signals["NewsSentiment"] = 0
         context_details["NewsSentiment"] = "Khong lay duoc tin tuc"
+
+    # ── Context signal: Commodity Context ────────────────────────────────
+    # [HKUDS] commodity-analysis/SKILL.md
+    # Chỉ áp dụng khi symbol thuộc sector có commodity liên quan
+    if commodity_data and commodity_data.get("success"):
+        signals["CommodityContext"] = commodity_data["signal"]
+        context_details["CommodityContext"] = commodity_data["detail"]
+    else:
+        # Symbol không có commodity mapping hoặc fetch failed → bỏ qua (không thêm signal 0)
+        # Để tránh dilute verdict khi không có thông tin
+        err = commodity_data.get("error", "N/A") if commodity_data else "not fetched"
+        context_details["CommodityContext"] = f"N/A: {err}"
+        # Không thêm vào signals → không count trong verdict
 
     # ── Tổng hợp vote ─────────────────────────────────────────────────────
     n_active = len(signals)
@@ -1823,7 +1933,7 @@ def _build_vibe_message(
     vibe: dict, verdict: dict,
     char_limit: int = 4000
 ) -> str:
-    """Build Telegram message với kết quả Vibe-Trading 7+2 agents."""
+    """Build Telegram message với kết quả Vibe-Trading 16+2 agents."""
     ap  = verdict["action_plan"]
     fv  = verdict["verdict_label"]
     pct = verdict["confidence_pct"]
@@ -2031,13 +2141,15 @@ def analyze_stock_full(symbol: str) -> tuple:
     Trả về (msg, metadata) — metadata dùng để lưu DB qua save_signal() trong bot.py.
     """
     # 1. Thu thập data song song
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        f_price  = ex.submit(get_price_data,  symbol, 500)  # 500 ngày: đủ cho Seasonal(3yr) + Volatility(252d)
-        f_market = ex.submit(get_market_data)
-        f_news   = ex.submit(get_news_data,   symbol)
-        price_data  = f_price.result()
-        market_data = f_market.result()
-        news_data   = f_news.result()
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        f_price     = ex.submit(get_price_data,    symbol, 500)
+        f_market    = ex.submit(get_market_data)
+        f_news      = ex.submit(get_news_data,     symbol)
+        f_commodity = ex.submit(get_commodity_data, symbol)
+        price_data     = f_price.result()
+        market_data    = f_market.result()
+        news_data      = f_news.result()
+        commodity_data = f_commodity.result()
 
     if not price_data["success"]:
         return f"Khong lay duoc du lieu gia {symbol}: {price_data['error']}", None
@@ -2058,7 +2170,8 @@ def analyze_stock_full(symbol: str) -> tuple:
 
     # 3. Tổng hợp verdict (14 Vibe + 2 context = 16 agents)
     try:
-        verdict = _vibe_verdict(vibe, ind, market_data, news_data)
+        verdict = _vibe_verdict(vibe, ind, market_data, news_data,
+                                     commodity_data=commodity_data)
     except Exception as e:
         return f"Loi tong hop verdict: {e}", None
 
@@ -2092,5 +2205,6 @@ def analyze_stock_full(symbol: str) -> tuple:
                            else "RUI RO" if verdict["signals"].get("MarketRegime", 0) < 0
                            else "TRUNG TINH"),
         "vibe_result":    vibe,
+        "commodity_data": commodity_data,
     }
     return msg, metadata

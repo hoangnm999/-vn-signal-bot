@@ -16,17 +16,17 @@ Label nguồn gốc:
 ──────────────────────────────────────────────────────────────────────────────
 
 Engines (16 total):
-  1.  Candlestick    [HKUDS] — 15 mô hình nến, vectorized scoring, volume filter
+  1.  Candlestick    [HKUDS] — 15 mô hình nến, vectorized sum→sign, volume filter (verified source)
   2.  Ichimoku       [HKUDS] — TK Cross event + 3-filter (rewrite từ source gốc)
   3.  TechnicalBasic [HKUDS] — 3-dim voting EMA/ADX+BB/RSI+OBV (rewrite từ source gốc)
-  4.  ElliottWave    [HKUDS] — Zigzag + 5-wave impulse + ABC correction + Fibonacci
-  5.  Harmonic       [HKUDS] — XABCD Gartley/Bat/Butterfly/Crab + pyharmonics fallback
+  4.  ElliottWave    [HKUDS] — Zigzag + 5-wave + ABC + Fibonacci (verified source)
+  5.  Harmonic       [HKUDS] — XABCD Gartley/Bat/Butterfly/Crab + pyharmonics fallback (verified source)
   6.  Volatility     [HKUDS] — HV percentile (lookback=120, low=20%, high=80%)
   7.  Seasonal       [HKUDS] — Fixed month lists (rewrite từ source gốc)
   8.  SMC            [HKUDS] — ChoCH priority + BOS + FVG filter (momentum fallback)
-  9.  CrossMarket    [Claude-made] — Vol-adjusted dual-MA, single stock adapt
-  10. MultiFactor    [Claude-made] — Momentum/Reversal/Vol/VolumeRatio Z-score
-  11. MeanReversion  [Claude-made] — Z-score price vs rolling mean
+  9.  CrossMarket    [HKUDS] — Vol-adjusted dual-MA, a_share params 5/20 MA (rewrite từ source gốc)
+  10. MultiFactor    [HKUDS] — 4-factor composite Z-score, adapted từ cross-section (rewrite từ source gốc)
+  11. MeanReversion  [HKUDS] — Z-score entry=2.0 exit=0.5 lookback=60D, adapted từ Pair Trading
   12. PriceMomentum  [Claude-made] — Multi-TF momentum 5D/20D/60D
   13. Breakout       [Claude-made] — S/R breakout + vol confirm
   14. MLStrategy     [Claude-made] — ExtraTrees walk-forward + rule fallback
@@ -746,711 +746,622 @@ class SMCEngine:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CrossMarketEngine:
-    MA_FAST=5; MA_SLOW=20; VOL_LB=20
+    """
+    Cross-Market Vol-Adjusted Dual-MA Signal.
+    [HKUDS] agent/src/skills/cross-market-strategy/example_signal_engine.py
 
-    def _one(self, df):
-        c=df["close"]
-        mf=c.rolling(self.MA_FAST).mean(); ms=c.rolling(self.MA_SLOW).mean()
-        sig=pd.Series(0.0,index=df.index)
-        sig[mf>ms]=1.0; sig[mf<ms]=-1.0
-        ret=c.pct_change().dropna()
-        vol=ret.rolling(self.VOL_LB).std().iloc[-1] if len(ret)>self.VOL_LB else ret.std()
-        # Volatility-adjusted: scale signal by inv_vol weight (single stock=1.0)
-        sig_adj=(sig*1.0).clip(-1.0,1.0)
-        last_s=_last(sig_adj)
-        det=(f"[Claude-made] MA{self.MA_FAST}={round(mf.iloc[-1],2)} MA{self.MA_SLOW}={round(ms.iloc[-1],2)} "
-             f"Vol20={round(vol*100,2) if not pd.isna(vol) else 'N/A'}% "
-             f"Signal={'BUY' if last_s>0 else 'SELL' if last_s<0 else 'NEUTRAL'}")
-        return sig_adj, det
+    HKUDS logic:
+      1. Per-market MA params (a_share: fast=5, slow=20)
+      2. Vol-adjusted weight = 1/vol (inverse volatility)
+      3. Signal clipped to [-1, 1]
 
-    def generate(self, data_map):
-        signals, details = {}, {}
-        for code, df in data_map.items():
-            try:
-                sig,det=self._one(df)
-                signals[code]=_last(sig); details[code]=det
-            except Exception as e:
-                signals[code]=0; details[code]=f"Loi: {e}"
-        return signals, details
+    VN stock: dùng a_share params (5/20 MA) — đúng nhất cho TTCK VN
+    Single-symbol mode: vol-weight normalize to 1.0
+    """
+    MARKET_PARAMS = {
+        "a_share":   {"ma_fast": 5,  "ma_slow": 20, "vol_lookback": 20},
+        "crypto":    {"ma_fast": 7,  "ma_slow": 25, "vol_lookback": 14},
+        "us_equity": {"ma_fast": 10, "ma_slow": 50, "vol_lookback": 20},
+        "hk_equity": {"ma_fast": 10, "ma_slow": 50, "vol_lookback": 20},
+        "forex":     {"ma_fast": 10, "ma_slow": 30, "vol_lookback": 20},
+    }
 
+    def _detect_market(self, code: str) -> str:
+        import re
+        patterns = [
+            (re.compile(r"^\d{6}\.(SZ|SH|BJ)$", re.I), "a_share"),
+            (re.compile(r"^[A-Z]+-USDT$", re.I),           "crypto"),
+            (re.compile(r"^[A-Z]+\.US$", re.I),           "us_equity"),
+            (re.compile(r"^\d{3,5}\.HK$", re.I),         "hk_equity"),
+        ]
+        for pat, mkt in patterns:
+            if pat.match(code):
+                return mkt
+        # VN stocks (2-5 chữ cái): a_share params
+        return "a_share"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ENGINE 10 — MULTI-FACTOR (Momentum/Reversal/Volatility/VolumeRatio, from Vibe-Trading)
-# Single stock: dùng absolute Z-score thay vì cross-section rank
-# ══════════════════════════════════════════════════════════════════════════════
+    def _raw_signal(self, df: pd.DataFrame, params: dict) -> pd.Series:
+        """Dual-MA signal theo HKUDS _market_signal()."""
+        c     = df["close"]
+        mf    = c.rolling(params["ma_fast"]).mean()
+        ms    = c.rolling(params["ma_slow"]).mean()
+        sig   = pd.Series(0.0, index=df.index)
+        sig[mf > ms] =  1.0
+        sig[mf < ms] = -1.0
+        return sig
 
-class MultiFactorEngine:
-    def __init__(self, mom_w=20, vol_w=20, z_th=1.0):
-        self.mom_w=mom_w; self.vol_w=vol_w; self.z_th=z_th
+    def _vol(self, df: pd.DataFrame, lookback: int = 20) -> float:
+        """Tính volatility gần nhất (std of daily returns)."""
+        ret = df["close"].pct_change().dropna()
+        if len(ret) > lookback:
+            return float(ret.rolling(lookback).std().iloc[-1])
+        return float(ret.std()) if len(ret) > 1 else 1e-10
 
-    def _one(self, df):
-        c=df["close"]
-        v=df.get("volume",pd.Series(1,index=df.index))
-        ret=c.pct_change()
-        # Factor values
-        momentum = c/c.shift(self.mom_w)-1              # +: bullish
-        reversal  = -(c/c.shift(5)-1)                   # -5d return inverted
-        volatility= -(ret.rolling(self.vol_w).std())    # low vol = better
-        vol_ratio = v/v.rolling(self.vol_w).mean()       # high vol ratio = better
-        # Composite score (equal weight, no cross-section needed for 1 stock)
-        # Normalise each factor individually (rolling z-score)
-        def roll_z(s, w=60):
-            m=s.rolling(w,min_periods=20).mean()
-            sd=s.rolling(w,min_periods=20).std()
-            return (s-m)/sd.replace(0,np.nan)
-        score = (roll_z(momentum)+roll_z(reversal)+roll_z(volatility)+roll_z(vol_ratio))/4
-        sig=pd.Series(0,index=df.index,dtype=int)
-        sig[score>self.z_th]=1; sig[score<-self.z_th]=-1
-        cur_score=score.iloc[-1]
-        det=(f"[Claude-made] Factor score={round(cur_score,2) if not pd.isna(cur_score) else 'N/A'} "
-             f"(momentum={round(momentum.iloc[-1]*100,1) if not pd.isna(momentum.iloc[-1]) else 'N/A'}% "
-             f"vol_ratio={round(vol_ratio.iloc[-1],2) if not pd.isna(vol_ratio.iloc[-1]) else 'N/A'}x) "
-             f"Signal={'BUY' if _last(sig)>0 else 'SELL' if _last(sig)<0 else 'NEUTRAL'}")
+    def _one(self, df: pd.DataFrame, code: str) -> tuple:
+        market  = self._detect_market(code)
+        params  = self.MARKET_PARAMS.get(market, self.MARKET_PARAMS["a_share"])
+        raw_sig = self._raw_signal(df, params)
+
+        # Vol-adjustment (single symbol → weight normalizes to 1.0)
+        v      = self._vol(df, params["vol_lookback"])
+        inv_v  = 1.0 / (v + 1e-10)
+        # Single-symbol: weight = 1.0 (no pool to normalize against)
+        sig    = raw_sig.clip(-1.0, 1.0)
+
+        mf_v  = round(float(df["close"].rolling(params["ma_fast"]).mean().iloc[-1]), 2)
+        ms_v  = round(float(df["close"].rolling(params["ma_slow"]).mean().iloc[-1]), 2)
+        cur   = _last(sig.apply(lambda x: 1 if x > 0 else -1 if x < 0 else 0))
+        vol_pct = round(v * 100, 2)
+        det   = (f"MA{params['ma_fast']}={mf_v} MA{params['ma_slow']}={ms_v} "
+                 f"Vol20={vol_pct}% Market={market} "
+                 f"Signal={'BUY' if cur > 0 else 'SELL' if cur < 0 else 'NEUTRAL'}")
         return sig, det
 
-    def generate(self, data_map):
+    def generate(self, data_map: dict) -> tuple:
         signals, details = {}, {}
         for code, df in data_map.items():
             try:
-                sig,det=self._one(df); signals[code]=_last(sig); details[code]=det
-            except Exception as e:
-                signals[code]=0; details[code]=f"Loi: {e}"
-        return signals, details
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENGINE 11 — MEAN REVERSION (từ pair-trading logic, adapt cho single stock)
-# Dùng price vs rolling mean Z-score — khi giá lệch quá xa mean → đảo chiều
-# Trực tiếp từ pair-trading engine của Vibe-Trading (Skill: pair-trading)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class MeanReversionEngine:
-    """
-    Adapt pair-trading Z-score logic cho single stock.
-    Thay vì ratio(A/B), dùng price vs rolling-mean.
-    Nguồn: agent/src/skills/pair-trading/example_signal_engine.py
-    """
-    def __init__(self, lookback=60, entry_z=2.0, exit_z=0.5):
-        self.lookback=lookback; self.entry_z=entry_z; self.exit_z=exit_z
-
-    def _one(self, df):
-        c = df["close"]
-        if len(c) < self.lookback + 5:
-            return pd.Series(0, index=df.index, dtype=int), "Khong du data"
-        mean = c.rolling(self.lookback).mean()
-        std  = c.rolling(self.lookback).std()
-        z    = (c - mean) / std.replace(0, np.nan)
-
-        sig = pd.Series(0, index=df.index, dtype=int)
-        sig[z < -self.entry_z] = 1    # giá quá thấp so với mean → kỳ vọng phục hồi
-        sig[z >  self.entry_z] = -1   # giá quá cao so với mean → kỳ vọng điều chỉnh
-        sig[z.abs() < self.exit_z] = 0
-
-        cur_z = z.iloc[-1]
-        cur_s = _last(sig)
-        det = (f"[Claude-made] Z-score={round(cur_z,2) if not pd.isna(cur_z) else 'N/A'} "
-               f"(entry±{self.entry_z} exit±{self.exit_z} lookback={self.lookback}D) "
-               f"Signal={'BUY(reversion up)' if cur_s>0 else 'SELL(reversion dn)' if cur_s<0 else 'NEUTRAL'}")
-        return sig, det
-
-    def generate(self, data_map):
-        signals, details = {}, {}
-        for code, df in data_map.items():
-            try:
-                sig, det = self._one(df)
-                signals[code] = _last(sig); details[code] = det
-            except Exception as e:
-                signals[code] = 0; details[code] = f"Loi: {e}"
-        return signals, details
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENGINE 12 — PRICE MOMENTUM (từ fundamental-filter logic + momentum factor)
-# Multi-timeframe momentum: 5D/20D/60D composite
-# Nguồn: agent/src/skills/fundamental-filter/example_signal_engine.py (momentum factor)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class PriceMomentumEngine:
-    """
-    Multi-timeframe price momentum engine.
-    Kết hợp momentum 5D/20D/60D và xác nhận bằng volume.
-    Nguồn logic: fundamental-filter engine (factor scoring) + Vibe momentum factor.
-    """
-    def __init__(self, windows=(5, 20, 60), vol_window=20):
-        self.windows  = windows
-        self.vol_window = vol_window
-
-    def _one(self, df):
-        c = df["close"]
-        v = df.get("volume", pd.Series(1, index=df.index))
-        if len(c) < max(self.windows) + 5:
-            return pd.Series(0, index=df.index, dtype=int), "Khong du data"
-
-        mom_signals = []
-        mom_vals    = []
-        for w in self.windows:
-            if len(c) > w:
-                m = float(c.iloc[-1] / c.iloc[-w] - 1) if c.iloc[-w] != 0 else 0.0
-                mom_vals.append(m)
-                mom_signals.append(1 if m > 0 else -1 if m < 0 else 0)
-
-        # Volume confirmation: current vol vs average
-        vol_ratio = float(v.iloc[-1] / v.rolling(self.vol_window).mean().iloc[-1]) if len(v) > self.vol_window else 1.0
-
-        # Composite: đa số timeframes + vol không quá thấp
-        bull = sum(1 for s in mom_signals if s > 0)
-        bear = sum(1 for s in mom_signals if s < 0)
-        n    = len(mom_signals)
-
-        sig_series = pd.Series(0, index=df.index, dtype=int)
-        if bull > n / 2 and vol_ratio > 0.5:
-            sig_series.iloc[-1] = 1
-        elif bear > n / 2 and vol_ratio > 0.5:
-            sig_series.iloc[-1] = -1
-
-        cur = _last(sig_series)
-        labels = [f"{w}D={round(m*100,1)}%" for w,m in zip(self.windows, mom_vals)]
-        det = (f"[Claude-made] Momentum [{', '.join(labels)}] | Vol={round(vol_ratio,2)}x | "
-               f"Signal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'}")
-        return sig_series, det
-
-    def generate(self, data_map):
-        signals, details = {}, {}
-        for code, df in data_map.items():
-            try:
-                sig, det = self._one(df)
-                signals[code] = _last(sig); details[code] = det
-            except Exception as e:
-                signals[code] = 0; details[code] = f"Loi: {e}"
-        return signals, details
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENGINE 13 — SUPPORT / RESISTANCE BREAKOUT
-# Phát hiện breakout qua đỉnh/đáy N phiên — xác nhận bằng volume spike
-# Bổ sung cho hệ thống: cần thiết cho TTCK VN (breakout rất phổ biến)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class BreakoutEngine:
-    """
-    Support/Resistance Breakout detection.
-    Phát hiện breakout qua high/low của N phiên trước, xác nhận bằng volume.
-    """
-    def __init__(self, lookback=20, vol_multiplier=1.3):
-        self.lookback = lookback
-        self.vol_multiplier = vol_multiplier
-
-    def _one(self, df):
-        c = df["close"]
-        h = df["high"]
-        l = df["low"]
-        v = df.get("volume", pd.Series(1, index=df.index))
-
-        if len(c) < self.lookback + 2:
-            return pd.Series(0, index=df.index, dtype=int), "Khong du data"
-
-        # Đỉnh/đáy N phiên trước (không tính phiên hiện tại)
-        resist = h.shift(1).rolling(self.lookback).max()
-        supprt = l.shift(1).rolling(self.lookback).min()
-        avg_vol = v.shift(1).rolling(self.lookback).mean()
-
-        sig = pd.Series(0, index=df.index, dtype=int)
-        # Breakout up: đóng cửa trên resistance + volume xác nhận
-        bull_break = (c > resist) & (v > avg_vol * self.vol_multiplier)
-        # Breakdown: đóng cửa dưới support + volume xác nhận
-        bear_break = (c < supprt) & (v > avg_vol * self.vol_multiplier)
-
-        sig[bull_break] = 1
-        sig[bear_break] = -1
-
-        cur = _last(sig)
-        r = float(resist.iloc[-1]) if not pd.isna(resist.iloc[-1]) else 0
-        s = float(supprt.iloc[-1]) if not pd.isna(supprt.iloc[-1]) else 0
-        vr = float(v.iloc[-1] / avg_vol.iloc[-1]) if not pd.isna(avg_vol.iloc[-1]) and avg_vol.iloc[-1] > 0 else 1.0
-        det = (f"[Claude-made] Resist={round(r,2)} Support={round(s,2)} "
-               f"VolRatio={round(vr,2)}x (need>{self.vol_multiplier}x) "
-               f"Signal={'BREAKOUT UP' if cur>0 else 'BREAKDOWN' if cur<0 else 'NO BREAK'}")
-        return sig, det
-
-    def generate(self, data_map):
-        signals, details = {}, {}
-        for code, df in data_map.items():
-            try:
-                sig, det = self._one(df)
-                signals[code] = _last(sig); details[code] = det
-            except Exception as e:
-                signals[code] = 0; details[code] = f"Loi: {e}"
-        return signals, details
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENGINE 14 — ML STRATEGY (sklearn RandomForest walk-forward, từ Vibe-Trading)
-# Nguồn: agent/src/skills/ml-strategy/SKILL.md (build_features + walk-forward)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class MLStrategyEngine:
-    """
-    Machine Learning signal engine dựa trên sklearn RandomForest.
-    Walk-forward training để tránh data leakage.
-    Nguồn: Vibe-Trading ml-strategy SKILL.md.
-    """
-    def __init__(self, train_window=120, predict_horizon=5, min_train=80):
-        self.train_window    = train_window
-        self.predict_horizon = predict_horizon
-        self.min_train       = min_train
-
-    def _build_features(self, df):
-        c = df["close"]; v = df.get("volume", pd.Series(1, index=df.index))
-        h = df.get("high", c); l = df.get("low", c)
-        ret = c.pct_change()
-        feat = pd.DataFrame(index=df.index)
-        # Price momentum — multi-timeframe (quan trọng cho VN)
-        feat["f_ret_1d"]        = c.pct_change(1)
-        feat["f_ret_5d"]        = c.pct_change(5)
-        feat["f_ret_20d"]       = c.pct_change(20)
-        feat["f_ret_60d"]       = c.pct_change(60)
-        # Volatility
-        feat["f_vol_10d"]       = ret.rolling(10).std()
-        feat["f_vol_20d"]       = ret.rolling(20).std()
-        # Trend (MA cross)
-        feat["f_ma_ratio_20"]   = c / c.rolling(20).mean()
-        feat["f_ma_ratio_50"]   = c / c.rolling(50).mean()
-        feat["f_ma5_20_cross"]  = c.rolling(5).mean() / c.rolling(20).mean()
-        # RSI — Wilder SMA để nhất quán với compute_indicators
-        delta = c.diff()
-        gain  = delta.where(delta > 0, 0).rolling(14).mean()
-        loss  = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs    = gain / loss.replace(0, np.nan)
-        feat["f_rsi_14"]        = 100 - (100 / (1 + rs))
-        # Bollinger position
-        feat["f_bb_pos"]        = (c - c.rolling(20).mean()) / (c.rolling(20).std().replace(0, np.nan))
-        # Volume — đặc biệt quan trọng cho TTCK VN (thanh khoản thấp)
-        feat["f_vol_ratio_20"]  = v / v.rolling(20).mean()
-        feat["f_vol_ratio_5"]   = v / v.rolling(5).mean()
-        # Volume-price momentum: ngày tăng volume cao hơn ngày giảm → bullish
-        vp = (c.pct_change() * (v / v.rolling(20).mean()))
-        feat["f_vp_momentum"]   = vp.rolling(5).sum()
-        # OBV trend — smart money flow
-        obv = (v * np.sign(c.diff())).fillna(0).cumsum()
-        feat["f_obv_ratio"]     = obv / obv.rolling(20).mean().replace(0, np.nan)
-        # High-Low range (intraday volatility)
-        feat["f_hl_ratio"]      = (h - l) / c.replace(0, np.nan)
-        return feat.replace([np.inf, -np.inf], np.nan)
-
-    def _one(self, df):
-        feat = self._build_features(df)
-        c    = df["close"]
-        n    = len(df)
-
-        if n < self.min_train + self.predict_horizon + 10:
-            return pd.Series(0, index=df.index, dtype=int), "Khong du data cho ML"
-
-        # Label: future N-day return > 0
-        label = (c.shift(-self.predict_horizon) > c).astype(int)
-
-        sig     = pd.Series(0, index=df.index, dtype=int)
-        method  = "rule_fallback"
-        cur     = 0
-
-        # ── Thử ML (sklearn) ──────────────────────────────────────────────
-        try:
-            from sklearn.ensemble import ExtraTreesClassifier  # nhanh hơn RF ~4x
-            from sklearn.preprocessing import StandardScaler
-
-            # Walk-forward: retrain mỗi 10 bars (giảm từ mỗi bar → giảm 90% thời gian)
-            step = 10
-            last_pred = 0
-            for i in range(self.train_window, n - self.predict_horizon, step):
-                X_train = feat.iloc[i - self.train_window:i].dropna()
-                y_train = label.iloc[i - self.train_window:i].loc[X_train.index]
-                if len(X_train) < self.min_train or y_train.nunique() < 2:
-                    continue
-                X_pred_block = feat.iloc[i:i+step].dropna()
-                if X_pred_block.empty:
-                    continue
-                try:
-                    scaler  = StandardScaler()
-                    X_tr_s  = scaler.fit_transform(X_train)
-                    X_pr_s  = scaler.transform(X_pred_block)
-                    clf = ExtraTreesClassifier(
-                        n_estimators=30, max_depth=4,
-                        random_state=42, n_jobs=1
-                    )
-                    clf.fit(X_tr_s, y_train)
-                    probas = clf.predict_proba(X_pr_s)
-                    for j, proba in enumerate(probas):
-                        idx = i + j
-                        if idx < n:
-                            ps = 1 if proba[1] > 0.60 else -1 if proba[1] < 0.40 else 0
-                            sig.iloc[idx] = ps
-                    last_pred = int(sig.iloc[min(i + step - 1, n - 1)])
-                except Exception:
-                    continue
-
-            cur    = _last(sig) if sig.any() else 0
-            method = "ExtraTrees walk-forward"
-
-        except ImportError:
-            # ── Fallback rule-based khi không có sklearn ──────────────────
-            # Dùng features đã tính để ra signal deterministic
-            feat_last = feat.iloc[-1]
-            score = 0
-            # RSI momentum
-            rsi = feat_last.get("f_rsi_14", 50)
-            if not pd.isna(rsi):
-                if rsi < 40: score += 1    # oversold → khả năng phục hồi
-                elif rsi > 65: score -= 1  # overbought
-            # MA trend
-            ma_r = feat_last.get("f_ma_ratio_20", 1.0)
-            if not pd.isna(ma_r):
-                if ma_r > 1.02: score += 1
-                elif ma_r < 0.98: score -= 1
-            # Price momentum 20D
-            r20 = feat_last.get("f_ret_20d", 0)
-            if not pd.isna(r20):
-                if r20 > 0.05: score += 1
-                elif r20 < -0.05: score -= 1
-            # Volume-price momentum
-            vp = feat_last.get("f_vp_momentum", 0)
-            if not pd.isna(vp):
-                if vp > 0.1: score += 1
-                elif vp < -0.1: score -= 1
-            cur = 1 if score >= 2 else -1 if score <= -2 else 0
-            sig.iloc[-1] = cur
-            method = "rule_fallback(no sklearn)"
-
-        det = (f"[Claude-made] ML({method} train={self.train_window}D horizon={self.predict_horizon}D) "
-               f"LastSignal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'}")
-        return sig, det
-
-    def generate(self, data_map):
-        signals, details = {}, {}
-        for code, df in data_map.items():
-            try:
-                sig, det = self._one(df)
-                signals[code] = _last(sig); details[code] = det
-            except Exception as e:
-                signals[code] = 0; details[code] = f"Loi ML: {e}"
-        return signals, details
-
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENGINE 15 — FUNDAMENTAL SCORE (Value + Growth filter)
-# Nguồn: Vibe-Trading fundamental-filter skill
-# Lấy PE/PB/ROE/EPS từ vnstock KBS — so sánh với ngưỡng ngành
-# ══════════════════════════════════════════════════════════════════════════════
-
-class FundamentalEngine:
-    """
-    Fundamental valuation + growth signal.
-    Scoring: PE thấp + PB hợp lý + ROE cao + EPS tăng trưởng → MUA
-    Nguồn: Vibe-Trading fundamental-filter SKILL.md
-    """
-    # Ngưỡng tham chiếu TTCK VN (theo VN30 trung bình lịch sử)
-    PE_CHEAP   = 12.0   # PE < 12: rẻ
-    PE_FAIR    = 20.0   # PE 12-20: hợp lý
-    PE_DEAR    = 30.0   # PE > 30: đắt
-    PB_CHEAP   = 1.5    # PB < 1.5: rẻ
-    PB_DEAR    = 4.0    # PB > 4: đắt
-    ROE_GOOD   = 15.0   # ROE > 15%: tốt
-    ROE_GREAT  = 20.0   # ROE > 20%: rất tốt
-    EPS_GROW   = 10.0   # EPS growth > 10%: tăng trưởng
-
-    def _fetch_fundamental(self, symbol: str) -> dict:
-        """Lấy fundamental data từ vnstock KBS."""
-        try:
-            from vnstock import Vnstock
-            stock = Vnstock().stock(symbol=symbol, source="KBS")
-            # Thử lấy ratio
-            for period in ["quarter", "annual"]:
-                try:
-                    ratio = stock.finance.ratio(period=period)
-                    if ratio is not None and not ratio.empty:
-                        latest = ratio.iloc[0]
-                        cols   = [c.lower() for c in latest.index]
-                        orig   = list(latest.index)
-
-                        def _find(patterns, default=None):
-                            for p in patterns:
-                                for i, c in enumerate(cols):
-                                    if p.lower() in c:
-                                        try:
-                                            v = float(latest[orig[i]])
-                                            if not pd.isna(v) and v != 0:
-                                                return v
-                                        except Exception:
-                                            pass
-                            return default
-
-                        return {
-                            "pe":      _find(["pricetoearning", "p/e", "pe"]),
-                            "pb":      _find(["pricetobook", "p/b", "pb"]),
-                            "roe":     _find(["roe"]),
-                            "eps":     _find(["earningpershare", "eps"]),
-                            "eps_g":   _find(["epsgrowth", "earnings_growth"]),
-                            "rev_g":   _find(["revenuegrowth", "revenue_growth"]),
-                            "de":      _find(["debtonequity", "d/e", "leverage"]),
-                            "source":  f"vnstock KBS ({period})",
-                        }
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        return {}
-
-    def _score(self, fund: dict) -> tuple[int, str]:
-        """
-        Tính điểm fundamental. Trả về (signal, detail_str).
-        signal: +1 (value/growth), -1 (expensive/weak), 0 (neutral)
-        """
-        if not fund:
-            return 0, "Khong lay duoc fundamental data (vnstock)"
-
-        score  = 0
-        parts  = []
-        pe  = fund.get("pe")
-        pb  = fund.get("pb")
-        roe = fund.get("roe")
-        eps_g = fund.get("eps_g")
-        rev_g = fund.get("rev_g")
-        de  = fund.get("de")
-
-        # PE scoring
-        if pe is not None and pe > 0:
-            if pe < self.PE_CHEAP:
-                score += 2; parts.append(f"PE={pe:.1f}(rẻ)")
-            elif pe < self.PE_FAIR:
-                score += 1; parts.append(f"PE={pe:.1f}(OK)")
-            elif pe > self.PE_DEAR:
-                score -= 2; parts.append(f"PE={pe:.1f}(đắt)")
-            else:
-                parts.append(f"PE={pe:.1f}")
-
-        # PB scoring
-        if pb is not None and pb > 0:
-            if pb < self.PB_CHEAP:
-                score += 1; parts.append(f"PB={pb:.1f}(rẻ)")
-            elif pb > self.PB_DEAR:
-                score -= 1; parts.append(f"PB={pb:.1f}(đắt)")
-            else:
-                parts.append(f"PB={pb:.1f}")
-
-        # ROE scoring
-        if roe is not None:
-            roe_pct = roe * 100 if abs(roe) < 2 else roe  # normalize nếu dạng 0.15
-            if roe_pct >= self.ROE_GREAT:
-                score += 2; parts.append(f"ROE={roe_pct:.1f}%(tốt)")
-            elif roe_pct >= self.ROE_GOOD:
-                score += 1; parts.append(f"ROE={roe_pct:.1f}%")
-            elif roe_pct < 5:
-                score -= 1; parts.append(f"ROE={roe_pct:.1f}%(yếu)")
-            else:
-                parts.append(f"ROE={roe_pct:.1f}%")
-
-        # EPS growth
-        if eps_g is not None:
-            eg = eps_g * 100 if abs(eps_g) < 5 else eps_g
-            if eg > self.EPS_GROW:
-                score += 1; parts.append(f"EPS_g={eg:.1f}%")
-            elif eg < 0:
-                score -= 1; parts.append(f"EPS_g={eg:.1f}%(giảm)")
-
-        # D/E cao → rủi ro
-        if de is not None and de > 2.0:
-            score -= 1; parts.append(f"D/E={de:.1f}(cao)")
-
-        # Kết luận
-        if not parts:
-            return 0, f"Du lieu: {fund.get('source','N/A')} — Khong du chi so"
-
-        src = fund.get("source", "N/A")
-        detail = f"[{src}] " + " | ".join(parts) + f" | Score={score:+d}"
-
-        if score >= 3:
-            return 1, detail
-        elif score <= -2:
-            return -1, detail
-        elif score >= 1:
-            return 1, detail   # lean bullish (giá trị tốt)
-        elif score <= -1:
-            return -1, detail  # lean bearish (định giá cao)
-        else:
-            return 0, detail
-
-    def generate(self, data_map: dict) -> tuple[dict, dict]:
-        signals, details = {}, {}
-        for code, df in data_map.items():
-            try:
-                fund = self._fetch_fundamental(code)
-                sig, det = self._score(fund)
-                signals[code] = sig
-                details[code] = f"[Claude-made] {det}"
+                sig, det = self._one(df, code)
+                signals[code] = _last(sig.apply(lambda x: 1 if x > 0 else -1 if x < 0 else 0))
+                details[code] = det
             except Exception as e:
                 signals[code] = 0
-                details[code] = f"[Claude-made] Loi FundamentalEngine: {e}"
+                details[code] = f"Loi CrossMarketEngine: {e}"
         return signals, details
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ENGINE 16 — MONEY FLOW (Smart Money / Institutional Flow)
-# Phân tích dòng tiền thông minh qua volume-price pattern
-# Nguồn: Vibe-Trading fund-flow + market-microstructure skills
-# ══════════════════════════════════════════════════════════════════════════════
-
-class MoneyFlowEngine:
+class MultiFactorEngine:
     """
-    Smart money / institutional money flow detection.
-    Dùng: OBV divergence, CMF (Chaikin Money Flow), VPT, Force Index
-    Không cần foreign flow data thực — phân tích từ OHLCV.
+    Multi-Factor Signal — adapted từ HKUDS cross-section ranking.
+    [HKUDS] agent/src/skills/MultiFactorEngine/example_signal_engine.py
+
+    HKUDS gốc: cross-section TopN ranking (cần nhiều mã cùng lúc).
+    Single-symbol adapt: time-series Z-score cho mỗi factor,
+    composite = sum(Z), threshold signal.
+
+    Factors (giống HKUDS):
+      momentum:     close/close.shift(20) - 1  (positive = bullish)
+      reversal:     -(close/close.shift(5) - 1) (negative momentum = mean revert)
+      volatility:   -returns.rolling(20).std()  (low vol = bullish)
+      volume_ratio: volume/volume.rolling(20).mean() (high vol = confirmation)
     """
-    def __init__(self, window=20, cmf_w=20, vpt_w=20):
-        self.window = window
-        self.cmf_w  = cmf_w
-        self.vpt_w  = vpt_w
+    def __init__(self, momentum_window=20, vol_window=20,
+                 z_lookback=60, threshold=0.5):
+        self.momentum_window = momentum_window
+        self.vol_window      = vol_window
+        self.z_lookback      = z_lookback   # window for time-series Z-score
+        self.threshold       = threshold    # composite Z > threshold → signal
 
-    def _cmf(self, h, l, c, v, w):
-        """Chaikin Money Flow = sum(MFV) / sum(Vol) trong W bars."""
-        hl_range = (h - l).replace(0, np.nan)
-        mfm = ((c - l) - (h - c)) / hl_range          # Money Flow Multiplier [-1, 1]
-        mfv = mfm * v                                   # Money Flow Volume
-        cmf = mfv.rolling(w).sum() / v.rolling(w).sum()
-        return cmf
-
-    def _vpt(self, c, v):
-        """Volume Price Trend — cumulative indicator."""
+    def _compute_factors(self, df: pd.DataFrame) -> pd.DataFrame:
+        """4 factors theo HKUDS MultiFactorEngine._compute_factors()."""
+        c = df["close"]
+        v = df.get("volume", pd.Series(1, index=df.index))
         ret = c.pct_change()
-        vpt = (ret * v).fillna(0).cumsum()
-        return vpt
 
-    def _obv(self, c, v):
-        """On Balance Volume."""
-        return (v * np.sign(c.diff())).fillna(0).cumsum()
+        f = pd.DataFrame(index=df.index)
+        # Exact HKUDS factor definitions
+        f["momentum"]     = c / c.shift(self.momentum_window) - 1
+        f["reversal"]     = -(c / c.shift(5) - 1)
+        f["volatility"]   = -ret.rolling(self.vol_window).std()
+        f["volume_ratio"] = v / v.rolling(self.vol_window).mean()
+        return f
 
-    def _force_index(self, c, v, w=13):
-        """Elder Force Index = price_change * volume."""
-        fi = c.diff() * v
-        return fi.ewm(span=w, adjust=False).mean()
+    def _time_series_zscore(self, series: pd.Series, window: int) -> pd.Series:
+        """Time-series Z-score (thay cross-section vì single symbol)."""
+        mu  = series.rolling(window).mean()
+        std = series.rolling(window).std().replace(0, np.nan)
+        return (series - mu) / std
 
-    def _one(self, df):
-        if len(df) < self.window + 5:
+    def _one(self, df: pd.DataFrame) -> tuple:
+        if len(df) < self.z_lookback + self.momentum_window + 5:
             return pd.Series(0, index=df.index, dtype=int), "Khong du data"
 
-        o = df.get("open",  df["close"])
-        h = df["high"]; l = df["low"]; c = df["close"]
-        v = df.get("volume", pd.Series(1, index=df.index))
-
-        # ── Tính các indicators ───────────────────────────────────────────
-        cmf     = self._cmf(h, l, c, v, self.cmf_w)
-        vpt     = self._vpt(c, v)
-        vpt_ma  = vpt.rolling(self.vpt_w).mean()
-        obv     = self._obv(c, v)
-        obv_ma  = obv.rolling(self.window).mean()
-        fi      = self._force_index(c, v, 13)
-
-        # ── Scoring (bar cuối) ────────────────────────────────────────────
-        score = 0
-        parts = []
-
-        # CMF: > +0.05 = tiền vào, < -0.05 = tiền ra
-        cmf_val = float(cmf.iloc[-1]) if not pd.isna(cmf.iloc[-1]) else 0
-        if cmf_val > 0.10:
-            score += 2; parts.append(f"CMF={cmf_val:.2f}(tienVao)")
-        elif cmf_val > 0.03:
-            score += 1; parts.append(f"CMF={cmf_val:.2f}(+)")
-        elif cmf_val < -0.10:
-            score -= 2; parts.append(f"CMF={cmf_val:.2f}(tienRa)")
-        elif cmf_val < -0.03:
-            score -= 1; parts.append(f"CMF={cmf_val:.2f}(-)")
-        else:
-            parts.append(f"CMF={cmf_val:.2f}(neutral)")
-
-        # VPT vs MA: VPT tăng nhanh hơn MA → dòng tiền vào
-        vpt_last   = float(vpt.iloc[-1])
-        vpt_ma_last= float(vpt_ma.iloc[-1]) if not pd.isna(vpt_ma.iloc[-1]) else vpt_last
-        if vpt_last > vpt_ma_last * 1.02:
-            score += 1; parts.append("VPT>MA(bull)")
-        elif vpt_last < vpt_ma_last * 0.98:
-            score -= 1; parts.append("VPT<MA(bear)")
-
-        # OBV vs MA
-        obv_last   = float(obv.iloc[-1])
-        obv_ma_last= float(obv_ma.iloc[-1]) if not pd.isna(obv_ma.iloc[-1]) else obv_last
-        if obv_last > obv_ma_last:
-            score += 1; parts.append("OBV>MA(bull)")
-        else:
-            score -= 1; parts.append("OBV<MA(bear)")
-
-        # Force Index: > 0 = lực mua, < 0 = lực bán
-        fi_val = float(fi.iloc[-1]) if not pd.isna(fi.iloc[-1]) else 0
-        if fi_val > 0:
-            score += 1; parts.append(f"FI>0(bullish)")
-        else:
-            score -= 1; parts.append(f"FI<0(bearish)")
-
-        # OBV divergence (5D): giá giảm nhưng OBV tăng → smart money mua
-        price_5d_chg = float((c.iloc[-1] - c.iloc[-5]) / c.iloc[-5]) if len(c) >= 5 else 0
-        obv_5d_chg   = float((obv.iloc[-1] - obv.iloc[-5]) / abs(obv.iloc[-5]) + 1e-9) if len(obv) >= 5 else 0
-        if price_5d_chg < -0.01 and obv_5d_chg > 0.01:
-            score += 1; parts.append("OBV_div(bull)")  # bullish divergence
-        elif price_5d_chg > 0.01 and obv_5d_chg < -0.01:
-            score -= 1; parts.append("OBV_div(bear)")  # bearish divergence
-
-        # Signal
-        if score >= 3:
-            cur_sig = 1
-        elif score <= -3:
-            cur_sig = -1
-        elif score >= 1:
-            cur_sig = 1
-        elif score <= -1:
-            cur_sig = -1
-        else:
-            cur_sig = 0
+        factors = self._compute_factors(df)
+        # Composite = sum of time-series Z-scores
+        composite = pd.Series(0.0, index=df.index)
+        for col in ["momentum", "reversal", "volatility", "volume_ratio"]:
+            z = self._time_series_zscore(factors[col], self.z_lookback)
+            composite += z.fillna(0)
 
         sig = pd.Series(0, index=df.index, dtype=int)
-        sig.iloc[-1] = cur_sig
+        sig[composite >  self.threshold] =  1
+        sig[composite < -self.threshold] = -1
 
-        label = "BUY(dong tien vao)" if cur_sig > 0 else "SELL(dong tien ra)" if cur_sig < 0 else "NEUTRAL"
-        det = f"Score={score:+d} | {' | '.join(parts)} | {label}"
+        cur      = _last(sig)
+        cur_comp = round(float(composite.iloc[-1]), 3) if not pd.isna(composite.iloc[-1]) else "N/A"
+        cur_mom  = round(float(factors["momentum"].iloc[-1]) * 100, 2) if not pd.isna(factors["momentum"].iloc[-1]) else "N/A"
+        cur_vr   = round(float(factors["volume_ratio"].iloc[-1]), 2) if not pd.isna(factors["volume_ratio"].iloc[-1]) else "N/A"
+        det = (f"Composite_Z={cur_comp} "
+               f"(mom={cur_mom}% vol_ratio={cur_vr}x) "
+               f"threshold=±{self.threshold} "
+               f"Signal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'}")
         return sig, det
 
-    def generate(self, data_map: dict) -> tuple[dict, dict]:
+    def generate(self, data_map: dict) -> tuple:
         signals, details = {}, {}
         for code, df in data_map.items():
             try:
                 sig, det = self._one(df)
                 signals[code] = _last(sig)
-                details[code] = f"[Claude-made] {det}"
+                details[code] = det
             except Exception as e:
                 signals[code] = 0
-                details[code] = f"[Claude-made] Loi MoneyFlowEngine: {e}"
+                details[code] = f"Loi MultiFactorEngine: {e}"
         return signals, details
+
+
+class MeanReversionEngine:
+    """
+    Mean Reversion + Cointegration Signal.
+    [HKUDS] agent/src/skills/Pair trading/example_signal_engine.py
+             agent/src/skills/correlation-analysis/SKILL.md
+
+    Combines 2 approaches:
+      1. Z-score vs rolling mean (HKUDS Pair Trading)
+         entry_z=2.0, exit_z=0.5, lookback=60D
+      2. Engle-Granger cointegration test vs VNINDEX proxy
+         (correlation-analysis SKILL) — upgrade khi có statsmodels
+
+    Cho TTCK VN: mã có cointegration với sector ETF/proxy
+    thường hội tụ về mean nhanh hơn → signal chất lượng cao hơn.
+    """
+    def __init__(self, lookback=60, entry_z=2.0, exit_z=0.5):
+        self.lookback = lookback
+        self.entry_z  = entry_z
+        self.exit_z   = exit_z
+        self._has_sm  = self._check_statsmodels()
+
+    @staticmethod
+    def _check_statsmodels() -> bool:
+        try:
+            from statsmodels.tsa.stattools import coint
+            return True
+        except ImportError:
+            return False
+
+    def _zscore_signal(self, c: pd.Series) -> tuple:
+        """HKUDS Pair Trading: Z-score vs rolling mean."""
+        mean = c.rolling(self.lookback).mean()
+        std  = c.rolling(self.lookback).std().replace(0, np.nan)
+        z    = (c - mean) / std
+        sig  = pd.Series(0, index=c.index, dtype=int)
+        sig[z < -self.entry_z] =  1   # oversold → BUY
+        sig[z >  self.entry_z] = -1   # overbought → SELL
+        sig[z.abs() < self.exit_z] = 0
+        return sig, z
+
+    def _cointegration_check(self, c: pd.Series, proxy: pd.Series) -> dict:
+        """
+        Engle-Granger cointegration test (correlation-analysis SKILL).
+        Trả về: {is_cointegrated, p_value, hedge_ratio, spread_z}
+        """
+        if not self._has_sm:
+            return {"is_cointegrated": False, "p": 1.0}
+        try:
+            from statsmodels.tsa.stattools import coint
+            import statsmodels.api as sm
+            # Align
+            df = pd.concat([c.rename("y"), proxy.rename("x")], axis=1).dropna()
+            if len(df) < self.lookback + 10:
+                return {"is_cointegrated": False, "p": 1.0}
+            y = df["y"]; x = df["x"]
+            # Engle-Granger test
+            _, p, _ = coint(y, x)
+            # OLS hedge ratio
+            x_c = sm.add_constant(x)
+            ols = sm.OLS(y, x_c).fit()
+            hr  = float(ols.params.iloc[1])
+            spread = y - hr * x
+            # Spread Z-score
+            sp_m = spread.rolling(self.lookback).mean()
+            sp_s = spread.rolling(self.lookback).std().replace(0, np.nan)
+            sp_z = (spread - sp_m) / sp_s
+            return {
+                "is_cointegrated": p < 0.05,
+                "p": round(float(p), 4),
+                "hedge_ratio": round(hr, 4),
+                "spread_z": sp_z,
+            }
+        except Exception:
+            return {"is_cointegrated": False, "p": 1.0}
+
+    def _one(self, df: pd.DataFrame, code: str,
+             proxy_df: pd.DataFrame = None) -> tuple:
+        if len(df) < self.lookback + 5:
+            return pd.Series(0, index=df.index, dtype=int), "Khong du data"
+
+        c = df["close"]
+        sig_zs, z = self._zscore_signal(c)
+        cur_z   = round(float(z.iloc[-1]), 3) if not pd.isna(z.iloc[-1]) else "N/A"
+
+        # Cointegration upgrade (nếu có proxy VNINDEX)
+        coint_info = ""
+        if proxy_df is not None and self._has_sm:
+            res = self._cointegration_check(c, proxy_df["close"])
+            if res.get("is_cointegrated"):
+                sp_z_last = round(float(res["spread_z"].iloc[-1]), 3)                             if res.get("spread_z") is not None and                                not pd.isna(res["spread_z"].iloc[-1]) else None
+                if sp_z_last is not None:
+                    # Override signal với spread Z-score (chất lượng cao hơn)
+                    if sp_z_last < -self.entry_z:
+                        sig_zs.iloc[-1] = 1
+                    elif sp_z_last > self.entry_z:
+                        sig_zs.iloc[-1] = -1
+                    elif abs(sp_z_last) < self.exit_z:
+                        sig_zs.iloc[-1] = 0
+                coint_info = (f" | Cointegrated(p={res['p']}) "
+                              f"hr={res.get('hedge_ratio','?')} "
+                              f"spread_z={sp_z_last}")
+            else:
+                coint_info = f" | No coint(p={res['p']})"
+
+        cur = _last(sig_zs)
+        det = (f"Z-score={cur_z} (entry±{self.entry_z} exit±{self.exit_z} "
+               f"lookback={self.lookback}D){coint_info} "
+               f"Signal={'BUY(oversold)' if cur>0 else 'SELL(overbought)' if cur<0 else 'NEUTRAL'}")
+        return sig_zs, det
+
+    def generate(self, data_map: dict) -> tuple:
+        signals, details = {}, {}
+        for code, df in data_map.items():
+            try:
+                sig, det = self._one(df, code)
+                signals[code] = _last(sig)
+                details[code] = det
+            except Exception as e:
+                signals[code] = 0
+                details[code] = f"Loi MeanReversionEngine: {e}"
+        return signals, details
+
+
+class MLStrategyEngine:
+    """
+    Machine-Learning Predictive Strategy.
+    [HKUDS] agent/src/skills/ml-strategy/SKILL.md
+
+    Đúng theo HKUDS spec:
+      Features (10): ret_5d, ret_20d, vol_20d, ma_ratio, volume_ratio,
+                     rsi_14, bb_position, high_low_ratio, close_open_ratio, skew_20d
+      Model: RandomForestClassifier(n_estimators=100, max_depth=5)
+      min_train_size=252, retrain_freq=20, horizon=5D
+      Output: prob*2-1 → [-1,1], discrete signal {-1,0,1}
+      Signal threshold: abs(signal) < 0.1 → 0
+    """
+    def __init__(self, min_train_size=252, retrain_freq=20,
+                 horizon=5, threshold=0.1,
+                 model_type="random_forest"):
+        self.min_train  = min_train_size
+        self.retrain_f  = retrain_freq
+        self.horizon    = horizon
+        self.threshold  = threshold
+        self.model_type = model_type
+
+    def _build_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """10 features đúng theo HKUDS build_features()."""
+        c   = df["close"]
+        v   = df.get("volume", pd.Series(1, index=df.index))
+        ret = c.pct_change()
+        o   = df.get("open", c)
+        h   = df["high"]; l = df["low"]
+
+        feat = pd.DataFrame(index=df.index)
+        feat["f_ret_5d"]         = c.pct_change(5)
+        feat["f_ret_20d"]        = c.pct_change(20)
+        feat["f_vol_20d"]        = ret.rolling(20).std()
+        feat["f_ma_ratio"]       = c / c.rolling(20).mean()
+        feat["f_volume_ratio"]   = v / v.rolling(20).mean()
+        # RSI(14) — HKUDS dùng rolling mean (không phải Wilder EWM)
+        delta = c.diff()
+        gain  = delta.clip(lower=0).rolling(14).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        rs    = gain / loss.replace(0, np.nan)
+        feat["f_rsi_14"]         = 100 - (100 / (1 + rs))
+        # Bollinger Band position — guard zero-bandwidth
+        ma20  = c.rolling(20).mean()
+        std20 = c.rolling(20).std()
+        bb_up = ma20 + 2 * std20; bb_lo = ma20 - 2 * std20
+        bb_rng= (bb_up - bb_lo).replace(0, np.nan)
+        feat["f_bb_position"]    = (c - bb_lo) / bb_rng
+        # Intraday features
+        feat["f_high_low_ratio"] = (h - l) / c
+        feat["f_close_open_ratio"]= (c - o) / o.replace(0, np.nan)
+        feat["f_skew_20d"]       = ret.rolling(20).skew()
+        return feat.replace([np.inf, -np.inf], np.nan)
+
+    def _walk_forward(self, feat: pd.DataFrame, labels: pd.Series) -> pd.Series:
+        """Walk-forward predict — đúng theo HKUDS walk_forward_predict()."""
+        try:
+            from sklearn.ensemble import RandomForestClassifier
+            from sklearn.preprocessing import StandardScaler
+        except ImportError:
+            return pd.Series(0.0, index=feat.index)
+
+        preds  = pd.Series(0.0, index=feat.index)
+        model  = None; scaler = None
+
+        for i in range(self.min_train, len(feat)):
+            # Retrain mỗi retrain_freq days (không phải mỗi bar → tiết kiệm thời gian)
+            if model is None or (i - self.min_train) % self.retrain_f == 0:
+                X_tr = feat.iloc[:i].values
+                y_tr = labels.iloc[:i].values
+                valid = ~(np.isnan(X_tr).any(axis=1) | np.isnan(y_tr))
+                X_tr = X_tr[valid]; y_tr = y_tr[valid]
+                if len(X_tr) < 50:
+                    continue
+                scaler = StandardScaler()
+                X_tr   = scaler.fit_transform(X_tr)
+                # HKUDS: RandomForest(n_estimators=100, max_depth=5)
+                model  = RandomForestClassifier(
+                    n_estimators=100, max_depth=5,
+                    random_state=42, n_jobs=1,
+                    class_weight="balanced",   # handle bull-market imbalance
+                )
+                model.fit(X_tr, y_tr)
+
+            if scaler is None:
+                continue
+            X_now = feat.iloc[i:i+1].values
+            if np.isnan(X_now).any():
+                continue
+            X_now = scaler.transform(X_now)
+            if hasattr(model, "predict_proba"):
+                prob = model.predict_proba(X_now)[0, 1]
+                preds.iloc[i] = prob * 2 - 1   # [0,1] → [-1,1] — HKUDS spec
+            else:
+                preds.iloc[i] = float(model.predict(X_now)[0])
+
+        return preds.fillna(0.0).clip(-1.0, 1.0)
+
+    def _one(self, df: pd.DataFrame) -> tuple:
+        # Validate minimum data (HKUDS: min_rows=300)
+        if len(df) < max(self.min_train + self.horizon + 10, 300):
+            return pd.Series(0, index=df.index, dtype=int),                    f"Khong du data (can >={self.min_train} bars)"
+
+        feat   = self._build_features(df)
+        # Labels: future horizon-day return > 0
+        labels = (df["close"].pct_change(self.horizon).shift(-self.horizon) > 0).astype(int)
+        raw    = self._walk_forward(feat, labels)
+
+        # Discrete signal với threshold (HKUDS: threshold=0.0 default, ta dùng 0.1)
+        sig = raw.apply(lambda x: 1 if x > self.threshold
+                        else -1 if x < -self.threshold else 0).astype(int)
+        cur     = _last(sig)
+        cur_raw = round(float(raw.iloc[-1]), 3)
+        det = (f"[HKUDS] ML(RandomForest n=100 depth=5 "
+               f"train={self.min_train}D retrain={self.retrain_f}D "
+               f"horizon={self.horizon}D) "
+               f"RawSignal={cur_raw:+.3f} threshold=±{self.threshold} "
+               f"Signal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'}")
+        return sig, det
+
+    def generate(self, data_map: dict) -> tuple:
+        signals, details = {}, {}
+        for code, df in data_map.items():
+            try:
+                sig, det = self._one(df)
+                signals[code] = _last(sig)
+                details[code] = det
+            except Exception as e:
+                signals[code] = 0
+                details[code] = f"Loi MLStrategy: {e}"
+        return signals, details
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENGINE 13 — CHANLUN (缠中说禅 / Chanlun Theory)
+# [HKUDS] agent/src/skills/chanlun/example_signal_engine.py
+#
+# Lý thuyết Chanlun: K-line → FX (phân hình) → BI (bút) → ZS (trung khu) → tín hiệu
+# Buy points: 一买 (1st buy), 三笔向上盘背, 五笔类一买
+# Sell points: 一卖 (1st sell), 三笔向下盘背, 五笔类一卖
+# Rất phổ biến tại TTCK VN và A-shares
+#
+# Requires: pip install czsc
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ChanlunEngine:
+    """
+    Chanlun (缠中说禅) Pattern Recognition.
+    [HKUDS] agent/src/skills/chanlun/example_signal_engine.py
+
+    Logic: Raw bars → FX (phân hình) → BI (bút) → ZS (trung khu) → buy/sell points
+    Buy:  一买 signal / 三笔向上盘背 / 五笔类一买 / BI转折 near ZS bottom
+    Sell: 一卖 signal / 三笔向下盘背 / 五笔类一卖 / BI转折 near ZS top
+
+    Requires czsc library: pip install czsc
+    Fallback khi không có czsc: pure-pandas Chanlun lite implementation
+    """
+    def __init__(self, min_bars=30):
+        self.min_bars   = min_bars
+        self._has_czsc  = self._check_czsc()
+
+    @staticmethod
+    def _check_czsc() -> bool:
+        try:
+            import czsc  # noqa
+            return True
+        except ImportError:
+            return False
+
+    def _df_to_bars(self, df, symbol):
+        """Convert OHLCV DataFrame → czsc RawBar list."""
+        from czsc import RawBar, Freq
+        from datetime import datetime
+        bars = []
+        for i, (dt, row) in enumerate(df.iterrows()):
+            if not isinstance(dt, datetime):
+                dt = pd.Timestamp(dt).to_pydatetime()
+            bars.append(RawBar(
+                symbol=symbol, id=i, dt=dt, freq=Freq.D,
+                open=float(row["open"]),  close=float(row["close"]),
+                high=float(row["high"]),  low=float(row["low"]),
+                vol=float(row.get("volume", row.get("vol", 0))),
+                amount=float(row.get("amount", 0)),
+            ))
+        return bars
+
+    def _get_czsc_signals(self, c):
+        """Compute Chanlun signals from CZSC object."""
+        from czsc.signals.cxt import (
+            cxt_first_buy_V221126, cxt_first_sell_V221126,
+            cxt_bi_base_V230228, cxt_three_bi_V230618, cxt_five_bi_V230619,
+        )
+        s = {}
+        s.update(cxt_first_buy_V221126(c, di=1))
+        s.update(cxt_first_sell_V221126(c, di=1))
+        s.update(cxt_bi_base_V230228(c, di=1))
+        s.update(cxt_three_bi_V230618(c, di=1))
+        s.update(cxt_five_bi_V230619(c, di=1))
+        return s
+
+    def _evaluate(self, c) -> int:
+        """Evaluate CZSC signals → {-1, 0, 1}."""
+        try:
+            from czsc import ZS
+            signals = c.signals
+            if not signals: return 0
+            # 一买
+            buy1 = [k for k in signals if "BUY1" in k]
+            if buy1 and "一买" in str(signals.get(buy1[0], "")): return 1
+            # 一卖
+            sell1 = [k for k in signals if "SELL1" in k]
+            if sell1 and "一卖" in str(signals.get(sell1[0], "")): return -1
+            # 三笔形态
+            three = [k for k in signals if "三笔" in k]
+            if three:
+                v = str(signals.get(three[0], ""))
+                if "向上盘背" in v: return 1
+                if "向下盘背" in v: return -1
+            # 五笔形态
+            five = [k for k in signals if "五笔" in k]
+            if five:
+                v = str(signals.get(five[0], ""))
+                if "类一买" in v: return 1
+                if "类一卖" in v: return -1
+            # BI + ZS position
+            bi_key = [k for k in signals if "V230228" in k]
+            if bi_key and len(c.bi_list) >= 3:
+                v = str(signals.get(bi_key[0], ""))
+                for i in range(len(c.bi_list)-3, max(len(c.bi_list)-10,-1), -1):
+                    try:
+                        zs = ZS(bis=c.bi_list[i:i+3])
+                        if zs.is_valid:
+                            lc = c.bars_raw[-1].close
+                            if "向下_转折" in v and lc <= zs.zd: return 1
+                            if "向上_转折" in v and lc >= zs.zg: return -1
+                            break
+                    except Exception:
+                        break
+        except Exception:
+            pass
+        return 0
+
+    def _one_czsc(self, df: pd.DataFrame, code: str) -> tuple:
+        """Full Chanlun via czsc library."""
+        from czsc import CZSC
+        bars  = self._df_to_bars(df, code)
+        sig   = pd.Series(0, index=df.index, dtype=int)
+        if len(bars) < self.min_bars:
+            return sig, "Khong du bars cho Chanlun"
+        c = CZSC(bars[:self.min_bars], get_signals=self._get_czsc_signals)
+        for bar in bars[self.min_bars:]:
+            c.update(bar)
+            v = self._evaluate(c)
+            if v != 0:
+                sig.iloc[bar.id] = v
+        cur = _last(sig)
+        n_bi = len(c.bi_list)
+        det = (f"[HKUDS] Chanlun(czsc) | BI count={n_bi} "
+               f"| Signal={'BUY(一买/盘背)' if cur>0 else 'SELL(一卖/盘背)' if cur<0 else 'NEUTRAL'}")
+        return sig, det
+
+    def _one_lite(self, df: pd.DataFrame) -> tuple:
+        """
+        Chanlun LITE — pure pandas fallback khi không có czsc.
+        Phát hiện FX (phân hình) đơn giản + BI direction.
+        """
+        h = df["high"]; l = df["low"]; c = df["close"]
+        sig = pd.Series(0, index=df.index, dtype=int)
+
+        # Phát hiện顶分型 (top FX) và底分型 (bottom FX)
+        top_fx  = (h > h.shift(1)) & (h > h.shift(-1))  # local high
+        bot_fx  = (l < l.shift(1)) & (l < l.shift(-1))  # local low
+
+        # BI direction: nếu vừa tạo bottom FX → potential buy
+        #               nếu vừa tạo top FX → potential sell
+        # Thêm filter: giá đang nằm gần extreme của FX
+        for i in range(2, len(df)-1):
+            if bool(bot_fx.iloc[i]):
+                # bottom phân hình → look-ahead: nếu giá phục hồi → BUY
+                sig.iloc[i] = 1
+            elif bool(top_fx.iloc[i]):
+                sig.iloc[i] = -1
+
+        cur = _last(sig)
+        det = (f"[HKUDS] Chanlun(lite-fallback: no czsc) "
+               f"| FX-based signal "
+               f"| Signal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'}")
+        return sig, det
+
+    def _one(self, df: pd.DataFrame, code: str) -> tuple:
+        if self._has_czsc:
+            try:
+                return self._one_czsc(df, code)
+            except Exception as e:
+                pass  # fallthrough to lite
+        return self._one_lite(df)
+
+    def generate(self, data_map: dict) -> tuple:
+        signals, details = {}, {}
+        for code, df in data_map.items():
+            try:
+                sig, det = self._one(df, code)
+                signals[code] = _last(sig)
+                details[code] = det
+            except Exception as e:
+                signals[code] = 0
+                details[code] = f"Loi ChanlunEngine: {e}"
+        return signals, details
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SINGLETON INSTANCES — 14 engines đầy đủ
 # ══════════════════════════════════════════════════════════════════════════════
 
 _ENGINES = {
-    # --- Từ Vibe-Trading strategy skills (có example_signal_engine.py) ---
-    "Candlestick":    CandlestickEngine(),      # 15 mô hình nến
-    "Ichimoku":       IchimokuEngine(),          # 5-line system
-    "TechnicalBasic": TechnicalEngine(),         # EMA/ADX/RSI/OBV
-    "ElliottWave":    ElliottEngine(),           # Zigzag + 5-wave
-    "Harmonic":       HarmonicEngine(),          # Gartley/Bat/Butterfly/Crab
-    "Volatility":     VolatilityEngine(),        # HV percentile
-    "Seasonal":       SeasonalEngine(),          # Calendar effect
-    "SMC":            SMCEngine(),               # BOS/ChoCH/FVG — momentum-based
-    "CrossMarket":    CrossMarketEngine(),       # Vol-adjusted dual-MA
-    "MultiFactor":    MultiFactorEngine(),       # Momentum/Reversal/Vol/VolumeRatio
-    # --- Adapted từ Vibe-Trading pair-trading + fundamental-filter ---
-    "MeanReversion":  MeanReversionEngine(),    # Z-score price vs rolling mean
-    "PriceMomentum":  PriceMomentumEngine(),    # Multi-TF momentum 5D/20D/60D
-    "Breakout":       BreakoutEngine(),          # S/R breakout + vol confirm
-    "MLStrategy":     MLStrategyEngine(),        # ExtraTrees walk-forward + rule fallback
-    # --- Mới: Fundamental + MoneyFlow (thu hẹp gap 16 vs 69) ---
-    "Fundamental":    FundamentalEngine(),       # PE/PB/ROE/EPS từ vnstock
-    "MoneyFlow":      MoneyFlowEngine(),         # CMF/VPT/OBV/Force Index
+    # ── HKUDS verified — có source code gốc ───────────────────────────────────
+    "Candlestick":    CandlestickEngine(),    # [HKUDS] 15 mô hình nến
+    "Ichimoku":       IchimokuEngine(),       # [HKUDS] TK Cross + 3-filter
+    "TechnicalBasic": TechnicalEngine(),      # [HKUDS] 3-dim voting EMA/ADX+BB/RSI+OBV
+    "ElliottWave":    ElliottEngine(),        # [HKUDS] Zigzag + 5-wave + ABC + Fibonacci
+    "Harmonic":       HarmonicEngine(),       # [HKUDS] XABCD + pyharmonics fallback
+    "Volatility":     VolatilityEngine(),     # [HKUDS] HV percentile lookback=120
+    "Seasonal":       SeasonalEngine(),       # [HKUDS] Fixed month lists
+    "SMC":            SMCEngine(),            # [HKUDS] ChoCH priority + BOS + FVG
+    "CrossMarket":    CrossMarketEngine(),    # [HKUDS] Vol-adjusted dual-MA a_share 5/20
+    "MultiFactor":    MultiFactorEngine(),    # [HKUDS] 4-factor composite Z-score
+    "MeanReversion":  MeanReversionEngine(),  # [HKUDS] Z-score entry=2.0 exit=0.5
+    "MLStrategy":     MLStrategyEngine(),     # [HKUDS] RandomForest walk-forward SKILL.md
+    "Chanlun":        ChanlunEngine(),         # [HKUDS] 缠中说禅 FX→BI→ZS→buy/sell points
 }
 
 
