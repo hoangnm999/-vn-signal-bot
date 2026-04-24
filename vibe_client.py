@@ -349,7 +349,40 @@ def _build_user_vars(alias: str, symbol: str, market: str,
     vn_market = market or "Vietnam HOSE/HNX"
     skills    = SKILLS_COVERAGE.get(alias, [])
     archetype, n_agents = SWARM_AGENT_INFO.get(alias, ("the_strategists", 4))
+
+    # ── Fix 1: Gán roles cụ thể cho từng agent ──────────────────────────
+    # AGENT_ROLES đã define sẵn nhưng chưa được dùng — giờ inject vào user_vars
+    # Server HKUDS dùng {{role_leader}}, {{role_researcher}}, ... trong prompt template
+    role_assignments = {
+        "role_leader":     AGENT_ROLES["Leader"],
+        "role_researcher": AGENT_ROLES["Researcher"],
+        "role_critic":     AGENT_ROLES["Critic"],
+        "role_secretary":  AGENT_ROLES["Secretary"],
+    }
+
+    # ── Fix 2: Debate instructions — bắt buộc Critic phải challenge ─────
+    # Không để agents dễ dàng đồng thuận — Critic PHẢI tìm điểm yếu trước
+    # khi Leader được phép ra kết luận cuối
+    debate_config = {
+        "debate_mode":         "structured_challenge",
+        "critic_instruction":  (
+            "You are the Critic. Your role is to CHALLENGE the Researcher's thesis. "
+            "You MUST identify at least 2 specific weaknesses or counter-arguments "
+            "before any consensus can be reached. Do NOT agree immediately. "
+            "Ask: What if the trend reverses? What does the bear case look like? "
+            "Only after rigorous challenge should the Leader synthesize."
+        ),
+        "leader_instruction":  (
+            "You are the Leader. Do NOT accept the first conclusion. "
+            "You must weigh the Researcher's analysis AGAINST the Critic's objections. "
+            "Your final verdict must explicitly address the strongest bear argument. "
+            "If bull and bear cases are close, output NEUTRAL with clear conditions."
+        ),
+        "consensus_threshold": "Consensus requires Critic to be convinced, not just outvoted.",
+    }
+
     base = {
+        # ── Target context ───────────────────────────────────────────────
         "target":           f"{symbol} ({vn_market})",
         "market":           vn_market,
         "timeframe":        timeframe or "daily",
@@ -359,6 +392,7 @@ def _build_user_vars(alias: str, symbol: str, market: str,
         "agent_archetype":  archetype,
         "n_agents":         str(n_agents),
         "skills_used":      ", ".join(skills[:8]),
+        # ── Sector & instrument context ──────────────────────────────────
         "commodity":        symbol,
         "crisis":           f"Tac dong den co phieu {symbol}",
         "factor_type":      "momentum, value, quality",
@@ -374,7 +408,30 @@ def _build_user_vars(alias: str, symbol: str, market: str,
         "pair_asset":       "VNINDEX",
         "benchmark":        "VNINDEX",
     }
-    base.update(extra)
+
+    # Merge roles + debate config vào base
+    base.update(role_assignments)
+    base.update(debate_config)
+
+    # ── Fix 3 (data injection): nếu extra chứa signal data từ /check ────
+    # Caller (bot.py) có thể truyền vào extra_vars={
+    #   "local_signals": "Bull:8/13 Bear:3/13 Verdict:NGHIENG_MUA",
+    #   "price_context": "Close=64.5 RSI=52 MACD=+0.36 Vol=1.2xMA20",
+    #   "support_resistance": "Ho tro:63.5 Khang cu:68.8",
+    # }
+    # Các key này sẽ được inject để agents có data thực thay vì general knowledge
+    if extra.get("local_signals"):
+        base["local_signal_context"] = (
+            f"[VN Signal Bot /check output for {symbol}]\n"
+            f"Signal summary: {extra['local_signals']}\n"
+            f"Price context: {extra.get('price_context', 'N/A')}\n"
+            f"Support/Resistance: {extra.get('support_resistance', 'N/A')}\n"
+            f"NOTE: Use this as additional data point. Do NOT simply echo it — "
+            f"critically evaluate whether you agree or disagree with each signal."
+        )
+
+    base.update({k: v for k, v in extra.items()
+                 if k not in ("local_signals", "price_context", "support_resistance")})
     return base
 
 
@@ -439,6 +496,81 @@ def resolve_alias(alias: str) -> Optional[str]:
 # ══════════════════════════════════════════════════════════════════════════════
 # CORE FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
+
+def build_local_context(symbol: str, check_result: dict) -> dict:
+    """
+    Build extra_vars từ kết quả /check để inject vào /vibe.
+    Gọi trước start_swarm() nếu muốn agents có data thực của cổ phiếu.
+
+    Args:
+        symbol: mã cổ phiếu
+        check_result: dict từ analyze_stock_full() hoặc run_vibe_agents()
+            Cần có keys: signals, details, verdict, bull, bear, n, indicators
+
+    Returns:
+        dict extra_vars để truyền vào start_swarm(extra_vars=...)
+
+    Usage trong bot.py:
+        check_data = run_vibe_agents(symbol, df)
+        ind        = get_indicators(symbol, df)
+        extra      = build_local_context(symbol, {**check_data, "indicators": ind})
+        run_id     = start_swarm("technical", symbol, extra_vars=extra)
+    """
+    signals    = check_result.get("signals", {})
+    bull       = check_result.get("bull", 0)
+    bear       = check_result.get("bear", 0)
+    n          = check_result.get("n", 1) or 1
+    verdict    = check_result.get("verdict", "")
+    ind        = check_result.get("indicators", {})
+
+    # ── Signal summary ────────────────────────────────────────────────────
+    bull_engines = [k for k, v in signals.items() if v == 1]
+    bear_engines = [k for k, v in signals.items() if v == -1]
+    neutral_engines = [k for k, v in signals.items() if v == 0]
+    conf_pct   = round(max(bull, bear) / n * 100) if n > 0 else 0
+
+    local_signals = (
+        f"Bull:{bull}/{n} Bear:{bear}/{n} Neutral:{n-bull-bear}/{n} "
+        f"Verdict:{verdict} Confidence:{conf_pct}%\n"
+        f"Bullish engines: {', '.join(bull_engines) or 'none'}\n"
+        f"Bearish engines: {', '.join(bear_engines) or 'none'}\n"
+        f"Neutral engines: {', '.join(neutral_engines) or 'none'}"
+    )
+
+    # ── Price context ─────────────────────────────────────────────────────
+    price_parts = []
+    if ind.get("current_price"):
+        price_parts.append(f"Close={ind['current_price']}")
+    if ind.get("rsi"):
+        price_parts.append(f"RSI={round(ind['rsi'], 1)}")
+    if ind.get("macd"):
+        price_parts.append(f"MACD={round(ind['macd'], 4):+}")
+    if ind.get("volume_ratio"):
+        price_parts.append(f"Vol={round(ind['volume_ratio'], 2)}xMA20")
+    if ind.get("change_1w_pct"):
+        price_parts.append(f"1W={round(ind['change_1w_pct'], 1):+}%")
+    if ind.get("change_1m_pct"):
+        price_parts.append(f"1M={round(ind['change_1m_pct'], 1):+}%")
+    price_context = " | ".join(price_parts) if price_parts else "N/A"
+
+    # ── Support / Resistance ──────────────────────────────────────────────
+    sr_parts = []
+    if ind.get("support_20d"):
+        sr_parts.append(f"Ho tro:{ind['support_20d']}")
+    if ind.get("resistance_20d"):
+        sr_parts.append(f"Khang cu:{ind['resistance_20d']}")
+    if ind.get("bb_lower"):
+        sr_parts.append(f"BB_low:{round(ind['bb_lower'],2)}")
+    if ind.get("bb_upper"):
+        sr_parts.append(f"BB_up:{round(ind['bb_upper'],2)}")
+    support_resistance = " | ".join(sr_parts) if sr_parts else "N/A"
+
+    return {
+        "local_signals":      local_signals,
+        "price_context":      price_context,
+        "support_resistance": support_resistance,
+    }
+
 
 def start_swarm(alias: str, symbol: str,
                 market: str = "Vietnam HOSE/HNX",
@@ -553,27 +685,30 @@ def run_swarm_sync(alias: str, symbol: str,
 
 
 def format_swarm_result(result: dict, symbol: str, alias: str) -> str:
-    """Format kết quả swarm thành text Telegram-ready (<=4000 ký tự)."""
+    """
+    Format kết quả swarm thành text đầy đủ.
+    KHÔNG truncate — caller (bot.py) dùng _smart_split() để tách nếu cần.
+    """
     canonical = resolve_alias(alias) or alias
     label     = SWARM_LABELS.get(canonical, canonical.upper())
     status    = result.get("status", "unknown")
 
     if status != "completed":
         err = result.get("error", "Unknown error")
-        return (f"Vibe-Trading — {label}\nMa: {symbol} | {status}\nLoi: {err}")
+        return f"Vibe-Trading — {label}\nMa: {symbol} | {status}\nLoi: {err}"
 
-    elapsed  = result.get("elapsed_seconds", 0)
-    tasks    = result.get("tasks", [])
-    n_done   = sum(1 for t in tasks if t.get("status") == "completed")
-    n_total  = len(tasks)
-    skills   = SKILLS_COVERAGE.get(canonical, [])
+    elapsed      = result.get("elapsed_seconds", 0)
+    tasks        = result.get("tasks", [])
+    n_done       = sum(1 for t in tasks if t.get("status") == "completed")
+    n_total      = len(tasks)
+    skills       = SKILLS_COVERAGE.get(canonical, [])
     archetype, _ = SWARM_AGENT_INFO.get(canonical, ("", 0))
     arch_desc    = AGENT_ARCHETYPES.get(archetype, "")
 
     header = (
         f"VIBE-TRADING — {label}\n"
         f"Ma: {symbol} | {n_done}/{n_total} agents | {elapsed//60}p{elapsed%60}s\n"
-        f"Skills: {', '.join(skills[:5])}{'...' if len(skills)>5 else ''}\n"
+        f"Skills: {', '.join(skills[:5])}{'...' if len(skills) > 5 else ''}\n"
         f"Role: {arch_desc}\n"
         f"{'='*36}\n\n"
     )
@@ -583,15 +718,13 @@ def format_swarm_result(result: dict, symbol: str, alias: str) -> str:
         completed = [t for t in tasks if t.get("status") == "completed"]
         if completed:
             last         = completed[-1]
-            final_report = f"[{last.get('agent_id','?')}]\n{(last.get('output') or '')[:800]}"
+            final_report = f"[{last.get('agent_id','?')}]\n{(last.get('output') or '')}"
         else:
             final_report = "Khong co bao cao."
 
-    max_body = 4000 - len(header) - 60
-    body     = final_report[:max_body]
-    if len(final_report) > max_body:
-        body += "\n...[xem day du tren Vibe-Trading dashboard]"
-    return header + body
+    # Trả về FULL text — không truncate
+    # bot.py dùng _smart_split() để tách thành nhiều Telegram message nếu cần
+    return header + final_report
 
 
 def get_swarm_info(alias: str) -> str:

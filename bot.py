@@ -14,6 +14,7 @@ try:
         is_available as vibe_available,
         start_swarm, poll_swarm, format_swarm_result,
         SWARM_ALIASES, SWARM_LABELS, SWARM_GROUPS, QUICK_ALIASES, resolve_alias,
+        build_local_context,
     )
     _VIBE_CLIENT = True
 except ImportError:
@@ -537,8 +538,25 @@ async def vibe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Chạy swarm trong background task — KHÔNG block event loop
     async def _run_swarm_bg():
         try:
-            # Start swarm
-            run_id = await asyncio.to_thread(start_swarm, alias, symbol)
+            # ── Thu thập local context từ /check để inject vào agents ────
+            # Nếu có data OHLCV, chạy quick analysis để lấy signals thực
+            extra_vars: dict = {}
+            try:
+                from analyzer import get_price_data, run_vibe_agents, get_indicators
+                df = await asyncio.to_thread(get_price_data, symbol, 300)
+                if df is not None and len(df) >= 60:
+                    check_data  = await asyncio.to_thread(run_vibe_agents, symbol, df)
+                    ind         = await asyncio.to_thread(get_indicators, symbol, df)
+                    extra_vars  = build_local_context(symbol, {**check_data, "indicators": ind})
+                    logger.info(f"vibe context injected for {symbol}: "
+                                f"bull={check_data.get('bull',0)} bear={check_data.get('bear',0)}")
+            except Exception as e:
+                logger.warning(f"Could not build local context for {symbol}: {e}")
+                # Không block — tiếp tục chạy vibe mà không có context
+
+            # Start swarm (với hoặc không có local context)
+            run_id = await asyncio.to_thread(start_swarm, alias, symbol,
+                                             extra_vars=extra_vars or None)
             if not run_id:
                 await context.bot.edit_message_text(
                     chat_id=chat_id, message_id=msg_id,
