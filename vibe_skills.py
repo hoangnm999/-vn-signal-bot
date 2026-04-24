@@ -887,8 +887,11 @@ class CrossMarketEngine:
         ms_v  = round(float(df["close"].rolling(params["ma_slow"]).mean().iloc[-1]), 2)
         cur   = _last(sig.apply(lambda x: 1 if x > 0 else -1 if x < 0 else 0))
         vol_pct = round(v * 100, 2)
+        # Đổi tên display: a_share → vn_stock (tránh hiểu nhầm là sàn TQ)
+        # Logic hoàn toàn không đổi — a_share params (MA5/MA20) phù hợp nhất cho VN
+        display_market = "vn_stock" if market == "a_share" else market
         det   = (f"MA{params['ma_fast']}={mf_v} MA{params['ma_slow']}={ms_v} "
-                 f"Vol20={vol_pct}% Market={market} "
+                 f"Vol20={vol_pct}% Market={display_market} "
                  f"Signal={'BUY' if cur > 0 else 'SELL' if cur < 0 else 'NEUTRAL'}")
         return sig, det
 
@@ -1122,8 +1125,11 @@ class MLStrategyEngine:
       Signal threshold: abs(signal) < 0.1 → 0
     """
     def __init__(self, min_train_size=252, retrain_freq=20,
-                 horizon=5, threshold=0.1,
+                 horizon=5, threshold=0.3,
                  model_type="random_forest"):
+        # threshold=0.3: raw signal [-1,1] phải vượt ±0.3 mới tính MUA/BÁN
+        # RawSignal 0.416 > 0.3 → MUA ✓  |  0.2 → NEUTRAL ✓  |  -0.35 → BÁN ✓
+        # threshold cũ 0.1 quá thấp: 0.416 lọt qua dù gần trung tính
         self.min_train  = min_train_size
         self.retrain_f  = retrain_freq
         self.horizon    = horizon
@@ -1216,7 +1222,7 @@ class MLStrategyEngine:
         labels = (df["close"].pct_change(self.horizon).shift(-self.horizon) > 0).astype(int)
         raw    = self._walk_forward(feat, labels)
 
-        # Discrete signal với threshold (HKUDS: threshold=0.0 default, ta dùng 0.1)
+        # Discrete signal với threshold (HKUDS: threshold=0.0 default, ta dùng 0.3 — xem __init__)
         sig = raw.apply(lambda x: 1 if x > self.threshold
                         else -1 if x < -self.threshold else 0).astype(int)
         cur     = _last(sig)

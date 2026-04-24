@@ -1581,12 +1581,15 @@ def _format_action_plan(verdict_label: str, ap: dict) -> str:
     TRUNG LAP: Chờ xác nhận
     """
     if "MUA" in verdict_label:
+        rr_warn = ""
+        if ap.get("poor_rr"):
+            rr_warn = f"\n  ⚠️  CANH BAO: R:R={ap['rr']} < 1.5 — rui ro/phan thuong chua tot, can than khi vao lenh"
         return (
             f"ACTION PLAN (MUA):\n"
             f"  Entry:  {_fmt_price(ap['entry_low'])} - {_fmt_price(ap['entry_high'])}\n"
             f"  Target: {_fmt_price(ap['tp'])} ({ap['tp_pct']:+.1f}%)\n"
             f"  SL:     {_fmt_price(ap['sl'])} ({ap['sl_pct']:+.1f}%)\n"
-            f"  R:R   = 1:{ap['rr']}"
+            f"  R:R   = 1:{ap['rr']}{rr_warn}"
         )
     elif "BAN" in verdict_label:
         r_lo  = ap.get("resist_low",  ap["entry_high"])
@@ -1701,6 +1704,26 @@ def run_verdict_agent(symbol, verdicts, ind):
         risk   = price - sl
         rr     = round(reward / risk, 1) if risk > 0 else 0
 
+    # ── R:R Guard: tự động thu hẹp SL nếu R:R < 1.5 ─────────────────────────
+    # Nguyên tắc: không nên vào lệnh nếu R:R < 1.5 (rủi ro > 2/3 reward)
+    # Cách fix: thu hẹp SL về ATR-based thay vì dùng support xa
+    # Nếu vẫn không đạt → đánh dấu poor_rr để hiển thị cảnh báo
+    MIN_RR = 1.5
+    if rr > 0 and rr < MIN_RR:
+        # Thử SL chặt hơn: 1.0× ATR thay 1.5×
+        sl_tight  = round(price - 1.0 * atr_proxy, 2)
+        risk_tight = price - sl_tight
+        rr_tight   = round(reward / risk_tight, 1) if risk_tight > 0 else 0
+        if rr_tight >= MIN_RR:
+            sl     = sl_tight
+            sl_pct = round((sl - price) / price * 100, 1)
+            risk   = risk_tight
+            rr     = rr_tight
+        # Nếu vẫn < 1.5 (TP quá gần): đánh dấu poor_rr, không block signal
+        # nhưng sẽ hiển thị cảnh báo trong format
+
+    poor_rr = rr > 0 and rr < MIN_RR  # flag để _format_action_plan hiển thị cảnh báo
+
     # ── VaR/CVaR (Historical Simulation) ─────────────────────────────────────
     # [HKUDS] risk-analysis/SKILL.md
     # VaR = maximum expected loss at confidence level (historical simulation)
@@ -1742,6 +1765,7 @@ def run_verdict_agent(symbol, verdicts, ind):
         "tp":           tp,         "sl":         sl,
         "tp_pct":       round((tp - price) / price * 100, 1),
         "sl_pct":       sl_pct,     "rr":         rr,
+        "poor_rr":      poor_rr,    # True nếu R:R < 1.5 sau khi đã thử tối ưu
         # Sell-side fields
         "resist_low":   resist_zone_lo, "resist_high": resist_zone_hi,
         "exit_low":     exit_lo,        "exit_high":   exit_hi,
@@ -2159,13 +2183,16 @@ def _build_vibe_message(
         var_str = ""
         if ap.get("var_95_pct"):
             var_str = f"  VaR 95%: {ap['var_95_pct']:+.2f}% (~{_fmt_price(ap.get('var_95_abs',0))} max loss/day)\n"
+        rr_warn = ""
+        if ap.get("poor_rr"):
+            rr_warn = f"  ⚠️  CANH BAO: R:R={ap['rr']} < 1.5 — rui ro/phan thuong chua tot, can than khi vao lenh\n"
         action_block = (
             f"ACTION PLAN (MUA):\n"
             f"  Entry:  {_fmt_price(ap['entry_low'])} - {_fmt_price(ap['entry_high'])}\n"
             f"  Target: {_fmt_price(ap['tp'])} ({ap['tp_pct']:+.1f}%)\n"
             f"  SL:     {_fmt_price(ap['sl'])} ({ap['sl_pct']:+.1f}%)\n"
             f"  R:R   = 1:{ap['rr']}\n"
-            + var_str
+            + rr_warn + var_str
         )
     elif "BAN" in fv:
         # BÁN: kháng cự / thoát hàng / cắt lỗ cứng — không hiển thị vùng mua
