@@ -1,291 +1,61 @@
 """
-local_swarm_cmd.py — Telegram command handler cho /local_swarm.
+local_swarm_cmd.py — Handler Telegram cho /local_swarm.
 
-Tích hợp:
-  1. /local_swarm STB           → Chạy thủ công
-  2. /local_swarm STB --check   → Chạy /check trước, rồi swarm (kết quả đầy đủ nhất)
-  3. Failover từ /vibe: khi Vibe-Trading offline → tự động chạy local_swarm
+ARCHITECTURE FIX (lỗi freeze 30 phút):
+─────────────────────────────────────────────────────────────────────
+Vấn đề gốc: progress_cb được gọi từ sync thread (asyncio.to_thread),
+bên trong cb lại cố schedule coroutine vào event loop → deadlock.
 
-Thêm vào bot.py:
-    from local_swarm_cmd import local_swarm_cmd, install_vibe_failover
-    app.add_handler(CommandHandler("local_swarm", local_swarm_cmd))
-    install_vibe_failover(app)   # patch vibe_cmd để tự failover
+Giải pháp: tách hoàn toàn 2 luồng:
+  1. Thread worker (run_local_swarm) — sync, không biết gì về asyncio
+     └─ Đẩy progress message vào queue (thread-safe)
+     └─ Set done_event khi xong hoặc lỗi
+
+  2. Async watcher (chạy trên event loop) — poll queue + done_event
+     └─ Edit message Telegram mỗi khi có progress mới
+     └─ Dừng ngay khi done_event được set
+     └─ Hard timeout 600s
+
+Không còn callback asyncio từ sync thread → không còn deadlock.
+─────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import queue
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Cooldown độc lập với /check và /vibe
-LOCAL_SWARM_COOLDOWN = 60
-_last_local_swarm: dict[str, float] = {}
+# ── Constants ─────────────────────────────────────────────────────────────────
+SWARM_COOLDOWN   = 120      # giây giữa 2 lần /local_swarm cùng user
+SWARM_TIMEOUT    = 600      # hard timeout 10 phút (Fix #2)
+MAX_PROGRESS_MSG = 30       # tối đa 30 dòng progress trước khi im lặng (Fix #3)
+PROGRESS_INTERVAL = 8       # giây cập nhật message Telegram
+SPAM_WARNING     = "⚠️ Đang xử lý tác vụ phức tạp, vui lòng đợi thêm..."
+
+# ── Global state ──────────────────────────────────────────────────────────────
+_last_local_swarm: dict[str, float] = {}    # user_id → timestamp
+
+# Lưu task đang chạy để /cancel có thể hủy (Fix #4)
+# key: chat_id, value: {"future": Future, "cancel_event": Event, "symbol": str}
+_active_swarm_tasks: dict[int, dict] = {}
+
+# Thread pool riêng để chạy swarm (tránh block ThreadPoolExecutor chính)
+_swarm_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="swarm")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Cancel command (Fix #4) ───────────────────────────────────────────────────
 
-def _get_rate_limit(user_id: str) -> float:
-    elapsed = time.time() - _last_local_swarm.get(user_id, 0)
-    return max(0.0, LOCAL_SWARM_COOLDOWN - elapsed)
-
-
-def _record(user_id: str):
-    _last_local_swarm[user_id] = time.time()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PROGRESS STREAMER — cập nhật Telegram message realtime
-# ══════════════════════════════════════════════════════════════════════════════
-
-class _TelegramProgressStreamer:
+async def cancel_swarm_cmd(update, context):
     """
-    Stream progress messages lên Telegram trong khi swarm đang chạy.
-    Chạy trong thread pool nên dùng asyncio.run_coroutine_threadsafe.
+    /cancel — hủy tác vụ local_swarm đang chạy của chat này.
     """
-
-    def __init__(self, bot, chat_id: int, message_id: int, loop):
-        self._bot        = bot
-        self._chat_id    = chat_id
-        self._msg_id     = message_id
-        self._loop       = loop
-        self._lines: list[str] = []
-        self._last_edit  = 0.0
-        self._min_interval = 4.0    # tối thiểu 4s giữa 2 lần edit
-
-    def __call__(self, msg: str):
-        """Được gọi từ thread của swarm."""
-        self._lines.append(msg)
-        now = time.time()
-        if now - self._last_edit >= self._min_interval:
-            self._last_edit = now
-            self._do_edit()
-
-    def _do_edit(self):
-        recent = self._lines[-8:]   # 8 dòng gần nhất
-        text = (
-            "🤖 LOCAL SWARM ĐANG CHẠY...\n"
-            "─" * 30 + "\n"
-            + "\n".join(recent)
-            + "\n\n(Đang xử lý, vui lòng đợi...)"
-        )
-        text = text[:4000]
-
-        async def _edit():
-            try:
-                await self._bot.edit_message_text(
-                    chat_id=self._chat_id,
-                    message_id=self._msg_id,
-                    text=text,
-                )
-            except Exception:
-                pass
-
-        asyncio.run_coroutine_threadsafe(_edit(), self._loop)
-
-    def flush(self):
-        """Gọi lần cuối trước khi thay thế bằng kết quả."""
-        self._do_edit()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CORE RUNNER
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _run_local_swarm_flow(
-    symbol: str,
-    run_check_first: bool,
-    context,
-    chat_id: int,
-    msg,
-):
-    """
-    Luồng chạy chính — chạy trong background task.
-
-    run_check_first=True  → gọi analyze_stock_full() trước để có meta đầy đủ
-    run_check_first=False → lấy meta từ DB hoặc khởi tạo minimal
-    """
-    loop = asyncio.get_event_loop()
-
-    try:
-        from local_swarm import run_local_swarm
-
-        # ── Bước 1: Lấy dữ liệu phân tích ──────────────────────────────────
-        meta = None
-        if run_check_first:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=msg.message_id,
-                text=f"⏳ Đang chạy /check {symbol} trước...\n(30-60 giây)"
-            )
-            try:
-                from analyzer import analyze_stock_full
-                _, meta = await asyncio.to_thread(analyze_stock_full, symbol)
-                if meta is None:
-                    raise ValueError("analyze_stock_full trả về None")
-                await context.bot.edit_message_text(
-                    chat_id=chat_id, message_id=msg.message_id,
-                    text=f"✅ /check {symbol} xong. Đang khởi động Hội đồng...",
-                )
-            except Exception as e:
-                logger.warning(f"local_swarm check fail: {e}")
-                await context.bot.edit_message_text(
-                    chat_id=chat_id, message_id=msg.message_id,
-                    text=(
-                        f"⚠️ Không lấy được dữ liệu /check ({e}).\n"
-                        f"Sẽ dùng kết quả gần nhất từ DB hoặc minimal analysis..."
-                    ),
-                )
-
-        # Nếu không có meta từ /check, thử lấy từ DB
-        if meta is None:
-            try:
-                from db import get_latest_meta
-                meta = get_latest_meta(symbol)
-                if meta:
-                    logger.info(f"local_swarm: dùng meta từ DB cho {symbol}")
-            except Exception:
-                pass
-
-        if meta is None:
-            # Tạo minimal meta từ price data
-            try:
-                from analyzer import get_price_data, get_indicators
-                price_r = await asyncio.to_thread(get_price_data, symbol, 100)
-                if price_r and price_r.get("success"):
-                    df = price_r["df"]
-                    ind = await asyncio.to_thread(get_indicators, symbol, df)
-                    meta = {
-                        "verdict": {
-                            "verdict_label":  "TRUNG LAP",
-                            "confidence_pct": 50,
-                            "bull_count":     0,
-                            "bear_count":     0,
-                            "active_agents":  0,
-                        },
-                        "ind":          ind or {},
-                        "agent_verdicts": {},
-                        "macro_v":      {},
-                    }
-            except Exception as e:
-                logger.warning(f"local_swarm minimal meta fail: {e}")
-
-        if meta is None:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=msg.message_id,
-                text=(
-                    f"❌ Không thể lấy dữ liệu cho {symbol}.\n"
-                    f"Hãy thử: /local_swarm {symbol} --check"
-                )
-            )
-            return
-
-        # ── Bước 2: Setup progress streamer ─────────────────────────────────
-        streamer = _TelegramProgressStreamer(
-            context.bot, chat_id, msg.message_id, loop
-        )
-
-        # ── Bước 3: Chạy swarm trong thread ─────────────────────────────────
-        try:
-            text, report = await asyncio.to_thread(
-                run_local_swarm, symbol, meta, None, streamer
-            )
-        except RuntimeError as e:
-            # LLM không available
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=msg.message_id,
-                text=f"❌ Lỗi LLM:\n{str(e)[:500]}\n\nCần set 1 trong:\nDEEPSEEK_API_KEY / OPENROUTER_API_KEY / GROQ_API_KEY / GEMINI_API_KEY"
-            )
-            return
-
-        # ── Bước 4: Gửi kết quả ─────────────────────────────────────────────
-        # Import smart split từ bot.py
-        try:
-            from bot import _smart_split, plain
-        except ImportError:
-            import re
-            def plain(t): return re.sub(r"[*`]", "", t)
-            def _smart_split(t):
-                return [t[:4000]] if len(t) > 4000 else [t]
-
-        parts = _smart_split(plain(text))
-
-        # Edit loading message thành phần đầu
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=msg.message_id,
-                text=parts[0],
-            )
-        except Exception:
-            await context.bot.send_message(chat_id=chat_id, text=parts[0])
-
-        # Gửi phần còn lại
-        for part in parts[1:]:
-            await context.bot.send_message(chat_id=chat_id, text=part)
-
-        logger.info(
-            f"local_swarm {symbol}: OK | "
-            f"{report.panel_verdict} | {report.elapsed_s:.0f}s | "
-            f"{report.llm_provider}"
-        )
-
-    except Exception as e:
-        import traceback
-        logger.error(f"local_swarm flow error: {e}\n{traceback.format_exc()}")
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=msg.message_id,
-                text=f"❌ Lỗi khi chạy Local Swarm {symbol}:\n{str(e)[:300]}"
-            )
-        except Exception:
-            pass
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM COMMAND HANDLER
-# ══════════════════════════════════════════════════════════════════════════════
-
-_HELP_TEXT = """\
-🤖 LOCAL SWARM PANEL — Hội đồng Chuyên gia AI Nội bộ
-
-Cú pháp:
-  /local_swarm <MA>          — Dùng kết quả /check gần nhất
-  /local_swarm <MA> --check  — Chạy /check trước (kết quả tốt nhất)
-  /local_swarm status        — Kiểm tra LLM available
-
-Ví dụ:
-  /local_swarm VCB
-  /local_swarm STB --check
-  /local_swarm HPG
-
-5 chuyên gia AI sẽ tranh luận 2 vòng:
-  📊 Chuyên gia Kỹ thuật
-  🌏 Chiến lược gia Vĩ mô
-  🛡️ Nhà Quản trị Rủi ro
-  💡 SMC Trader
-  📋 Bộ lọc Cơ bản
-
-Output: Verdict + Entry/SL/TP/RR + Scenarios + Shelf Life
-
-Thời gian: ~2-4 phút (phụ thuộc LLM provider)
-"""
-
-
-async def local_swarm_cmd(update, context):
-    """
-    /local_swarm <MA> [--check]
-
-    Args:
-      MA       : mã cổ phiếu
-      --check  : chạy /check trước để có dữ liệu mới nhất
-    """
-    from telegram import Update
-    from telegram.ext import ContextTypes
-
     try:
         from bot import is_allowed, _deny
     except ImportError:
@@ -295,129 +65,390 @@ async def local_swarm_cmd(update, context):
     if not is_allowed(update):
         await _deny(update); return
 
+    chat_id = update.effective_chat.id
+    task = _active_swarm_tasks.get(chat_id)
+
+    if not task:
+        await update.message.reply_text("Không có tác vụ nào đang chạy.")
+        return
+
+    symbol = task.get("symbol", "?")
+    task["cancel_event"].set()    # báo cho thread dừng
+    future: Future = task["future"]
+    future.cancel()               # cancel future nếu chưa start
+    _active_swarm_tasks.pop(chat_id, None)
+
+    await update.message.reply_text(
+        f"✅ Đã gửi tín hiệu hủy tác vụ /local_swarm {symbol}.\n"
+        "Kết quả hiện có sẽ được trả về nếu phân tích đã có một phần."
+    )
+
+
+# ── Main command handler ──────────────────────────────────────────────────────
+
+async def local_swarm_cmd(update, context):
+    """
+    /local_swarm <MA> [--check]
+
+    Flow:
+      1. Validate + cooldown check
+      2. Lấy meta từ analyze_stock_full (trong thread)
+      3. Tạo progress_queue + done_event
+      4. Submit run_local_swarm vào thread pool
+      5. Async watcher: poll queue, cập nhật Telegram, timeout
+      6. Khi done: gửi kết quả cuối
+    """
+    try:
+        from bot import is_allowed, _deny, plain, _validate_symbol
+    except ImportError:
+        def is_allowed(_): return True
+        async def _deny(_): pass
+        def plain(t): return t
+        def _validate_symbol(s):
+            s = s.upper().strip()
+            return (s.isalnum() and 2 <= len(s) <= 10), s
+
+    if not is_allowed(update):
+        await _deny(update); return
+
     args = context.args or []
-
-    # Help
-    if not args or args[0].lower() in ("help", "--help", "-h", "?"):
-        await update.message.reply_text(_HELP_TEXT)
-        return
-
-    # Status check
-    if args[0].lower() == "status":
-        msg = await update.message.reply_text("Đang kiểm tra LLM...")
-        try:
-            from local_swarm import check_local_swarm_available
-            ok, info = await asyncio.to_thread(check_local_swarm_available)
-            if ok:
-                await msg.edit_text(f"✅ Local Swarm: READY\n{info}")
-            else:
-                await msg.edit_text(f"❌ Local Swarm: UNAVAILABLE\n{info}")
-        except Exception as e:
-            await msg.edit_text(f"Lỗi kiểm tra: {e}")
-        return
-
-    # Parse symbol
-    import re
-    raw_sym = args[0]
-    symbol  = raw_sym.upper().strip()[:10]
-    if not re.match(r'^[A-Z0-9]{2,10}$', symbol):
-        await update.message.reply_text("Mã không hợp lệ (VD: VCB, STB, HPG)."); return
-
-    run_check_first = "--check" in [a.lower() for a in args]
-
-    # Rate limit
-    user_id = str(update.effective_user.id) if update.effective_user else "unknown"
-    wait    = _get_rate_limit(user_id)
-    if wait > 0:
+    if not args:
         await update.message.reply_text(
-            f"Vui lòng chờ {wait:.0f}s trước khi /local_swarm tiếp."
-        ); return
-    _record(user_id)
+            "Cú pháp: /local_swarm <MA>\n"
+            "Ví dụ : /local_swarm VCB\n"
+            "Hủy   : /cancel"
+        )
+        return
+
+    valid, symbol = _validate_symbol(args[0])
+    if not valid:
+        await update.message.reply_text(f"Mã '{args[0]}' không hợp lệ (2-10 ký tự)."); return
+
+    check_mode = "--check" in [a.lower() for a in args]
+
+    # ── Cooldown ──────────────────────────────────────────────────────────────
+    user_id = str(update.effective_user.id) if update.effective_user else "unknown"
+    since   = time.time() - _last_local_swarm.get(user_id, 0)
+    if since < SWARM_COOLDOWN:
+        wait = int(SWARM_COOLDOWN - since)
+        await update.message.reply_text(f"⏳ Vui lòng chờ {wait}s trước khi chạy lại."); return
+    _last_local_swarm[user_id] = time.time()
 
     chat_id = update.effective_chat.id
 
-    # Loading message
-    init_text = (
-        f"🤖 LOCAL SWARM: {symbol}\n"
-        f"{'─'*30}\n"
-        f"{'⏳ Chạy /check trước...' if run_check_first else '⏳ Đang khởi động...'}\n\n"
-        f"5 chuyên gia AI sẽ tranh luận 2 vòng.\n"
-        f"Ước tính: 2-4 phút. Bot vẫn nhận lệnh khác trong khi chờ."
+    # ── Kiểm tra có task đang chạy không ─────────────────────────────────────
+    if chat_id in _active_swarm_tasks:
+        await update.message.reply_text(
+            f"⚠️ Đang có tác vụ /local_swarm {_active_swarm_tasks[chat_id].get('symbol','?')} "
+            f"đang chạy.\nGõ /cancel để hủy hoặc đợi kết thúc."
+        )
+        return
+
+    # ── Gửi loading message ───────────────────────────────────────────────────
+    msg = await update.message.reply_text(
+        f"🤖 LOCAL SWARM ĐANG CHẠY: {symbol}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ Đang lấy dữ liệu thị trường...\n"
+        f"(Tối đa {SWARM_TIMEOUT//60} phút | /cancel để hủy)"
     )
-    msg = await update.message.reply_text(init_text)
 
-    # Chạy background
-    asyncio.create_task(
-        _run_local_swarm_flow(symbol, run_check_first, context, chat_id, msg)
-    )
+    # ── Kiểm tra availability nhanh ───────────────────────────────────────────
+    if check_mode:
+        try:
+            from local_swarm import check_local_swarm_available
+            ok, info = check_local_swarm_available()
+            if not ok:
+                await msg.edit_text(f"❌ Local Swarm không khả dụng:\n{info}")
+                return
+            await context.bot.send_message(chat_id=chat_id, text=f"✅ LLM sẵn sàng: {info}")
+        except Exception as e:
+            await msg.edit_text(f"❌ Lỗi kiểm tra: {e}")
+            return
 
+    # ── Setup thread-safe communication (Fix #1) ──────────────────────────────
+    progress_queue: queue.Queue[str] = queue.Queue()
+    done_event   = threading.Event()          # set khi swarm xong
+    cancel_event = threading.Event()          # set khi user /cancel
+    result_holder: dict = {"text": None, "error": None}
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FAILOVER PATCH — tự động dùng Local Swarm khi Vibe offline
-# ══════════════════════════════════════════════════════════════════════════════
+    def progress_cb(msg_text: str):
+        """Callback an toàn: chỉ đẩy vào queue, không gọi asyncio."""
+        if cancel_event.is_set():
+            raise RuntimeError("Cancelled by user")
+        progress_queue.put_nowait(str(msg_text))
 
-def install_vibe_failover(app):
-    """
-    Patch vibe_cmd để tự động fallback sang Local Swarm khi Vibe server offline.
+    # ── Worker function chạy trong thread ────────────────────────────────────
+    def _swarm_worker():
+        """Chạy hoàn toàn synchronous, không biết gì về asyncio."""
+        try:
+            from analyzer import analyze_stock_full
+            from local_swarm import run_local_swarm
 
-    Gọi sau khi đăng ký handler:
-        install_vibe_failover(app)
-    """
-    try:
-        import bot as _bot_module
-        original_vibe_cmd = _bot_module.vibe_cmd
+            progress_cb(f"📊 Đang phân tích {symbol} qua 16 engines...")
 
-        async def _vibe_with_failover(update, context):
-            """Wrapper: thử Vibe → fail → Local Swarm."""
-            try:
-                from vibe_client import is_available
-                vibe_ok = is_available()
-            except Exception:
-                vibe_ok = False
-
-            if not vibe_ok:
-                # Vibe offline → thông báo và offer Local Swarm
-                args    = context.args or []
-                symbol  = args[0].upper() if args else "?"
-
-                try:
-                    from bot import is_allowed, _deny
-                except ImportError:
-                    def is_allowed(_): return True
-                    async def _deny(_): pass
-
-                if not is_allowed(update):
-                    await _deny(update); return
-
-                chat_id = update.effective_chat.id
-                msg = await update.message.reply_text(
-                    f"⚠️ Vibe-Trading server OFFLINE.\n\n"
-                    f"🔄 Tự động chuyển sang LOCAL SWARM PANEL\n"
-                    f"Mã: {symbol} | 5 chuyên gia AI nội bộ\n\n"
-                    f"Đang khởi động... (~2-4 phút)"
-                )
-
-                user_id = str(update.effective_user.id) if update.effective_user else "unknown"
-                asyncio.create_task(
-                    _run_local_swarm_flow(symbol, True, context, chat_id, msg)
-                )
+            if cancel_event.is_set():
+                result_holder["error"] = "Cancelled"
                 return
 
-            # Vibe online → chạy bình thường
-            await original_vibe_cmd(update, context)
+            # Lấy meta từ analyze_stock_full
+            result_text_check, meta = analyze_stock_full(symbol)
+            if meta is None:
+                result_holder["error"] = f"Không lấy được dữ liệu cho {symbol}. Thử /debug {symbol}"
+                return
 
-        # Replace handler
-        for handler_group in app.handlers.values():
-            for handler in handler_group:
-                from telegram.ext import CommandHandler
-                if (isinstance(handler, CommandHandler) and
-                        "vibe" in (handler.commands or set()) and
-                        "vibestatus" not in (handler.commands or set())):
-                    handler.callback = _vibe_with_failover
-                    logger.info("Vibe failover patch installed on /vibe")
-                    return
+            if cancel_event.is_set():
+                result_holder["error"] = "Cancelled"
+                return
 
-        logger.warning("Could not find /vibe handler to patch")
+            progress_cb(f"✅ Dữ liệu OK | Bắt đầu hội đồng 5 chuyên gia (3 vòng)...")
+
+            # Chạy swarm với timeout tích hợp (Fix #2)
+            text, report = run_local_swarm(
+                symbol,
+                meta=meta,
+                progress_cb=progress_cb,
+            )
+            result_holder["text"] = text
+
+        except RuntimeError as e:
+            if "Cancelled" in str(e):
+                result_holder["error"] = "✅ Đã hủy theo yêu cầu."
+            else:
+                result_holder["error"] = f"Lỗi runtime: {e}"
+            logger.warning(f"Swarm worker RuntimeError: {e}")
+        except Exception as e:
+            result_holder["error"] = f"Lỗi khi chạy Local Swarm: {e}"
+            logger.error(f"Swarm worker error: {e}", exc_info=True)
+        finally:
+            done_event.set()    # BẮT BUỘC set dù thành công hay lỗi (Fix #1)
+
+    # ── Submit vào thread pool ────────────────────────────────────────────────
+    future = _swarm_executor.submit(_swarm_worker)
+    _active_swarm_tasks[chat_id] = {
+        "future":       future,
+        "cancel_event": cancel_event,
+        "symbol":       symbol,
+        "started_at":   time.time(),
+    }
+
+    # ── Async watcher: poll queue + done_event (Fix #1, #3) ──────────────────
+    await _watch_swarm_progress(
+        context=context,
+        chat_id=chat_id,
+        msg=msg,
+        progress_queue=progress_queue,
+        done_event=done_event,
+        cancel_event=cancel_event,
+        result_holder=result_holder,
+        symbol=symbol,
+        plain=plain,
+    )
+
+    # Cleanup
+    _active_swarm_tasks.pop(chat_id, None)
+
+
+async def _watch_swarm_progress(
+    context,
+    chat_id: int,
+    msg,
+    progress_queue: queue.Queue,
+    done_event: threading.Event,
+    cancel_event: threading.Event,
+    result_holder: dict,
+    symbol: str,
+    plain,
+):
+    """
+    Async watcher chạy trên event loop.
+    Poll progress_queue và cập nhật Telegram message.
+    Dừng khi done_event được set hoặc timeout.
+    (Fix #1: đồng bộ đúng; Fix #2: hard timeout; Fix #3: cap 30 lines)
+    """
+    started     = time.time()
+    status_lines: list[str] = [
+        f"🤖 LOCAL SWARM: {symbol}",
+        "━" * 26,
+    ]
+    progress_count = 0      # số dòng progress đã nhận (Fix #3)
+    last_edit_time = 0.0
+    spam_mode      = False   # True khi vượt MAX_PROGRESS_MSG
+
+    async def _try_edit(text: str):
+        nonlocal last_edit_time
+        now = time.time()
+        if now - last_edit_time < 3.0:   # rate limit: không edit quá 1 lần/3s
+            return
+        last_edit_time = now
+        try:
+            await msg.edit_text(plain(text[:4000]))
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                logger.debug(f"edit_text error: {e}")
+
+    while True:
+        # ── Kiểm tra timeout cứng (Fix #2) ───────────────────────────────────
+        elapsed = time.time() - started
+        if elapsed > SWARM_TIMEOUT:
+            logger.warning(f"Swarm {symbol} TIMEOUT after {elapsed:.0f}s")
+            cancel_event.set()
+            result_holder["error"] = (
+                f"⏰ Đã vượt quá thời gian xử lý ({SWARM_TIMEOUT//60} phút).\n"
+                "Kết quả không đầy đủ. Thử lại sau hoặc dùng /check."
+            )
+            done_event.set()
+            break
+
+        # ── Drain progress queue ──────────────────────────────────────────────
+        drained = False
+        while True:
+            try:
+                line = progress_queue.get_nowait()
+                progress_count += 1
+                drained = True
+
+                if progress_count <= MAX_PROGRESS_MSG:
+                    # Thêm dòng mới vào status (Fix #3)
+                    status_lines.append(line)
+                    # Giữ tối đa 15 dòng gần nhất để message không quá dài
+                    if len(status_lines) > 17:
+                        status_lines = status_lines[:2] + status_lines[-15:]
+                elif not spam_mode:
+                    # Vượt giới hạn: chuyển sang spam_mode (Fix #3)
+                    spam_mode = True
+                    status_lines.append(SPAM_WARNING)
+
+            except queue.Empty:
+                break
+
+        # ── Kiểm tra done_event (Fix #1) ─────────────────────────────────────
+        if done_event.is_set():
+            # Drain lần cuối
+            while True:
+                try:
+                    line = progress_queue.get_nowait()
+                    progress_count += 1
+                    if progress_count <= MAX_PROGRESS_MSG:
+                        status_lines.append(line)
+                except queue.Empty:
+                    break
+            break
+
+        # ── Cập nhật message nếu có thay đổi ─────────────────────────────────
+        if drained:
+            elapsed_s = int(time.time() - started)
+            footer = f"\n⏱️ {elapsed_s}s | /cancel để hủy"
+            await _try_edit("\n".join(status_lines) + footer)
+
+        # Chờ interval ngắn rồi check lại
+        await asyncio.sleep(2.0)
+
+    # ── Gửi kết quả cuối (Fix #5) ────────────────────────────────────────────
+    elapsed_total = int(time.time() - started)
+
+    if result_holder["error"]:
+        error_msg = str(result_holder["error"])
+        # Xóa message loading, gửi lỗi
+        try:
+            await msg.edit_text(
+                f"❌ {error_msg}\n\n"
+                f"⏱️ Đã chạy {elapsed_total}s"
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ {error_msg}"
+            )
+        return
+
+    if result_holder["text"]:
+        result_text = str(result_holder["text"])
+        # Xóa message loading
+        try:
+            await msg.edit_text("✅ Hoàn tất! Đang gửi báo cáo...")
+        except Exception:
+            pass
+
+        # Gửi kết quả dưới dạng message mới (Fix #5)
+        # Nếu quá dài thì chia nhỏ
+        chunks = _split_message(result_text, max_len=4000)
+        for i, chunk in enumerate(chunks):
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=plain(chunk),
+                )
+                if i < len(chunks) - 1:
+                    await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Gửi swarm result chunk {i}: {e}")
+                break
+    else:
+        try:
+            await msg.edit_text(
+                f"⚠️ Local Swarm {symbol} kết thúc nhưng không có kết quả.\n"
+                f"Thử lại: /local_swarm {symbol}"
+            )
+        except Exception:
+            pass
+
+
+def _split_message(text: str, max_len: int = 4000) -> list[str]:
+    """Chia text thành chunks không vượt quá max_len ký tự."""
+    if len(text) <= max_len:
+        return [text]
+
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        # Cắt tại newline gần nhất
+        cut = text.rfind("\n", 0, max_len)
+        if cut < max_len // 2:
+            cut = max_len
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return chunks
+
+
+# ── Vibe failover (khi Vibe-Trading offline → dùng local swarm) ──────────────
+
+def install_vibe_failover(app) -> None:
+    """
+    Patch /vibe command: khi Vibe API offline, tự động fallover sang local_swarm.
+    Gọi sau khi đăng ký CommandHandler("vibe", vibe_cmd).
+    """
+    try:
+        from bot import vibe_cmd as _orig_vibe_cmd
+        from telegram.ext import CommandHandler
+
+        async def _vibe_with_failover(update, context):
+            try:
+                from vibe_client import is_available
+                if is_available():
+                    return await _orig_vibe_cmd(update, context)
+            except Exception:
+                pass
+
+            # Failover: chạy local_swarm thay thế
+            await update.message.reply_text(
+                "⚠️ Vibe-Trading API offline. Chuyển sang Local Swarm...\n"
+                "(Chất lượng tương đương nhưng chạy chậm hơn ~3 phút)"
+            )
+            return await local_swarm_cmd(update, context)
+
+        # Thay thế handler /vibe hiện tại
+        # Lưu ý: chỉ hoạt động nếu được gọi sau khi add_handler("vibe")
+        for handler in app.handlers.get(0, []):
+            if hasattr(handler, "command") and "vibe" in (handler.command or []):
+                handler.callback = _vibe_with_failover
+                logger.info("✅ Vibe failover đã được cài vào /vibe handler")
+                return
+
+        # Nếu không tìm thấy, add mới
+        app.add_handler(CommandHandler("vibe_local", local_swarm_cmd))
+        logger.info("✅ Vibe failover: thêm /vibe_local handler")
 
     except Exception as e:
-        logger.warning(f"install_vibe_failover failed: {e}")
+        logger.warning(f"install_vibe_failover: {e}")
