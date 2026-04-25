@@ -29,3 +29,7 @@ pyharmonics>=1.4.0     # HarmonicEngine: XABCD pyharmonics (full mode, fallback 
 
 # Financial data (FundamentalFilterEngine fallback)
 yfinance>=0.2.0        # Fallback cuối cho fundamental data (.VN suffix)
+
+matplotlib>=3.7.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
