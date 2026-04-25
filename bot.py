@@ -27,6 +27,15 @@ try:
 except ImportError:
     _VIBE_CLIENT = False
 
+import pathlib
+from datetime import datetime
+
+try:
+    from api_server import start_api_server
+    _API_SERVER = True
+except ImportError:
+    _API_SERVER = False
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -190,6 +199,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/alerts        — Xem canh bao dang hoat dong\n"
         "/status        — Kiem tra trang thai bot & API & DB\n"
         "/debug <MA>    — Debug tung data source\n"
+        "/backtest <MA> [strategy] — Backtest chien luoc giao dich\n"
         "/help          — Huong dan chi tiet\n"
         "/start         — Hien thi menu nay"
     )
@@ -221,6 +231,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/history <MA>  — Lich su signal: /history VCB\n"
         "/alert STB 68000 — Dat canh bao khi STB vuot 68,000\n"
         "/alerts         — Xem danh sach canh bao\n"
+        "/backtest <MA> [strategy] [ngay]\n"
+        "Backtest chien luoc tren du lieu lich su:\n"
+        "  strategy: ma_cross (mac dinh), rsi, bb, macd, momentum\n"
+        "  Vi du: /backtest VCB rsi 365\n\n"
         "/watchlist     — Xem danh sach ma theo doi\n"
         "/add <MA>      — Them ma (toi da 20)\n"
         "/remove <MA>   — Xoa ma\n"
@@ -722,6 +736,294 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"Loi khi lay history {symbol}: {str(e)[:200]}")
 
 
+# ── /backtest ─────────────────────────────────────────────────────────────────
+# Backtest preset strategies trên dữ liệu OHLCV VN lấy từ Entrade/Fireant.
+# Chạy background (không block bot). Kết quả: text metrics + ảnh equity curve.
+# ─────────────────────────────────────────────────────────────────────────────
+
+BACKTEST_COOLDOWN = 120           # 2 phút cooldown per user
+_last_backtest: dict[str, float] = {}
+
+
+def _get_strategy_code(strategy: str) -> str:
+    """Trả về source code signal_engine.py cho từng strategy preset."""
+    _codes = {
+        "ma_cross": '''"""MA20/MA50 Golden Cross."""
+import pandas as pd
+
+def generate_signals(df):
+    close = df["close"]
+    ma20  = close.rolling(20).mean()
+    ma50  = close.rolling(50).mean()
+    pos   = (ma20 > ma50).astype(int) * 2 - 1
+    cross = pos.diff().fillna(0)
+    sig   = __import__("pandas").Series(0, index=df.index)
+    sig[cross > 0] =  1
+    sig[cross < 0] = -1
+    return sig
+''',
+        "rsi": '''"""RSI(14) Reversal."""
+import pandas as pd
+
+def _rsi(close, p=14):
+    d = close.diff()
+    g = d.clip(lower=0).rolling(p).mean()
+    l = (-d.clip(upper=0)).rolling(p).mean()
+    return 100 - 100/(1 + g/l.replace(0,1e-9))
+
+def generate_signals(df):
+    rsi = _rsi(df["close"])
+    sig = pd.Series(0, index=df.index)
+    sig[(rsi>30)&(rsi.shift(1)<=30)] =  1
+    sig[(rsi<70)&(rsi.shift(1)>=70)] = -1
+    return sig
+''',
+        "bb": '''"""Bollinger Bands Mean Reversion."""
+import pandas as pd
+
+def generate_signals(df):
+    c=df["close"]; ma=c.rolling(20).mean(); std=c.rolling(20).std()
+    upper=ma+2*std; lower=ma-2*std
+    sig=pd.Series(0,index=df.index)
+    sig[(c>lower)&(c.shift(1)<=lower.shift(1))] =  1
+    sig[(c<upper)&(c.shift(1)>=upper.shift(1))] = -1
+    return sig
+''',
+        "macd": '''"""MACD(12,26,9) Crossover."""
+import pandas as pd
+
+def generate_signals(df):
+    c=df["close"]
+    macd=(c.ewm(span=12,adjust=False).mean()-c.ewm(span=26,adjust=False).mean())
+    sig_line=macd.ewm(span=9,adjust=False).mean()
+    cross=macd-sig_line
+    sig=pd.Series(0,index=df.index)
+    sig[(cross>0)&(cross.shift(1)<=0)] =  1
+    sig[(cross<0)&(cross.shift(1)>=0)] = -1
+    return sig
+''',
+        "momentum": '''"""Price Momentum 20D."""
+import pandas as pd
+
+def generate_signals(df):
+    ret=df["close"].pct_change(20)
+    vol=ret.rolling(20).std()
+    mom=ret/vol.replace(0,1e-9)
+    sig=pd.Series(0,index=df.index)
+    sig[(mom>0.5)&(mom.diff()>0)] =  1
+    sig[(mom<-0.5)&(mom.diff()<0)] = -1
+    return sig
+''',
+    }
+    return _codes.get(strategy, _codes["ma_cross"])
+
+
+def _build_backtest_summary(metrics: dict, symbol: str, strategy: str, days: int, n_trades: int) -> str:
+    """Text tóm tắt kết quả backtest gửi Telegram."""
+    ret  = metrics.get("total_return_pct", 0)
+    cagr = metrics.get("cagr_pct", 0)
+    sh   = metrics.get("sharpe_ratio", 0)
+    mdd  = metrics.get("max_drawdown_pct", 0)
+    wr   = metrics.get("win_rate_pct", 0)
+    pf   = metrics.get("profit_factor", 0)
+    vol  = metrics.get("volatility_ann_pct", 0)
+    cal  = metrics.get("calmar_ratio", 0)
+    cap  = metrics.get("initial_capital_vnd", 100_000_000)
+    fin  = metrics.get("final_equity_vnd", cap)
+    aw   = metrics.get("avg_win_pct", 0)
+    al   = metrics.get("avg_loss_pct", 0)
+    pnl  = fin - cap
+
+    grade = "A" if sh > 1.5 and mdd > -20 else "B" if sh > 0.8 else "C" if sh > 0 else "D"
+    em_r  = "🟢" if ret > 0 else "🔴"
+
+    return "\n".join([
+        f"BACKTEST: {symbol} | {strategy.upper()} | {days}D",
+        "═" * 36,
+        f"Xep hang  : [{grade}]",
+        "",
+        "HIEU SUAT:",
+        f"  Loi nhuan : {em_r} {ret:+.2f}%  ({pnl:+,.0f} VND)",
+        f"  CAGR/nam  : {cagr:+.2f}%",
+        f"  Sharpe    : {sh:.3f}",
+        f"  Calmar    : {cal:.3f}",
+        f"  Vol/nam   : {vol:.1f}%",
+        "",
+        "RUI RO:",
+        f"  Max DD    : {mdd:.2f}%",
+        "",
+        "LENH GIAO DICH:",
+        f"  So lenh   : {n_trades}",
+        f"  Win Rate  : {wr:.1f}%",
+        f"  TB thang  : {aw:+.2f}%",
+        f"  TB thua   : {al:+.2f}%",
+        f"  ProfitFac : {pf:.2f}",
+        "",
+        f"Von ban dau: {cap:,.0f} VND",
+        f"Von cuoi   : {fin:,.0f} VND",
+        "═" * 36,
+        "Bieu do equity curve da duoc gui kem.",
+    ])
+
+
+async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /backtest <MA> [strategy] [ngay]
+
+    Strategy: ma_cross (mac dinh), rsi, bb, macd, momentum
+    Vi du:
+      /backtest VCB
+      /backtest HPG rsi 500
+      /backtest FPT macd 365
+    """
+    if not is_allowed(update):
+        await _deny(update); return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "BACKTEST — Kiem tra hieu qua chien luoc\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Cu phap: /backtest <MA> [strategy] [so_ngay]\n\n"
+            "Strategy co san:\n"
+            "  ma_cross  — MA20/MA50 crossover (mac dinh)\n"
+            "  rsi       — RSI 30/70 reversal\n"
+            "  bb        — Bollinger Bands reversion\n"
+            "  macd      — MACD(12,26,9) crossover\n"
+            "  momentum  — Price momentum 20 ngay\n\n"
+            "Vi du:\n"
+            "  /backtest VCB\n"
+            "  /backtest HPG rsi 365\n"
+            "  /backtest FPT macd 500\n\n"
+            "Von mac dinh: 100,000,000 VND | Phi: 0.15%"
+        )
+        return
+
+    valid, symbol = _validate_symbol(args[0])
+    if not valid:
+        await update.message.reply_text("Ma khong hop le (VD: VCB, HPG)."); return
+
+    strategy = args[1].lower() if len(args) > 1 else "ma_cross"
+    try:
+        days = max(100, min(int(args[2]), 1500)) if len(args) > 2 else 365
+    except (ValueError, IndexError):
+        days = 365
+
+    valid_strategies = {"ma_cross", "rsi", "bb", "macd", "momentum"}
+    if strategy not in valid_strategies:
+        await update.message.reply_text(
+            f"Strategy '{strategy}' khong hop le.\n"
+            f"Chon: {', '.join(sorted(valid_strategies))}"
+        ); return
+
+    user_id = str(update.effective_user.id) if update.effective_user else "unknown"
+    elapsed_since = time.time() - _last_backtest.get(user_id, 0)
+    if elapsed_since < BACKTEST_COOLDOWN:
+        wait = int(BACKTEST_COOLDOWN - elapsed_since)
+        await update.message.reply_text(f"Vui long cho {wait}s truoc khi /backtest tiep."); return
+    _last_backtest[user_id] = time.time()
+
+    chat_id = update.effective_chat.id
+    msg = await update.message.reply_text(
+        f"Dang chay backtest: {symbol} ({strategy}, {days} ngay)...\n"
+        f"Co the mat 30-90 giay."
+    )
+
+    async def _run_bt_bg():
+        import tempfile, json as _json, shutil
+
+        try:
+            signal_code = _get_strategy_code(strategy)
+
+            with tempfile.TemporaryDirectory(prefix="vn_bt_") as tmpdir:
+                run_path = pathlib.Path(tmpdir)
+                (run_path / "code").mkdir()
+
+                config = {
+                    "source": "entrade", "symbol": symbol,
+                    "days": days, "initial_capital": 100_000_000,
+                    "commission_pct": 0.0015, "slippage_pct": 0.001,
+                    "position_size": 1.0, "allow_short": False,
+                }
+                (run_path / "config.json").write_text(
+                    _json.dumps(config, ensure_ascii=False), encoding="utf-8"
+                )
+                (run_path / "code" / "signal_engine.py").write_text(
+                    signal_code, encoding="utf-8"
+                )
+
+                from backtest_engine import run_vn_backtest
+                result = await asyncio.to_thread(run_vn_backtest, str(run_path))
+
+                if result["status"] == "error":
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id, message_id=msg.message_id,
+                        text=f"Backtest that bai: {symbol}\n{result.get('error','')[:200]}"
+                    )
+                    return
+
+                # Copy chart ra persistent dir trước khi tmpdir bị xoá
+                chart_src = result.get("chart_path", "")
+                chart_dest = ""
+                if chart_src and pathlib.Path(chart_src).exists():
+                    out_dir = pathlib.Path("backtest_charts")
+                    out_dir.mkdir(exist_ok=True)
+                    chart_dest = str(out_dir / f"{symbol}_{strategy}_{int(time.time())}.png")
+                    shutil.copy(chart_src, chart_dest)
+
+                # Gửi text metrics
+                metrics  = result.get("metrics", {})
+                n_trades = result.get("n_trades", 0)
+                summary  = _build_backtest_summary(metrics, symbol, strategy, days, n_trades)
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg.message_id,
+                    text=plain(summary)[:4096]
+                )
+
+                # Gửi chart ảnh
+                if chart_dest and pathlib.Path(chart_dest).exists():
+                    caption = (
+                        f"Equity Curve: {symbol} | {strategy.upper()} | {days}D\n"
+                        f"Return: {metrics.get('total_return_pct',0):+.1f}% | "
+                        f"Sharpe: {metrics.get('sharpe_ratio',0):.2f} | "
+                        f"MaxDD: {metrics.get('max_drawdown_pct',0):.1f}%"
+                    )
+                    try:
+                        with open(chart_dest, "rb") as f:
+                            await context.bot.send_photo(
+                                chat_id=chat_id, photo=f,
+                                caption=plain(caption)
+                            )
+                    except Exception as pe:
+                        logger.warning(f"Khong gui duoc chart: {pe}")
+                    finally:
+                        pathlib.Path(chart_dest).unlink(missing_ok=True)
+
+                # Gửi 5 lệnh gần nhất
+                trades = [t for t in result.get("trades", []) if t.get("type") == "SELL"][-5:]
+                if trades:
+                    lines = ["5 LENH BAN GAN NHAT:"]
+                    for t in trades:
+                        em = "✅" if t.get("pnl_vnd", 0) > 0 else "❌"
+                        lines.append(
+                            f"{em} {t['date']} | Gia: {t['price']:,.0f} | "
+                            f"PnL: {t.get('pnl_pct', 0):+.2f}%"
+                        )
+                    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+
+        except Exception as e:
+            logger.error(f"backtest_cmd bg error: {e}")
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg.message_id,
+                    text=f"Loi backtest {symbol}: {str(e)[:200]}"
+                )
+            except Exception:
+                pass
+
+    asyncio.create_task(_run_bt_bg())
+
+
 # ── Cron job 18:00 mỗi ngày ──────────────────────────────────────────────────
 async def _start_cron():
     while True:
@@ -1101,6 +1403,7 @@ def main():
     app.add_handler(CommandHandler("vibestatus",   vibe_status_cmd))
     app.add_handler(CommandHandler("vibetest",     vibetest_cmd))
     app.add_handler(CommandHandler("deepscan",    deepscan_cmd))
+    app.add_handler(CommandHandler("backtest",    backtest_cmd))
     if _ALERT_AVAILABLE:
         app.add_handler(CommandHandler("alert",    alert_cmd))
         app.add_handler(CommandHandler("alerts",   alerts_cmd))
@@ -1110,6 +1413,10 @@ def main():
         asyncio.create_task(_start_cron())
         if _ALERT_AVAILABLE:
             asyncio.create_task(_start_alert_cron(application))
+        if _API_SERVER:
+            import threading
+            threading.Thread(target=start_api_server, daemon=True).start()
+            logger.info("API server started (port 8080)")
 
     app.post_init = post_init
 
