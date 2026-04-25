@@ -41,6 +41,19 @@ except ImportError:
     logger.warning("local_swarm_cmd.py chua co — /local_swarm bi tat")
 
 try:
+    from backtest_rule_cmd import backtest_rule_cmd
+    _BACKTEST_RULE = True
+except Exception as _e:
+    _BACKTEST_RULE = False
+    logger.warning(f"backtest_rule_cmd.py chua co hoac loi — /backtest_rule bi tat: {_e}")
+
+try:
+    from vn_loader import debug_sources as _vn_debug_sources
+    _VN_LOADER_DEBUG = True
+except Exception:
+    _VN_LOADER_DEBUG = False
+
+try:
     from vibe_client import (
         is_available as vibe_available,
         start_swarm, poll_swarm, format_swarm_result,
@@ -427,6 +440,42 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     result = "\n".join(lines)
     await _edit_or_split(msg, update.message, result)
+
+
+# ── /debug_loader <MA> ────────────────────────────────────────────────────────
+async def debug_loader_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kiểm tra từng source trong vn_loader waterfall."""
+    if not is_allowed(update): await _deny(update); return
+    if not context.args:
+        await update.message.reply_text("Dung: /debug_loader VCB"); return
+
+    valid, symbol = _validate_symbol(context.args[0])
+    if not valid:
+        await update.message.reply_text("Ma khong hop le."); return
+
+    if not _VN_LOADER_DEBUG:
+        await update.message.reply_text(
+            "vn_loader.debug_sources chua co. "
+            "Dung /debug de kiem tra data sources."
+        )
+        return
+
+    msg = await update.message.reply_text(f"Dang kiem tra vn_loader sources cho {symbol}... (~30s)")
+    try:
+        report = await asyncio.to_thread(_vn_debug_sources, symbol, 100)
+        lines  = [f"=== DEBUG LOADER {symbol} ==="]
+        if isinstance(report, dict):
+            for src, info in report.items():
+                ok    = info.get("ok", False)
+                bars  = f" | {info.get('bars',0)} bars" if ok else ""
+                t     = f" ({info.get('time',0):.1f}s)" if "time" in info else ""
+                err   = f": {info.get('error','')[:60]}" if not ok else ""
+                lines.append(f"  {'✅' if ok else '❌'} {src}{bars}{t}{err}")
+        else:
+            lines.append(str(report)[:1000])
+        await _edit_or_split(msg, update.message, "\n".join(lines))
+    except Exception as e:
+        await msg.edit_text(f"Loi debug_loader: {e}")
 
 
 # ── /check ────────────────────────────────────────────────────────────────────
@@ -1175,6 +1224,7 @@ def main():
     app.add_handler(CommandHandler("remove",       remove_cmd))
     app.add_handler(CommandHandler("status",       status_cmd))
     app.add_handler(CommandHandler("debug",        debug_cmd))
+    app.add_handler(CommandHandler("debug_loader", debug_loader_cmd))
     app.add_handler(CommandHandler("check",        check_cmd))
     app.add_handler(CommandHandler("scan",         scan_cmd))
     app.add_handler(CommandHandler("report",       report_cmd))
@@ -1182,10 +1232,12 @@ def main():
     app.add_handler(CommandHandler("vibe",         vibe_cmd))
     app.add_handler(CommandHandler("vibestatus",   vibe_status_cmd))
     app.add_handler(CommandHandler("vibetest",     vibetest_cmd))
-    app.add_handler(CommandHandler("deepscan",    deepscan_cmd))
+    app.add_handler(CommandHandler("deepscan",     deepscan_cmd))
     if _LOCAL_SWARM:
-        app.add_handler(CommandHandler("local_swarm", local_swarm_cmd))
-        install_vibe_failover(app)   # failover khi Vibe offline
+        app.add_handler(CommandHandler("local_swarm",   local_swarm_cmd))
+        install_vibe_failover(app)
+    if _BACKTEST_RULE:
+        app.add_handler(CommandHandler("backtest_rule", backtest_rule_cmd))
     if _ALERT_AVAILABLE:
         app.add_handler(CommandHandler("alert",    alert_cmd))
         app.add_handler(CommandHandler("alerts",   alerts_cmd))

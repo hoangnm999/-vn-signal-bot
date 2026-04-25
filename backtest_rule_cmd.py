@@ -285,8 +285,23 @@ def _run_rule_backtest_sync(
         "days":             days,
     }
 
-    # 1. Load data
+    # 1. Load data — thử vn_loader trước, fallback sang analyzer.get_price_data
     df = load_vn_ohlcv(symbol, days=days)
+    if df is None or (hasattr(df, '__len__') and len(df) < 30):
+        try:
+            from analyzer import get_price_data
+            result = get_price_data(symbol, days=min(days, 500))
+            if isinstance(result, dict) and result.get("success"):
+                df = result["df"]
+                logger.info(f"backtest: fallback sang analyzer.get_price_data cho {symbol}")
+        except Exception as _fe:
+            logger.warning(f"backtest fallback get_price_data fail: {_fe}")
+    if df is None or len(df) < 30:
+        return {
+            "status": "error",
+            "error":  f"Khong du du lieu cho {symbol} (can toi thieu 30 bars). "
+                      f"Thu /debug {symbol} de kiem tra data sources."
+        }
 
     # 2. Parse & compile rules → signals
     signals, entry_ec, exit_ec, ctx = generate_rule_signals(df, entry_rule, exit_rule)
@@ -574,7 +589,8 @@ async def backtest_rule_cmd(update, context):
     from telegram.ext import ContextTypes
 
     try:
-        from bot import is_allowed, _deny, plain
+        from bot import is_allowed, _deny
+        plain = _plain   # dùng local _plain thay vì import từ bot (tránh circular)
     except ImportError:
         def is_allowed(_): return True
         async def _deny(_): pass
