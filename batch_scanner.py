@@ -126,7 +126,7 @@ def _scan_one_symbol(symbol: str) -> dict:
         from guardrails import MAX_CHECK_AGE_HOURS
         if check_age_hours is None or check_age_hours > MAX_CHECK_AGE_HOURS:
             try:
-                logger.info(f"[{symbol}] /check cũ ({check_age_hours:.0f}h) → refresh")
+                logger.info(f"[{symbol}] /check cũ ({check_age_hours:.0f}h → refresh)" if check_age_hours is not None else f"[{symbol}] /check chưa có → chạy mới")
                 from analyzer import analyze_stock_full
                 analyze_stock_full(symbol)
                 check_age_hours = 0.1   # vừa refresh
@@ -156,37 +156,67 @@ def _scan_one_symbol(symbol: str) -> dict:
         except Exception as _ce:
             logger.warning(f"[{symbol}] cache check fail: {_ce}")
 
-        # ── 5. Load state vector từ DB (dùng /check result gần nhất) ─────
+        # ── 5. Load state vector ─────────────────────────────────────────
+        # Ưu tiên: load_auto_context (hàm chính thống) → DB query → compute trực tiếp
         state_vec = None
-        try:
-            from db import get_conn
-            with get_conn() as conn:
-                row = conn.execute(
-                    "SELECT state_vector FROM signals "
-                    "WHERE symbol=? ORDER BY created_at DESC LIMIT 1",
-                    (symbol,)
-                ).fetchone()
-                if row and row[0]:
-                    import json as _json
-                    sv = row[0]
-                    state_vec = _json.loads(sv) if isinstance(sv, str) else sv
-        except Exception as _sve:
-            logger.debug(f"[{symbol}] state_vec load fail: {_sve}")
+        sv_source = "none"
 
+        # 5a. Thử load_auto_context — dùng cùng logic với backtest_rule
+        try:
+            from auto_context import load_auto_context
+            ctx = load_auto_context(symbol)
+            if ctx and ctx.get("found") and ctx.get("state_vector"):
+                state_vec = ctx["state_vector"]
+                sv_source = "auto_context"
+                logger.info(f"[{symbol}] state_vec from auto_context OK")
+        except Exception as _ace:
+            logger.debug(f"[{symbol}] auto_context fail: {_ace}")
+
+        # 5b. Fallback: query DB trực tiếp (thử nhiều column names)
         if state_vec is None:
-            # Fallback: tính vector từ OHLCV trực tiếp
+            try:
+                import json as _json
+                from db import get_conn
+                with get_conn() as conn:
+                    # Thử column "state_vector" trước, sau đó "state_vec"
+                    for col in ("state_vector", "state_vec", "vector_json"):
+                        try:
+                            row = conn.execute(
+                                f"SELECT {col} FROM signals "
+                                f"WHERE symbol=? AND {col} IS NOT NULL "
+                                f"ORDER BY created_at DESC LIMIT 1",
+                                (symbol,)
+                            ).fetchone()
+                            if row and row[0]:
+                                sv = row[0]
+                                state_vec = _json.loads(sv) if isinstance(sv, str) else sv
+                                sv_source = f"db.{col}"
+                                logger.info(f"[{symbol}] state_vec from {sv_source}")
+                                break
+                        except Exception:
+                            continue
+            except Exception as _dbe:
+                logger.warning(f"[{symbol}] db state_vec fail: {_dbe}")
+
+        # 5c. Fallback cuối: tính vector từ OHLCV trực tiếp
+        if state_vec is None:
             try:
                 from state_vector import compute_state_vector_from_df
                 from vn_loader import load_vn_ohlcv
                 df_sv     = load_vn_ohlcv(symbol, days=120, min_bars=60)
                 state_vec = compute_state_vector_from_df(df_sv) if df_sv is not None else None
+                if state_vec:
+                    sv_source = "computed_direct"
+                    logger.info(f"[{symbol}] state_vec computed directly")
             except Exception as _fbe:
-                logger.warning(f"[{symbol}] fallback vector fail: {_fbe}")
+                logger.warning(f"[{symbol}] compute state_vec fail: {_fbe}")
 
         if state_vec is None:
+            reason = f"Không lấy được state vector (tried: auto_context, db, compute)"
+            logger.warning(f"[{symbol}] REJECT: {reason}")
             result_base.update({
                 "gate": "REJECT", "elapsed": round(time.time() - t0, 1),
-                "reason": "Không tính được state vector",
+                "reason": reason,
             })
             return result_base
 
@@ -205,9 +235,11 @@ def _scan_one_symbol(symbol: str) -> dict:
             logger.warning(f"[{symbol}] find_similar fail: {_fe}")
 
         if not analogs:
+            reason = f"find_similar trả về None (cache_days={cache_days}, sv_source={sv_source})"
+            logger.warning(f"[{symbol}] REJECT: {reason}")
             result_base.update({
                 "gate": "REJECT", "elapsed": round(time.time() - t0, 1),
-                "reason": "Không tìm được ngày tương đồng",
+                "reason": reason,
             })
             return result_base
 
@@ -431,8 +463,12 @@ def format_scan_report(scan_result: dict) -> list[str]:
     if partial:
         footer_lines.append("⚠️ Kết quả chưa đầy đủ — một số mã bị timeout.")
     if rejected:
-        syms = ", ".join(r["symbol"] for r in rejected[:8])
-        footer_lines.append(f"⏭️ Bỏ qua ({len(rejected)} mã): {syms}")
+        footer_lines.append(f"⏭️ Bị loại ({len(rejected)} mã):")
+        for r in rejected[:6]:
+            reason = r.get("reason", "unknown")[:60]
+            footer_lines.append(f"  • {r['symbol']}: {reason}")
+        if len(rejected) > 6:
+            footer_lines.append(f"  ... và {len(rejected)-6} mã khác")
     if errors:
         footer_lines.append(f"❌ Lỗi: {'; '.join(errors[:3])}")
 
