@@ -67,36 +67,18 @@ def _price_in_band(p: float, ref: float, band: float = PRICE_BAND_PCT) -> bool:
     return abs(p - ref) / ref <= band
 
 
-# Band riêng cho engine detail — chặt hơn PRICE_BAND_PCT (30%)
-# Lý do: engine detail chứa giá lịch sử, giá mã khác có thể trong ±30%
-# nhưng vẫn gây nhiễu cho LLM (ví dụ: DVP=74, giá 55/63/88 trong ±30%)
-DETAIL_BAND_PCT = 0.10   # ±10% — chỉ giá sát hiện tại mới được truyền
-
-
 def _sanitize_engine_detail(detail: str, ref_price: float) -> str:
     """
-    Quét text engine detail, xóa/thay thế các số trông như giá cổ phiếu
-    nhưng nằm ngoài ±10% ref_price.
-
-    Thay bằng [DL_KHONG_HOP_LE] — chuỗi không có số → LLM không thể
-    trích xuất giá từ đó, buộc phải ghi "không đủ dữ liệu".
-
-    Ngưỡng nhận diện giá: số >= ref_price * 0.50
-    (tránh nhầm RSI 50-70, MACD 0.003, volume ratio 1.5)
+    Quét text engine detail, đánh dấu các số trông như giá cổ phiếu
+    nhưng nằm ngoài ±30% ref_price bằng [~xxx] để LLM không dùng nhầm.
+    Chỉ xử lý số >= ref_price * 0.30 (tránh nhầm với %, RSI, v.v.)
     """
     if ref_price <= 0 or not detail:
         return detail
 
-    lo        = ref_price * (1 - DETAIL_BAND_PCT)
-    hi        = ref_price * (1 + DETAIL_BAND_PCT)
-    threshold = ref_price * 0.50   # dưới ngưỡng này → chỉ báo, không phải giá
-
-    # Keyword chỉ báo — số ngay sau các từ này không phải giá cổ phiếu
-    _IND_PAT = re.compile(
-        r"(?:rsi|macd|cci|adx|atr|stoch|bb|ema|sma|ma|volume|vol|hist|"
-        r"signal|ratio|score|pct|percent|r:r|rr|tp|sl|conf)\s*[=:>\s]?\s*$",
-        re.IGNORECASE,
-    )
+    lo        = ref_price * (1 - PRICE_BAND_PCT)
+    hi        = ref_price * (1 + PRICE_BAND_PCT)
+    threshold = ref_price * 0.30
 
     def _replace(m: re.Match) -> str:
         raw = m.group(0)
@@ -105,14 +87,10 @@ def _sanitize_engine_detail(detail: str, ref_price: float) -> str:
         except ValueError:
             return raw
         if val < threshold:
-            return raw                      # quá nhỏ → chỉ báo/%, giữ nguyên
-        # Kiểm tra context trước số — nếu là indicator keyword thì giữ nguyên
-        before = detail[:m.start()].rstrip()
-        if _IND_PAT.search(before):
-            return raw                      # RSI=62, MACD=0.003... → giữ nguyên
+            return raw           # quá nhỏ → không phải giá → giữ nguyên
         if lo <= val <= hi:
-            return raw                      # trong ±10% → hợp lệ
-        return "[DL_KHONG_HOP_LE]"         # ngoài biên → xóa số
+            return raw           # trong biên → giữ nguyên
+        return f"[~{val:,.0f}]"  # ngoài biên → đánh dấu
 
     return re.sub(r"[\d,]+(?:\.\d+)?", _replace, detail)
 
@@ -684,13 +662,9 @@ def _build_data_block(td: dict) -> str:
 
 def _get_skill_block(expert: dict, td: dict) -> str:
     """
-    Trích skill details theo từng chuyên gia.
-    - Sau khi _sanitize_engine_detail chạy, detail có thể chứa [DL_KHONG_HOP_LE]
-    - Nếu detail chứa quá nhiều placeholder → thay bằng thông báo rõ ràng
-      thay vì truyền noise vào prompt LLM
-    - Nếu engine không có detail → ghi rõ để LLM không tự bịa
+    Trích skill details theo từng chuyên gia — đầy đủ, có label rõ ràng.
+    Nếu engine không có detail → ghi rõ 'không có dữ liệu'.
     """
-    price = td["price"]
     lines = []
     for sk in expert["skill_keys"]:
         detail = td["engine_details"].get(sk, "").strip()
@@ -698,38 +672,10 @@ def _get_skill_block(expert: dict, td: dict) -> str:
         sig_em = ""
         if signal is not None:
             sig_em = " [🟢 BUY]" if signal > 0 else " [🔴 SELL]" if signal < 0 else " [⚪ NEU]"
-
-        if not detail or len(detail) <= 10:
-            lines.append(
-                f"  [{sk}]{sig_em}: KHÔNG CÓ DỮ LIỆU — "
-                f"ghi 'không đủ dữ liệu {sk}', không tự suy diễn giá."
-            )
-            continue
-
-        # Đếm placeholder [DL_KHONG_HOP_LE] — nếu chiếm >40% token → detail vô dụng
-        placeholder_count = detail.count("[DL_KHONG_HOP_LE]")
-        # Ước tính số token bằng word count
-        word_count = max(len(detail.split()), 1)
-        contamination = placeholder_count / word_count
-
-        if contamination > 0.40:
-            # Phần lớn dữ liệu giá bị lọc → không truyền noise
-            lines.append(
-                f"  [{sk}]{sig_em}: DỮ LIỆU GIÁ KHÔNG HỢP LỆ (ngoài ±10% so với "
-                f"{price:,.0f}) — ghi 'không đủ dữ liệu {sk}', không tự suy diễn."
-            )
-        elif placeholder_count > 0:
-            # Một phần bị lọc — truyền detail nhưng nhắc rõ
-            clean = detail[:280]
-            lines.append(
-                f"  [{sk}]{sig_em}:\n"
-                f"    {clean}\n"
-                f"    ⚠️ Các ký hiệu [DL_KHONG_HOP_LE] = giá ngoài ±10% của "
-                f"{price:,.0f} — TUYỆT ĐỐI không dùng, không đoán lại con số."
-            )
-        else:
+        if detail and len(detail) > 10:
             lines.append(f"  [{sk}]{sig_em}:\n    {detail[:280]}")
-
+        else:
+            lines.append(f"  [{sk}]{sig_em}: (không có detail từ engine này)")
     return "\n".join(lines)
 
 
@@ -751,13 +697,9 @@ def _build_round1_prompt(
         "3. R:R = (TP - Entry) / (Entry - SL). Nếu R:R < 1.5 → ĐỔI SANG THEO DOI.\n"
         "4. SCORE từ -5 đến +5 (âm=bearish, dương=bullish, 0=neutral).\n"
         "5. Chỉ phân tích theo trường phái của mình — không lấn sang trường phái khác.\n"
-        f"6. ⚠️ RÀNG BUỘC GIÁ CỨNG: Mọi Entry/SL/TP PHẢI trong [{price_lo:,.0f}–{price_hi:,.0f}].\n"
-        "   [DL_KHONG_HOP_LE] trong Skill Details = giá đã bị lọc, TUYỆT ĐỐI KHÔNG phục hồi hay đoán lại.\n"
-        "7. NGUỒN GIÁ DUY NHẤT: Chỉ dùng số từ mục DỮ LIỆU KỸ THUẬT và PRICE LOCK bên dưới.\n"
-        "   Nếu Skill Details không có giá hợp lệ → ghi 'không đủ dữ liệu', đặt Entry=0.\n"
-        "8. NHẤT QUÁN: Mọi phân tích phải kể cùng một câu chuyện về giá.\n"
-        f"   Ví dụ SAI: 'OB tại 63', 'kháng cự 88', 'Entry=55' khi giá hiện tại={price:,.0f}.\n"
-        f"   Ví dụ ĐÚNG: 'Entry={round(price,0):,.0f}, SL={round(price*0.95,0):,.0f}, TP={round(price*1.05,0):,.0f}'.\n\n"
+        f"6. ⚠️ RÀNG BUỘC GIÁ CỨNG: Mọi giá đề xuất PHẢI trong [{price_lo:,.0f}–{price_hi:,.0f}].\n"
+        f"   Số có dấu [~xxx] trong Skill Details = giá ngoài biên, TUYỆT ĐỐI KHÔNG dùng.\n"
+        "7. KHÔNG tự suy diễn giá không có trong dữ liệu — nếu thiếu, ghi 'không đủ thông tin'.\n\n"
         "═══ ĐỊNH DẠNG ĐẦU RA (theo đúng thứ tự) ═══\n"
         "STANCE: [MUA/BAN/THEO DOI]\n"
         "SCORE: [-5..+5]\n"
@@ -803,8 +745,12 @@ def _build_round2_prompt(
     price    = td["price"]
     price_lo = round(price * (1 - PRICE_BAND_PCT), 0)
     price_hi = round(price * (1 + PRICE_BAND_PCT), 0)
+    lo8      = round(price * 0.92, 1)
+    hi8      = round(price * 1.08, 1)
 
     system = (
+        f"🚨 CẢNH BÁO: CHỈ dùng giá trong [{lo8:,.1f}–{hi8:,.1f}]. "
+        f"Mọi số ngoài phạm vi này = SAI, phải bỏ qua.\n\n"
         f"Bạn là {expert['role']} — VÒNG 2: PHẢN BIỆN CHÉO.\n"
         f"{expert['focus']}\n\n"
         "═══ NHIỆM VỤ VÒNG 2 ═══\n"
@@ -851,8 +797,12 @@ def _build_round3_prompt(
     price    = td["price"]
     price_lo = round(price * (1 - PRICE_BAND_PCT), 0)
     price_hi = round(price * (1 + PRICE_BAND_PCT), 0)
+    lo8      = round(price * 0.92, 1)
+    hi8      = round(price * 1.08, 1)
 
     system = (
+        f"🚨 CẢNH BÁO: CHỈ dùng giá trong [{lo8:,.1f}–{hi8:,.1f}]. "
+        f"Mọi số ngoài phạm vi này = SAI, phải bỏ qua.\n\n"
         f"Bạn là {expert['role']} — VÒNG 3: KẾT LUẬN CUỐI CÙNG.\n"
         f"{expert['focus']}\n\n"
         "═══ VÒNG CUỐI — NGẮN GỌN, SỐ LIỆU ═══\n"
