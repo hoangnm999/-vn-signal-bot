@@ -44,6 +44,20 @@ except ImportError:
     logger.warning("local_swarm_cmd.py chua co — /local_swarm bi tat")
 
 try:
+    from backtest_rule_cmd import backtest_rule_cmd
+    _BACKTEST_RULE = True
+except ImportError:
+    _BACKTEST_RULE = False
+    logger.warning("backtest_rule_cmd.py chua co — /backtest_rule bi tat")
+
+try:
+    from batch_scanner import scan_watchlist_cmd, _start_scan_cron
+    _BATCH_SCANNER = True
+except ImportError:
+    _BATCH_SCANNER = False
+    logger.warning("batch_scanner.py chua co — /scan_watchlist bi tat")
+
+try:
     from vibe_client import (
         is_available as vibe_available,
         start_swarm, poll_swarm, format_swarm_result,
@@ -486,127 +500,95 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── /check_all ────────────────────────────────────────────────────────────────
-# Chạy /check tuần tự cho tất cả mã trong watchlist.
-# Lưu signal + state_vector vào DB để scan_watchlist có dữ liệu tham chiếu.
-# ─────────────────────────────────────────────────────────────────────────────
-
-CHECK_ALL_COOLDOWN = 600   # 10 phút cooldown
+CHECK_ALL_COOLDOWN = 600
 _last_check_all: dict[str, float] = {}
 
 
 async def check_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /check_all [--force]
-
-    Chạy /check tuần tự cho toàn bộ watchlist.
-    Mục đích: tạo/cập nhật state_vector cho mỗi mã,
-    làm cơ sở dữ liệu cho /scan_watchlist tìm ngày tương đồng.
-
-    Flags:
-      --force : bỏ qua mã đã có /check trong 24h (mặc định skip)
-
-    Cú pháp:
-      /check_all           — skip mã đã check trong 24h
-      /check_all --force   — check lại tất cả bất kể tuổi dữ liệu
+    /check_all           — skip mã đã check trong 24h
+    /check_all --force   — check lại tất cả
+    Pipeline: analyze_stock_full → save_signal → save_state_vector → append_today_vector
     """
     if not is_allowed(update): await _deny(update); return
-
     user_id = str(update.effective_user.id) if update.effective_user else "unknown"
     since   = time.time() - _last_check_all.get(user_id, 0)
     if since < CHECK_ALL_COOLDOWN:
-        wait = int(CHECK_ALL_COOLDOWN - since)
         await update.message.reply_text(
-            f"⏳ Vui lòng chờ {wait}s trước khi /check_all lại.\n"
-            f"(Cooldown {CHECK_ALL_COOLDOWN//60} phút)"
-        )
-        return
+            f"⏳ Chờ {int(CHECK_ALL_COOLDOWN - since)}s trước khi /check_all lại."
+        ); return
 
     force_flag = "--force" in (context.args or [])
-    wl         = [s.strip().upper() for s in _get_watchlist(context) if s.strip()]
+    wl = [s.strip().upper() for s in _get_watchlist(context) if s.strip()]
     if not wl:
-        await update.message.reply_text("Watchlist trống.")
-        return
+        await update.message.reply_text("Watchlist trống."); return
 
     _last_check_all[user_id] = time.time()
     chat_id = update.effective_chat.id
-
     msg = await update.message.reply_text(
-        f"🔍 /check_all bắt đầu: {len(wl)} mã\n"
-        f"Mode: {'🔄 Force (check lại tất cả)' if force_flag else '⏭️ Skip nếu đã check trong 24h'}\n"
-        f"Ước tính: {len(wl)*30//60}–{len(wl)*60//60} phút. Gửi kết quả khi xong."
+        f"🔍 /check_all: {len(wl)} mã\n"
+        f"Mode: {'🔄 Force' if force_flag else '⏭️ Skip nếu đã check <24h'}\n"
+        f"Ước tính {len(wl)*30//60}–{len(wl)*60//60} phút."
     )
 
     async def _run():
-        import time as _time
-        ok_syms, skip_syms, fail_syms = [], [], []
-        lines = []
-
+        ok_list, skip_list, fail_list = [], [], []
+        progress_lines = []
         for i, sym in enumerate(wl, 1):
-            # Kiểm tra xem mã đã có /check gần đây chưa (nếu không force)
+            # Skip nếu đã check gần đây
             if not force_flag:
                 try:
                     from db import get_conn
                     with get_conn() as conn:
                         row = conn.execute(
                             "SELECT created_at FROM signals "
-                            "WHERE symbol=? ORDER BY created_at DESC LIMIT 1",
-                            (sym,)
+                            "WHERE symbol=? ORDER BY created_at DESC LIMIT 1", (sym,)
                         ).fetchone()
                         if row and row[0]:
                             from datetime import timezone as _tz
                             created = row[0]
                             if isinstance(created, str):
-                                from datetime import datetime as _dt
-                                created = _dt.fromisoformat(created)
+                                created = datetime.fromisoformat(created)
                             if created.tzinfo is None:
                                 created = created.replace(tzinfo=_tz.utc)
                             age_h = (datetime.now(_tz.utc) - created).total_seconds() / 3600
                             if age_h < 24:
-                                skip_syms.append(sym)
-                                lines.append(f"  ⏭️ {sym}: skip ({age_h:.0f}h ago)")
+                                skip_list.append(sym)
+                                progress_lines.append(f"  ⏭️ {sym} (skip {age_h:.0f}h)")
                                 continue
                 except Exception:
-                    pass   # DB fail → vẫn check
+                    pass
 
-            # Chạy analyze_stock_full
             try:
-                lines.append(f"  🔄 [{i}/{len(wl)}] Đang check {sym}...")
-                # Progress update mỗi mã
+                progress_lines.append(f"  🔄 [{i}/{len(wl)}] {sym}...")
                 try:
-                    preview = "\n".join([
-                        f"🔍 /check_all: {i}/{len(wl)} mã",
-                        f"OK:{len(ok_syms)} Skip:{len(skip_syms)} Fail:{len(fail_syms)}",
-                        "",
-                    ] + lines[-5:])
+                    preview = (f"🔍 /check_all {i}/{len(wl)} | "
+                               f"OK:{len(ok_list)} Skip:{len(skip_list)} Fail:{len(fail_list)}\n"
+                               + "\n".join(progress_lines[-6:]))
                     await context.bot.edit_message_text(
                         chat_id=chat_id, message_id=msg.message_id,
-                        text=preview[:4000]
-                    )
+                        text=preview[:4000])
                 except Exception:
                     pass
 
                 result, meta = await asyncio.to_thread(analyze_stock_full, sym)
-
                 if meta is None:
-                    fail_syms.append(sym)
-                    lines.append(f"  ❌ {sym}: analyze fail")
+                    fail_list.append(sym)
+                    progress_lines[-1] = f"  ❌ {sym}: analyze fail"
                     continue
 
-                # Lưu signal vào DB
+                # Lưu signal
                 sid = 0
                 try:
-                    sid = save_signal(
-                        sym,
-                        meta["verdict"],
-                        meta["ind"],
-                        meta["agent_verdicts"],
-                        meta["macro_v"]["label"] if isinstance(meta["macro_v"], dict) else meta["macro_v"],
-                    )
+                    sid = save_signal(sym, meta["verdict"], meta["ind"],
+                                      meta["agent_verdicts"],
+                                      meta["macro_v"]["label"] if isinstance(meta["macro_v"], dict)
+                                      else meta["macro_v"])
                 except Exception as _dbe:
-                    logger.warning(f"check_all: save_signal {sym} fail: {_dbe}")
+                    logger.warning(f"check_all save_signal {sym}: {_dbe}")
 
                 # Lưu state_vector (quan trọng cho scan_watchlist)
-                sv_saved = False
+                sv_ok = False
                 if sid > 0 and _AUTO_CONTEXT:
                     try:
                         from vn_loader import load_vn_ohlcv
@@ -615,46 +597,41 @@ async def check_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if _sv:
                             sv_json = {k: v for k, v in _sv.items() if k != "_array"}
                             await asyncio.to_thread(save_state_vector_to_signal, sid, sv_json)
-                            sv_saved = True
+                            sv_ok = True
                     except Exception as _sve:
-                        logger.debug(f"check_all: state_vector {sym}: {_sve}")
+                        logger.debug(f"check_all sv {sym}: {_sve}")
 
-                # Cập nhật vector cache CSV (cho historical_analog)
+                # Cập nhật vector cache CSV cho historical_analog
                 try:
                     from historical_analog import append_today_vector
                     await asyncio.to_thread(append_today_vector, sym)
                 except Exception as _ve:
-                    logger.debug(f"check_all: vector cache {sym}: {_ve}")
+                    logger.debug(f"check_all vec_cache {sym}: {_ve}")
 
-                ok_syms.append(sym)
-                sv_tag = "✅+vec" if sv_saved else "✅"
-                lines.append(f"  {sv_tag} {sym}: OK")
-
-                # Delay ngắn giữa các mã tránh flood API
+                ok_list.append(sym)
+                tag = "✅+vec" if sv_ok else "✅"
+                progress_lines[-1] = f"  {tag} {sym}"
                 await asyncio.sleep(2)
 
             except Exception as e:
-                fail_syms.append(sym)
-                lines.append(f"  ❌ {sym}: {str(e)[:60]}")
+                fail_list.append(sym)
+                progress_lines[-1] = f"  ❌ {sym}: {str(e)[:50]}"
                 logger.error(f"check_all {sym}: {e}")
 
-        # ── Báo cáo kết quả cuối ─────────────────────────────────────
         summary = [
-            f"✅ /check_all hoàn thành ({len(wl)} mã):",
-            f"  OK   : {len(ok_syms)} — {', '.join(ok_syms[:10])}{'...' if len(ok_syms)>10 else ''}",
-            f"  Skip : {len(skip_syms)} — {', '.join(skip_syms[:10])}{'...' if len(skip_syms)>10 else ''}",
-            f"  Fail : {len(fail_syms)}" + (f" — {', '.join(fail_syms)}" if fail_syms else ""),
+            f"✅ /check_all xong ({len(wl)} mã):",
+            f"  OK  : {len(ok_list)} mã",
+            f"  Skip: {len(skip_list)} mã (đã check <24h)",
+            f"  Fail: {len(fail_list)}" + (f" — {', '.join(fail_list)}" if fail_list else ""),
             "",
-            "State vector đã lưu → /scan_watchlist sẵn sàng chạy.",
+            "→ Chạy /scan_watchlist để xem cơ hội tiềm năng.",
         ]
-        if fail_syms:
-            summary.append(f"⚠️ {len(fail_syms)} mã lỗi: thử lại bằng /check <MA> thủ công.")
-
+        if fail_list:
+            summary.append(f"⚠️ Thử lại bằng /check <MA> cho mã lỗi.")
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=msg.message_id,
-                text="\n".join(summary)[:4000]
-            )
+                text="\n".join(summary)[:4000])
         except Exception:
             await context.bot.send_message(chat_id=chat_id,
                                            text="\n".join(summary)[:4000])
@@ -1358,7 +1335,6 @@ def main():
     app.add_handler(CommandHandler("status",       status_cmd))
     app.add_handler(CommandHandler("debug",        debug_cmd))
     app.add_handler(CommandHandler("check",        check_cmd))
-    app.add_handler(CommandHandler("check_all",   check_all_cmd))
     app.add_handler(CommandHandler("scan",         scan_cmd))
     app.add_handler(CommandHandler("report",       report_cmd))
     app.add_handler(CommandHandler("history",      history_cmd))
@@ -1366,6 +1342,11 @@ def main():
     app.add_handler(CommandHandler("vibestatus",   vibe_status_cmd))
     app.add_handler(CommandHandler("vibetest",     vibetest_cmd))
     app.add_handler(CommandHandler("deepscan",    deepscan_cmd))
+    app.add_handler(CommandHandler("check_all",   check_all_cmd))
+    if _BACKTEST_RULE:
+        app.add_handler(CommandHandler("backtest_rule", backtest_rule_cmd))
+    if _BATCH_SCANNER:
+        app.add_handler(CommandHandler("scan_watchlist", scan_watchlist_cmd))
     if _LOCAL_SWARM:
         app.add_handler(CommandHandler("local_swarm",  local_swarm_cmd))
         app.add_handler(CommandHandler("cancel",       cancel_swarm_cmd))
@@ -1378,6 +1359,15 @@ def main():
 
     async def post_init(application):
         asyncio.create_task(_start_cron())
+        if _BATCH_SCANNER:
+            _scan_ids = [
+                int(x.strip()) for x in
+                os.environ.get("ALLOWED_IDS","").split(",")
+                if x.strip().lstrip("-").isdigit()
+            ]
+            if _scan_ids:
+                asyncio.create_task(_start_scan_cron(application.bot, _scan_ids))
+                logger.info(f"ScanCron: {len(_scan_ids)} chat_ids, 08:00 daily")
         if _ALERT_AVAILABLE:
             asyncio.create_task(_start_alert_cron(application))
 
