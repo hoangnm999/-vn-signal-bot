@@ -191,42 +191,44 @@ def append_today_vector(symbol: str, df: pd.DataFrame = None) -> bool:
 # SEARCH
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Ngưỡng tương đồng tối thiểu để lọc kết quả
+SIMILARITY_THRESHOLD = 0.80   # 80%
+MAX_DISPLAY          = 10     # tối đa hiển thị chi tiết
+MIN_DISPLAY_WARNING  = 3      # dưới ngưỡng này thêm cảnh báo mẫu nhỏ
+
+
 def find_similar(
     symbol:        str,
     target_vector: dict,
-    top_n:         int = 3,
+    top_n:         int = 3,       # giữ param để backward-compat
     years:         int = 5,
     exclude_days:  int = 90,
+    sim_threshold: float = SIMILARITY_THRESHOLD,
 ) -> Optional[list]:
     """
-    Tìm top_n ngày lịch sử có vector tương đồng nhất với target_vector.
+    Tìm TẤT CẢ ngày lịch sử có similarity >= sim_threshold (mặc định 80%).
 
-    Args:
-        symbol:        Mã CK
-        target_vector: dict từ compute_state_vector()
-        top_n:         Số kết quả trả về
-        years:         Giới hạn tìm kiếm trong N năm gần nhất
-        exclude_days:  Bỏ qua N ngày gần nhất (tránh match với chính nó)
+    Trả về list đã sắp xếp theo similarity giảm dần, mỗi phần tử:
+    {
+        "date", "similarity", "close",
+        "fwd_30", "fwd_60", "fwd_90",   # % return tại mốc cố định
+        "max_gain", "max_gain_day",      # đỉnh tăng cao nhất (%)
+        "max_drawdown", "max_dd_day",    # sụt giảm lớn nhất từ đỉnh (%)
+        "daily_volatility",              # biến động TB ngày (%)
+        "conclusion",                    # nhận định nhanh
+        "outcome",                       # TANG/GIAM/DI NGANG (backward-compat)
+    }
 
-    Returns:
-        list of dict, mỗi phần tử:
-        {
-            "date":      str,
-            "similarity": float,   # cosine similarity [0, 1]
-            "close":     float,    # giá tại ngày đó
-            "fwd_30":    float,    # % return sau 30 ngày
-            "fwd_60":    float,    # % return sau 60 ngày
-            "fwd_90":    float,    # % return sau 90 ngày
-            "outcome":   str,      # "TANG", "GIAM", "DI NGANG"
-        }
-        None nếu cache chưa có hoặc lỗi.
+    Field bổ sung trong list metadata (truy cập qua results[0]["_meta"]):
+        "total_matches"   : tổng ngày >= threshold
+        "search_bars"     : số ngày tìm kiếm
+        "avg_similarity"  : similarity trung bình của tất cả match
     """
     symbol = symbol.upper()
 
     if not cache_exists(symbol):
         return None
 
-    # Load cache
     try:
         t0       = time.time()
         cache_df = pd.read_csv(_cache_path(symbol))
@@ -235,7 +237,7 @@ def find_similar(
         logger.warning(f"find_similar({symbol}): load cache fail: {e}")
         return None
 
-    if len(cache_df) < top_n + exclude_days + 90:
+    if len(cache_df) < exclude_days + 90 + 10:
         logger.warning(f"find_similar({symbol}): cache quá ngắn ({len(cache_df)} rows)")
         return None
 
@@ -247,55 +249,68 @@ def find_similar(
         (cache_df["date"] <= cutoff_end)
     ].copy().reset_index(drop=True)
 
-    if len(search_df) < top_n:
+    if len(search_df) < 5:
         return None
 
-    # Tính cosine similarity với target_vector
+    # Vectorized cosine similarity
     target_list = vector_to_list(target_vector)
     target_arr  = np.array(target_list, dtype=float)
     t_norm      = np.linalg.norm(target_arr)
-
-    # Lấy ma trận vector (bỏ cột date, close)
-    vec_cols  = VECTOR_KEYS
-    available_cols = [c for c in vec_cols if c in search_df.columns]
-    if len(available_cols) < VECTOR_DIM - 2:
-        logger.warning(f"find_similar: cache thiếu columns: {set(vec_cols) - set(available_cols)}")
-        return None
-
-    mat = search_df[available_cols].fillna(0.0).values.astype(float)
-
-    # Vectorized cosine similarity
     if t_norm == 0:
         return None
-    dot_prods   = mat @ target_arr
-    mat_norms   = np.linalg.norm(mat, axis=1)
-    mat_norms   = np.where(mat_norms == 0, 1e-9, mat_norms)
+
+    available_cols = [c for c in VECTOR_KEYS if c in search_df.columns]
+    if len(available_cols) < VECTOR_DIM - 2:
+        logger.warning(f"find_similar: cache thiếu columns")
+        return None
+
+    mat          = search_df[available_cols].fillna(0.0).values.astype(float)
+    dot_prods    = mat @ target_arr
+    mat_norms    = np.linalg.norm(mat, axis=1)
+    mat_norms    = np.where(mat_norms == 0, 1e-9, mat_norms)
     similarities = dot_prods / (mat_norms * t_norm)
 
-    # Top N indices
-    top_indices = np.argsort(-similarities)[:top_n * 3]  # lấy dư để filter
+    # Lọc TẤT CẢ ngày >= threshold, sắp xếp giảm dần
+    above_thresh = np.where(similarities >= sim_threshold)[0]
+    if len(above_thresh) == 0:
+        # Fallback: lấy top_n nếu không có ngày nào >= threshold
+        above_thresh = np.argsort(-similarities)[:max(top_n, 3)]
+        logger.info(f"find_similar({symbol}): không có ngày >= {sim_threshold:.0%}, fallback top {top_n}")
 
+    sorted_idx  = above_thresh[np.argsort(-similarities[above_thresh])]
+    total_match = len(sorted_idx)
+    avg_sim     = float(np.mean(similarities[sorted_idx]))
+    search_bars = len(search_df)
+
+    # Tính đầy đủ price journey cho từng ngày match
     results = []
-    for idx in top_indices:
-        if len(results) >= top_n:
-            break
-
+    for idx in sorted_idx:
         sim       = float(similarities[idx])
         row       = search_df.iloc[idx]
         date_str  = str(row["date"])
         close_val = float(row.get("close", 0))
 
-        # Tính forward returns từ cache (dùng close của các ngày sau)
-        fwd = _calc_forward_returns(cache_df, date_str, close_val)
+        journey = _calc_price_journey(cache_df, date_str, close_val, horizon=90)
 
         results.append({
-            "date":       date_str,
-            "similarity": round(sim, 4),
-            "close":      close_val,
-            "fwd_30":     fwd.get(30),
-            "fwd_60":     fwd.get(60),
-            "fwd_90":     fwd.get(90),
-            "outcome":    _classify_outcome(fwd.get(30)),
+            "date":             date_str,
+            "similarity":       round(sim, 4),
+            "close":            close_val,
+            "fwd_30":           journey["fwd_30"],
+            "fwd_60":           journey["fwd_60"],
+            "fwd_90":           journey["fwd_90"],
+            "max_gain":         journey["max_gain"],
+            "max_gain_day":     journey["max_gain_day"],
+            "max_drawdown":     journey["max_drawdown"],
+            "max_dd_day":       journey["max_dd_day"],
+            "daily_volatility": journey["daily_volatility"],
+            "conclusion":       journey["conclusion"],
+            "outcome":          _classify_outcome(journey["fwd_30"]),
+            "_meta": {
+                "total_matches": total_match,
+                "search_bars":   search_bars,
+                "avg_similarity": round(avg_sim, 4),
+            },
         })
 
     return results if results else None
@@ -306,19 +321,88 @@ def _calc_forward_returns(
     from_date: str,
     from_close: float,
 ) -> dict:
-    """Tính % return sau 30/60/90 ngày từ cache."""
-    result = {}
-    future = cache_df[cache_df["date"] > from_date].reset_index(drop=True)
+    """Wrapper backward-compat → gọi _calc_price_journey."""
+    j = _calc_price_journey(cache_df, from_date, from_close)
+    return {30: j["fwd_30"], 60: j["fwd_60"], 90: j["fwd_90"]}
 
-    for days in FORWARD_DAYS:
+
+def _calc_price_journey(
+    cache_df:   pd.DataFrame,
+    from_date:  str,
+    from_close: float,
+    horizon:    int = 90,
+) -> dict:
+    """
+    Phân tích toàn bộ hành trình giá trong `horizon` ngày tiếp theo.
+
+    Returns dict:
+        fwd_30, fwd_60, fwd_90      : % return tại mốc cố định
+        max_gain, max_gain_day      : đỉnh tăng cao nhất (%), ngày đạt đỉnh
+        max_drawdown, max_dd_day    : sụt giảm lớn nhất từ đỉnh (%), ngày chạm đáy
+        daily_volatility            : biến động TB hàng ngày (%)
+        conclusion                  : str nhận định nhanh
+    """
+    result = {
+        "fwd_30": None, "fwd_60": None, "fwd_90": None,
+        "max_gain": None, "max_gain_day": None,
+        "max_drawdown": None, "max_dd_day": None,
+        "daily_volatility": None,
+        "conclusion": "CHUA RO",
+    }
+    if from_close <= 0:
+        return result
+
+    future = cache_df[cache_df["date"] > from_date].reset_index(drop=True)
+    if len(future) < 5:
+        return result
+
+    window = future.head(horizon)
+    closes = window["close"].values.astype(float)
+
+    # Forward returns tại mốc cố định
+    for days, key in [(30, "fwd_30"), (60, "fwd_60"), (90, "fwd_90")]:
         if len(future) > days:
-            future_close = float(future.iloc[days]["close"])
-            if from_close > 0:
-                result[days] = round((future_close - from_close) / from_close * 100, 2)
-            else:
-                result[days] = None
-        else:
-            result[days] = None  # Chưa đủ dữ liệu tương lai
+            fc = float(future.iloc[days]["close"])
+            result[key] = round((fc - from_close) / from_close * 100, 2)
+
+    # Hành trình giá — pct change so với from_close
+    pct_changes = (closes - from_close) / from_close * 100
+
+    # Max gain
+    max_gain_idx = int(np.argmax(pct_changes))
+    result["max_gain"]     = round(float(pct_changes[max_gain_idx]), 2)
+    result["max_gain_day"] = int(max_gain_idx + 1)
+
+    # Max drawdown từ đỉnh (running peak)
+    running_peak = np.maximum.accumulate(pct_changes)
+    drawdowns    = pct_changes - running_peak   # luôn <= 0
+    max_dd_idx   = int(np.argmin(drawdowns))
+    result["max_drawdown"] = round(float(drawdowns[max_dd_idx]), 2)
+    result["max_dd_day"]   = int(max_dd_idx + 1)
+
+    # Daily volatility (mean |daily pct change|)
+    if len(closes) > 1:
+        daily_ret = np.abs(np.diff(closes) / closes[:-1] * 100)
+        result["daily_volatility"] = round(float(np.mean(daily_ret)), 2)
+
+    # Conclusion
+    f30 = result["fwd_30"]
+    mdd = result["max_drawdown"] or 0
+    mg  = result["max_gain"] or 0
+    if f30 is None:
+        result["conclusion"] = "CHUA RO"
+    elif f30 >= 8 and mdd > -8:
+        result["conclusion"] = "TANG MANH, it rung lac"
+    elif f30 >= 5:
+        result["conclusion"] = "TANG MANH, rung lac dau ky" if mdd < -5 else "TANG MANH"
+    elif f30 >= 2:
+        result["conclusion"] = "TANG NHE"
+    elif f30 <= -8:
+        result["conclusion"] = "GIAM MANH"
+    elif f30 <= -3:
+        result["conclusion"] = "GIAM"
+    else:
+        result["conclusion"] = "DI NGANG"
 
     return result
 
@@ -343,63 +427,170 @@ def _classify_outcome(fwd_30: Optional[float]) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def format_analog_report(
-    symbol:   str,
-    analogs:  list,
+    symbol:      str,
+    analogs:     list,
     current_vec: dict,
+    max_chars:   int = 4000,
 ) -> str:
-    """Tạo text báo cáo phân tích tương đồng."""
+    """
+    Tạo báo cáo phân tích tương đồng 4 phần:
+      1. Tóm tắt nhanh
+      2. Chi tiết ngày tiêu biểu (tối đa MAX_DISPLAY=10, tự giảm nếu quá dài)
+      3. Thống kê tổng hợp (tính trên TOÀN BỘ ngày >= 80%)
+      4. Cảnh báo rủi ro tự động
+    """
     if not analogs:
         return f"Khong tim thay ngay tuong dong cho {symbol}."
 
-    lines = [
+    # ── Meta từ kết quả find_similar ──────────────────────────────────
+    meta         = analogs[0].get("_meta", {})
+    total_match  = meta.get("total_matches", len(analogs))
+    search_bars  = meta.get("search_bars",  0)
+    avg_sim_all  = meta.get("avg_similarity", 0)
+
+    # ── PHẦN 1: Tóm tắt nhanh ─────────────────────────────────────────
+    p1 = [
         f"PHAN TICH TUONG DONG: {symbol}",
-        "═" * 40,
-        "Tim kiem ngay lich su co trang thai ky thuat",
-        "tuong dong nhat voi hien tai (cosine similarity).",
-        "",
-        f"TOP {len(analogs)} NGAY TUONG DONG:",
-        "─" * 40,
+        "═" * 38,
+        f"So khop : {total_match} ngay tuong dong >= 80%",
+        f"Tu      : {search_bars:,} ngay lich su",
+        f"Do TD TB: {avg_sim_all:.1%} (toan bo mau khop)",
     ]
+    if total_match < MIN_DISPLAY_WARNING:
+        p1.append("⚠️ Mau du lieu nho, ket qua chi mang tinh tham khao.")
+    p1.append("")
 
-    for i, a in enumerate(analogs, 1):
-        sim   = a["similarity"]
-        date  = a["date"]
-        close = a["close"]
-        f30   = a["fwd_30"]
-        f60   = a["fwd_60"]
-        f90   = a["fwd_90"]
-        out   = a["outcome"]
+    # ── PHẦN 2: Chi tiết ngày tiêu biểu ──────────────────────────────
+    display_list = analogs[:MAX_DISPLAY]   # top similarity đã sort sẵn
 
-        em = "🟢" if "TANG" in out else "🔴" if "GIAM" in out else "🟡"
+    def _fmt_details(items: list) -> list:
+        lines = [f"CHI TIET {len(items)} NGAY TIEU BIEU:", "─" * 38]
+        for i, a in enumerate(items, 1):
+            sim  = a["similarity"]
+            date = a["date"]
+            cl   = a["close"]
+            f30  = a["fwd_30"]
+            f60  = a["fwd_60"]
+            f90  = a["fwd_90"]
+            mg   = a.get("max_gain")
+            mgd  = a.get("max_gain_day")
+            mdd  = a.get("max_drawdown")
+            mddd = a.get("max_dd_day")
+            dv   = a.get("daily_volatility")
+            conc = a.get("conclusion", "?")
+            em   = "🟢" if "TANG" in conc else "🔴" if "GIAM" in conc else "🟡"
 
-        lines.append(f"#{i} — {date} | Tuong dong: {sim:.1%}")
-        lines.append(f"    Gia luc do: {close:,.0f} | Ket qua: {em} {out}")
+            lines.append(f"#{i} — {date} | Gia: {cl:,.0f} | TD: {sim:.1%}")
+            # Hành trình 90 ngày
+            peak_str = f"+{mg:.1f}% (N{mgd})" if mg is not None else "N/A"
+            dd_str   = f"{mdd:.1f}% (N{mddd})" if mdd is not None else "N/A"
+            lines.append(f"  ⏱️ 90D: Dinh: {peak_str} | Day: {dd_str}")
+            # Forward returns
+            fwd_parts = []
+            if f30 is not None: fwd_parts.append(f"30D:{f30:+.1f}%")
+            if f60 is not None: fwd_parts.append(f"60D:{f60:+.1f}%")
+            if f90 is not None: fwd_parts.append(f"90D:{f90:+.1f}%")
+            if fwd_parts:
+                lines.append(f"  📈 Fwd: {' | '.join(fwd_parts)}")
+            if dv is not None:
+                lines.append(f"  📊 Bien dong TB: {dv:.1f}%/ngay")
+            lines.append(f"  {em} {conc}")
+            lines.append("")
+        return lines
 
-        fwd_parts = []
-        if f30 is not None: fwd_parts.append(f"30D:{f30:+.1f}%")
-        if f60 is not None: fwd_parts.append(f"60D:{f60:+.1f}%")
-        if f90 is not None: fwd_parts.append(f"90D:{f90:+.1f}%")
-        if fwd_parts:
-            lines.append(f"    Forward returns: {' | '.join(fwd_parts)}")
-        lines.append("")
+    p2 = _fmt_details(display_list)
 
-    # Thống kê tổng hợp
-    valid_f30 = [a["fwd_30"] for a in analogs if a["fwd_30"] is not None]
-    if valid_f30:
-        avg30  = np.mean(valid_f30)
-        pos30  = sum(1 for x in valid_f30 if x > 0)
-        n30    = len(valid_f30)
-        lines += [
-            "─" * 40,
-            "THONG KE (sau 30 ngay):",
-            f"  TB return : {avg30:+.2f}%",
-            f"  Tang/Giam : {pos30}/{n30} ({pos30/n30:.0%} tang)",
-            "─" * 40,
+    # ── PHẦN 3: Thống kê tổng hợp (toàn bộ analogs, không chỉ display) ─
+    def _build_stats(items: list) -> list:
+        vf30 = [a["fwd_30"] for a in items if a.get("fwd_30") is not None]
+        vf60 = [a["fwd_60"] for a in items if a.get("fwd_60") is not None]
+        vf90 = [a["fwd_90"] for a in items if a.get("fwd_90") is not None]
+        vmdd = [a["max_drawdown"] for a in items if a.get("max_drawdown") is not None]
+        vdv  = [a["daily_volatility"] for a in items if a.get("daily_volatility") is not None]
+        n    = len(items)
+
+        lines = [
+            f"THONG KE TONG HOP ({n} ngay, do TD >= 80%):",
+            "─" * 38,
         ]
+        if vf30:
+            wins   = [x for x in vf30 if x > 0]
+            losses = [x for x in vf30 if x <= 0]
+            wr     = len(wins) / len(vf30)
+            avg30  = float(np.mean(vf30))
+            aw30   = float(np.mean(wins))   if wins   else 0
+            al30   = float(np.mean(losses)) if losses else 0
+            lines += [
+                f"  Ty le tang sau 30D : {len(wins)}/{len(vf30)} ({wr:.0%})",
+                f"  LN TB khi tang     : {aw30:+.2f}%",
+                f"  TL TB khi giam     : {al30:+.2f}%",
+                f"  LN TB sau 30D      : {avg30:+.2f}%",
+            ]
+        if vf60:
+            lines.append(f"  LN TB sau 60D      : {float(np.mean(vf60)):+.2f}%")
+        if vf90:
+            lines.append(f"  LN TB sau 90D      : {float(np.mean(vf90)):+.2f}%")
+        if vmdd:
+            avg_mdd = float(np.mean(vmdd))
+            lines.append(f"  Max DD TB          : {avg_mdd:.2f}%")
+        if vdv:
+            lines.append(f"  Bien dong TB ngay  : {float(np.mean(vdv)):.1f}%")
 
-    lines.append("Luu y: Phan tich tuong dong chi mang tinh tham khao.")
-    lines.append("Qua khu khong dam bao tuong lai.")
-    return "\n".join(lines)
+        # Thời gian nắm giữ tối ưu
+        avgs = {}
+        for k, v in [(30, vf30), (60, vf60), (90, vf90)]:
+            if v: avgs[k] = float(np.mean(v))
+        if avgs:
+            best_k = max(avgs, key=avgs.get)
+            lines.append(f"  Thoi gian toi uu   : {best_k} ngay (TB {avgs[best_k]:+.1f}%)")
+
+        return lines
+
+    p3 = _build_stats(analogs)
+
+    # ── PHẦN 4: Cảnh báo rủi ro ─────────────────────────────────────
+    warnings = []
+    vmdd_all  = [a["max_drawdown"] for a in analogs if a.get("max_drawdown") is not None]
+    vf30_all  = [a["fwd_30"]       for a in analogs if a.get("fwd_30") is not None]
+
+    avg_mdd_val = float(np.mean(vmdd_all)) if vmdd_all else 0
+    if avg_mdd_val < -5:
+        warnings.append(
+            f"⚠️ MDD TB = {avg_mdd_val:.1f}%: Cac kich ban qua khu "
+            f"thuong co nhip giam manh truoc khi tang. "
+            f"Can chuan bi tam ly va von."
+        )
+    if avg_sim_all < 0.85 and total_match > 0:
+        warnings.append(
+            "⚠️ Do tuong dong TB < 85%, ket qua chi mang tinh tham khao."
+        )
+    if total_match < 5:
+        warnings.append(
+            f"⚠️ Chi co {total_match} mau, chua du y nghia thong ke."
+        )
+
+    p4 = []
+    if warnings:
+        p4 = ["", "CANH BAO RUI RO:"] + warnings
+
+    # ── Assemble với giới hạn ký tự ─────────────────────────────────
+    footer = ["", "Luu y: Phan tich chi mang tinh tham khao. QK khong dam bao TL."]
+    base   = p1 + p3 + p4 + footer
+    base_txt = "\n".join(base)
+
+    # Thử full (10 ngày chi tiết)
+    full = "\n".join(p1 + p2 + p3 + p4 + footer)
+    if len(full) <= max_chars:
+        return full
+
+    # Giảm xuống 5 ngày
+    p2_short = _fmt_details(display_list[:5])
+    short    = "\n".join(p1 + p2_short + p3 + p4 + footer)
+    if len(short) <= max_chars:
+        return short
+
+    # Cuối cùng: chỉ stats + warnings, không chi tiết
+    return base_txt[:max_chars]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
