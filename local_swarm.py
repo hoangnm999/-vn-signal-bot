@@ -1,16 +1,20 @@
 """
-local_swarm.py — Local Swarm Panel v2.0
-Hội đồng chuyên gia AI nội bộ, chiều sâu phân tích 90% Panel Swarm gốc.
+local_swarm.py — Local Swarm Panel v3.0
+Hội đồng chuyên gia AI nội bộ — chiều sâu phân tích 90% Panel Swarm gốc.
 
-KIẾN TRÚC v2.0:
+KIẾN TRÚC v3.0:
   analyze_stock_full() → metadata (16 engines + indicators)
-       → extract_technical_data() → TechnicalData (JSON đầy đủ)
+       → extract_technical_data()      — trích đầy đủ + rich engine details
+       → _sanitize_engine_detail()     — lọc giá ngoài biên ±30%
        → SwarmOrchestrator (3 vòng tranh luận)
-       → SwarmReport → format_swarm_report()
+           Vòng 1: Phân tích độc lập — skill-aware, số liệu cụ thể
+           Vòng 2: Phản biện chéo — phản biện ≥1 expert đối lập
+           Vòng 3: Kết luận + kịch bản cụ thể
+           Moderator: JSON tổng hợp
+       → _validate_prices_in_output()  — kiểm tra giá lần cuối
+       → format_swarm_report()         — output Telegram-safe, không cắt dòng
 
-PROVIDERS (waterfall):
-  DeepSeek → OpenRouter → Groq → Gemini → Ollama
-
+PROVIDERS (waterfall): DeepSeek → OpenRouter → Groq → Gemini → Ollama
 TIMEOUT: 600s hard + per-call 120s (patched từ local_swarm_cmd.py)
 """
 
@@ -35,10 +39,13 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 
 DEBATE_ROUNDS    = 3
-LLM_TIMEOUT      = 90        # giây — sẽ bị override bởi _patch_llm_timeout
-LLM_MAX_TOKENS   = 800       # per expert response
-MODERATOR_TOKENS = 2000      # moderator JSON
-SWARM_VERSION    = "2.0"
+LLM_TIMEOUT      = 90         # giây — override bởi _patch_llm_timeout trong cmd
+LLM_MAX_TOKENS   = 900        # per expert response — tăng để có dư chi tiết
+MODERATOR_TOKENS = 2200       # moderator JSON
+SWARM_VERSION    = "3.0"
+
+# Biên độ giá hợp lệ: mọi mức giá đề xuất phải nằm trong ±30% giá hiện tại
+PRICE_BAND_PCT   = 0.30
 
 _DEFAULT_MODELS = {
     "deepseek":   "deepseek-chat",
@@ -48,9 +55,10 @@ _DEFAULT_MODELS = {
     "ollama":     "qwen2.5:7b",
 }
 
-# Biên độ giá hợp lệ: mọi mức giá phải nằm trong ±30% so với giá hiện tại
-PRICE_BAND_PCT = 0.30
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PRICE GUARD HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _price_in_band(p: float, ref: float, band: float = PRICE_BAND_PCT) -> bool:
     """Kiểm tra p có nằm trong ±band% so với ref không."""
@@ -63,10 +71,11 @@ def _sanitize_engine_detail(detail: str, ref_price: float) -> str:
     """
     Quét text engine detail, đánh dấu các số trông như giá cổ phiếu
     nhưng nằm ngoài ±30% ref_price bằng [~xxx] để LLM không dùng nhầm.
-    Chỉ xử lý số >= ref_price*0.3 (tránh nhầm với %, RSI, v.v.)
+    Chỉ xử lý số >= ref_price * 0.30 (tránh nhầm với %, RSI, v.v.)
     """
     if ref_price <= 0 or not detail:
         return detail
+
     lo        = ref_price * (1 - PRICE_BAND_PCT)
     hi        = ref_price * (1 + PRICE_BAND_PCT)
     threshold = ref_price * 0.30
@@ -78,32 +87,61 @@ def _sanitize_engine_detail(detail: str, ref_price: float) -> str:
         except ValueError:
             return raw
         if val < threshold:
-            return raw          # quá nhỏ, không phải giá — giữ nguyên
+            return raw           # quá nhỏ → không phải giá → giữ nguyên
         if lo <= val <= hi:
-            return raw          # trong biên — giữ nguyên
-        return f"[~{val:,.0f}]"  # ngoài biên — đánh dấu
+            return raw           # trong biên → giữ nguyên
+        return f"[~{val:,.0f}]"  # ngoài biên → đánh dấu
 
     return re.sub(r"[\d,]+(?:\.\d+)?", _replace, detail)
 
 
+def _safe_float(v, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+        import math
+        return x if math.isfinite(x) else default
+    except Exception:
+        return default
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# TECHNICAL DATA EXTRACTION
+# TECHNICAL DATA EXTRACTION — trích đầy đủ từ analyze_stock_full()
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_technical_data(symbol: str, meta: dict) -> dict:
     """
-    Trích xuất toàn bộ dữ liệu kỹ thuật từ metadata analyze_stock_full().
+    Trích xuất toàn bộ dữ liệu kỹ thuật từ metadata của analyze_stock_full().
     Trả về dict đầy đủ để truyền vào prompt từng chuyên gia.
-    """
-    ind     = meta.get("ind", {})
-    verdict = meta.get("verdict", {})
-    vibe    = meta.get("vibe_result", {})
-    macro_v = meta.get("macro_v", {})
-    news    = meta.get("news_data", {})
-    comm    = meta.get("commodity_data", {})
 
-    # ── Signals ─────────────────────────────────────────────────────────────
-    signals: dict = {}
+    Nguồn dữ liệu:
+      meta["ind"]              → indicators cơ bản (từ compute_indicators)
+      meta["verdict"]          → tổng hợp 16 engines + action_plan
+      meta["vibe_result"]      → dict từ run_vibe_agents() chứa engine details
+      meta["verdict"]["context_details"] → MarketRegime, NewsSentiment, VNMacro...
+      meta["macro_v"]          → macro context
+      meta["commodity_data"]   → commodity context
+    """
+    ind       = meta.get("ind",       {}) or {}
+    verdict   = meta.get("verdict",   {}) or {}
+    vibe      = meta.get("vibe_result", {}) or {}
+    macro_v   = meta.get("macro_v",   {}) or {}
+    macro_d   = meta.get("macro_data", {}) or {}
+    comm_d    = meta.get("commodity_data", {}) or {}
+
+    # ── Giá cơ sở — lấy trước để sanitize ─────────────────────────────────
+    price     = _safe_float(ind.get("current_price", 0), 0.0)
+    ma20      = _safe_float(ind.get("ma20",  price), price)
+    ma50_raw  = ind.get("ma50")
+    ma50      = _safe_float(ma50_raw, 0.0) if ma50_raw else None
+    bb_up     = _safe_float(ind.get("bb_upper",       price * 1.04), price * 1.04)
+    bb_low    = _safe_float(ind.get("bb_lower",       price * 0.96), price * 0.96)
+    bb_mid    = _safe_float(ind.get("bb_mid",         ma20), ma20)
+    sup_20d   = _safe_float(ind.get("support_20d",    price * 0.95), price * 0.95)
+    res_20d   = _safe_float(ind.get("resistance_20d", price * 1.05), price * 1.05)
+    atr       = price * 0.02  # ước tính cơ bản nếu không có ATR riêng
+
+    # ── Signals từ 16 engines ──────────────────────────────────────────────
+    signals: dict[str, int] = {}
     raw_sigs = verdict.get("signals", {})
     if isinstance(raw_sigs, dict):
         for k, v in raw_sigs.items():
@@ -112,87 +150,109 @@ def extract_technical_data(symbol: str, meta: dict) -> dict:
             except Exception:
                 pass
 
-    # ── Giá cơ sở — phải lấy trước để sanitize engine details ───────────────
-    price   = float(ind.get("current_price", 0))
-    sup_20d = float(ind.get("support_20d",    price * 0.95))
-    res_20d = float(ind.get("resistance_20d", price * 1.05))
-    bb_low  = float(ind.get("bb_lower",       price * 0.96))
-    bb_up   = float(ind.get("bb_upper",       price * 1.04))
-    ma20    = float(ind.get("ma20",           price))
-    ma50_v  = ind.get("ma50")
-    ma50    = float(ma50_v) if ma50_v else None
-    atr     = price * 0.02
+    # ── Engine details — gom từ vibe + context_details ─────────────────────
+    _raw_engine: dict[str, str] = {}
 
-    # ── Lấy engine details — sanitize ngay giá ngoài biên ±30% ──────────────
-    _raw_engine: dict = {}
+    # Từ vibe_result["details"] — kết quả chi tiết từng HKUDS engine
     if isinstance(vibe, dict):
         raw_details = vibe.get("details", {})
         if isinstance(raw_details, dict):
-            _raw_engine = {k: str(v)[:250] for k, v in raw_details.items()}
-        ctx_details = verdict.get("context_details", {})
-        if isinstance(ctx_details, dict):
-            _raw_engine.update({k: str(v)[:250] for k, v in ctx_details.items()})
-    # Sanitize: đánh dấu giá ngoài band trong text để LLM không dùng nhầm
-    engine_details: dict = {
+            for k, v in raw_details.items():
+                _raw_engine[k] = str(v)[:350]
+
+    # Từ verdict["context_details"] — MarketRegime, NewsSentiment, VNMacro, CommodityContext
+    ctx_details = verdict.get("context_details", {})
+    if isinstance(ctx_details, dict):
+        for k, v in ctx_details.items():
+            _raw_engine[k] = str(v)[:350]
+
+    # Sanitize giá ngoài biên
+    engine_details: dict[str, str] = {
         k: _sanitize_engine_detail(v, price)
         for k, v in _raw_engine.items()
     }
 
+    # ── Action plan từ /check ─────────────────────────────────────────────
+    ap        = verdict.get("action_plan", {}) or {}
+    tp_raw    = _safe_float(ap.get("tp",        0))
+    sl_raw    = _safe_float(ap.get("sl",        0))
+    en_raw    = _safe_float(ap.get("entry_low", price))
+    tp_check  = tp_raw if tp_raw > 0 and _price_in_band(tp_raw, price) else 0.0
+    sl_check  = sl_raw if sl_raw > 0 and _price_in_band(sl_raw, price) else 0.0
+    en_check  = en_raw if en_raw > 0 and _price_in_band(en_raw, price) else price
+
+    # ── S/R đa tầng ────────────────────────────────────────────────────────
     sr = _compute_sr_levels_v2(price, sup_20d, res_20d, bb_low, bb_up, ma20, ma50, atr)
 
-    # ── Action plan từ /check — clamp về band hợp lệ ─────────────────────────
-    ap       = verdict.get("action_plan", {})
-    tp_raw   = float(ap.get("tp",        0))
-    sl_raw   = float(ap.get("sl",        0))
-    en_raw   = float(ap.get("entry_low", price))
-    # Chỉ dùng nếu trong biên, không thì về 0 (moderator tự tính)
-    tp_check = tp_raw if (tp_raw > 0 and _price_in_band(tp_raw, price)) else 0.0
-    sl_check = sl_raw if (sl_raw > 0 and _price_in_band(sl_raw, price)) else 0.0
-    en_check = en_raw if (en_raw > 0 and _price_in_band(en_raw, price)) else price
+    # ── News ───────────────────────────────────────────────────────────────
+    news_data    = meta.get("news_data", {}) or {}
+    if isinstance(news_data, dict) and news_data.get("success"):
+        news_headlines = news_data.get("headlines", [])[:8]
+    else:
+        news_headlines = []
 
-    news_headlines = (
-        news.get("headlines", [])[:8]
-        if isinstance(news, dict) and news.get("success") else []
+    # ── Macro & Commodity ─────────────────────────────────────────────────
+    market_regime  = macro_v.get("market_regime", "UNKNOWN")
+    macro_label    = macro_v.get("macro_label", macro_v.get("label", ""))
+    macro_detail   = macro_v.get("detail", macro_d.get("detail", ""))
+
+    commodity_signal = 0
+    commodity_detail = ""
+    if isinstance(comm_d, dict) and comm_d.get("success"):
+        commodity_signal = int(comm_d.get("signal", 0))
+        commodity_detail = str(comm_d.get("detail", ""))[:200]
+
+    # ── Change 1d ─────────────────────────────────────────────────────────
+    change_1d = _safe_float(
+        ind.get("change_1d_pct",
+                ind.get("change_1d",
+                        ind.get("change_1w_pct", 0))),
+        0.0,
     )
 
     return {
-        "symbol":          symbol.upper(),
-        "price":           price,
-        "change_1d_pct":   float(ind.get("change_1d_pct", ind.get("change_1w_pct", 0))),
-        "change_1w_pct":   float(ind.get("change_1w_pct", 0)),
-        "change_1m_pct":   float(ind.get("change_1m_pct", 0)),
-        "rsi":             float(ind.get("rsi", 50)),
-        "macd":            float(ind.get("macd", 0)),
-        "macd_hist":       float(ind.get("macd_hist", 0)),
-        "macd_signal":     float(ind.get("macd_signal", 0)),
-        "volume_ratio":    float(ind.get("volume_ratio", 1.0)),
-        "ma20":            ma20,
-        "ma50":            ma50,
-        "bb_upper":        bb_up,
-        "bb_lower":        bb_low,
-        "bb_mid":          float(ind.get("bb_mid", ma20)),
-        "atr":             atr,
-        "support_20d":     sup_20d,
-        "resistance_20d":  res_20d,
-        "sr_levels":       sr,
-        "tp_check":        tp_check,
-        "sl_check":        sl_check,
-        "entry_check":     en_check,
-        "verdict_label":   verdict.get("verdict_label", "TRUNG LAP"),
-        "confidence_pct":  float(verdict.get("confidence_pct", 50)),
-        "bull_count":      int(verdict.get("bull_count", 0)),
-        "bear_count":      int(verdict.get("bear_count", 0)),
-        "active_agents":   int(verdict.get("active_agents", 0)),
-        "contradictions":  verdict.get("contradictions", []),
-        "signals":         signals,
-        "engine_details":  engine_details,
-        "market_regime":   macro_v.get("market_regime", "UNKNOWN") if isinstance(macro_v, dict) else "UNKNOWN",
-        "macro_label":     macro_v.get("label", "") if isinstance(macro_v, dict) else "",
-        "macro_detail":    macro_v.get("detail", "") if isinstance(macro_v, dict) else "",
-        "news_headlines":  news_headlines,
-        "news_sentiment":  verdict.get("news_sentiment", ""),
-        "commodity_detail": comm.get("detail", "") if isinstance(comm, dict) else "",
-        "commodity_signal": int(comm.get("signal", 0)) if isinstance(comm, dict) else 0,
+        # Cơ bản
+        "symbol":           symbol.upper(),
+        "price":            price,
+        "change_1d_pct":    change_1d,
+        "change_1w_pct":    _safe_float(ind.get("change_1w_pct", 0)),
+        "change_1m_pct":    _safe_float(ind.get("change_1m_pct", 0)),
+        # Indicators
+        "rsi":              _safe_float(ind.get("rsi",          50), 50.0),
+        "macd":             _safe_float(ind.get("macd",          0)),
+        "macd_hist":        _safe_float(ind.get("macd_hist",     0)),
+        "macd_signal":      _safe_float(ind.get("macd_signal",   0)),
+        "volume_ratio":     _safe_float(ind.get("volume_ratio", 1.0), 1.0),
+        "ma20":             ma20,
+        "ma50":             ma50,
+        "bb_upper":         bb_up,
+        "bb_lower":         bb_low,
+        "bb_mid":           bb_mid,
+        "atr":              atr,
+        "support_20d":      sup_20d,
+        "resistance_20d":   res_20d,
+        "sr_levels":        sr,
+        # Action plan
+        "tp_check":         tp_check,
+        "sl_check":         sl_check,
+        "entry_check":      en_check,
+        # Verdict
+        "verdict_label":    verdict.get("verdict_label", "TRUNG LAP"),
+        "confidence_pct":   _safe_float(verdict.get("confidence_pct", 50), 50.0),
+        "bull_count":       int(verdict.get("bull_count",     0)),
+        "bear_count":       int(verdict.get("bear_count",     0)),
+        "active_agents":    int(verdict.get("active_agents",  0)),
+        "contradictions":   verdict.get("contradictions", []),
+        "signals":          signals,
+        "engine_details":   engine_details,
+        # Macro & News
+        "market_regime":    market_regime,
+        "macro_label":      macro_label,
+        "macro_detail":     macro_detail,
+        "news_headlines":   news_headlines,
+        "news_sentiment":   verdict.get("news_sentiment", ""),
+        "commodity_detail": commodity_detail,
+        "commodity_signal": commodity_signal,
     }
 
 
@@ -201,23 +261,25 @@ def _compute_sr_levels_v2(
     bb_low: float, bb_up: float, ma20: float,
     ma50: Optional[float], atr: float,
 ) -> dict:
-    """Tính S/R đa tầng, sắp xếp gần→xa, loại trùng 2.5%."""
+    """Tính S/R đa tầng từ SMA/BB/Fib/ATR. Sắp xếp gần→xa, loại trùng 2.5%."""
     sup_cands: list[tuple[float, str]] = []
     res_cands: list[tuple[float, str]] = []
 
     def _add(p: float, reason: str):
-        if p <= 0 or abs(p - price) / price > 0.25:
+        if p <= 0 or price <= 0:
+            return
+        if abs(p - price) / price > 0.28:   # loại > 28% để giữ band hợp lý
             return
         if p < price:
             sup_cands.append((p, reason))
         elif p > price:
             res_cands.append((p, reason))
 
-    _add(sup_20d,  "Low 20 ngày")
-    _add(res_20d,  "High 20 ngày")
-    _add(bb_low,   "Bollinger Lower (2σ)")
-    _add(bb_up,    "Bollinger Upper (2σ)")
-    _add(ma20,     "SMA20")
+    _add(sup_20d, "Low 20 ngày")
+    _add(res_20d, "High 20 ngày")
+    _add(bb_low,  "Bollinger Lower (2σ)")
+    _add(bb_up,   "Bollinger Upper (2σ)")
+    _add(ma20,    "SMA20")
     if ma50:
         _add(ma50, "SMA50")
 
@@ -234,8 +296,8 @@ def _compute_sr_levels_v2(
         _add(round(price - mult * atr, 0), f"Hỗ trợ {lbl}")
         _add(round(price + mult * atr, 0), f"Kháng cự {lbl}")
 
-    def _dedupe(cands, desc: bool) -> list[dict]:
-        srt = sorted(cands, key=lambda x: abs(x[0] - price))
+    def _dedupe(cands: list, desc: bool) -> list[dict]:
+        srt    = sorted(cands, key=lambda x: abs(x[0] - price))
         result: list[dict] = []
         for p, reason in srt:
             if any(abs(p - r["price"]) / max(r["price"], 1) < 0.025 for r in result):
@@ -247,6 +309,7 @@ def _compute_sr_levels_v2(
             })
             if len(result) >= 3:
                 break
+        # Đảm bảo đủ 3 mức
         while len(result) < 3:
             base  = result[-1]["price"] if result else price
             new_p = round(base * (1.03 if desc else 0.97), 0)
@@ -281,51 +344,50 @@ class ExpertOpinion:
 
 @dataclass
 class DebateRound:
-    round_num:  int
-    exchanges:  list[dict]
+    round_num: int
+    exchanges: list[dict]
 
 
 @dataclass
 class SwarmReport:
-    symbol:            str
-    timestamp:         str
-    elapsed_s:         float
-    llm_provider:      str
-    llm_model:         str
-    panel_verdict:     str
-    panel_confidence:  float
-    final_score:       float
-    resonance_pct:     float
-    consensus_level:   str
-    vote_bull:         int
-    vote_neutral:      int
-    vote_bear:         int
-    dissent_notes:     list[str]
-    scenario_buy:      dict
-    scenario_sell:     dict
-    scenario_watch:    dict
-    support_levels:    list
-    resistance_levels: list
-    rr_warning:        str
-    main_risks:        list[str]
-    key_catalysts:     list[str]
-    shelf_life_days:   int
-    expires_at:        str
-    review_date:       str
-    expert_opinions:   list[ExpertOpinion]
-    debate_rounds:     list[DebateRound]
-    moderator_summary: str
+    symbol:             str
+    timestamp:          str
+    elapsed_s:          float
+    llm_provider:       str
+    llm_model:          str
+    panel_verdict:      str
+    panel_confidence:   float
+    final_score:        float
+    resonance_pct:      float
+    consensus_level:    str
+    vote_bull:          int
+    vote_neutral:       int
+    vote_bear:          int
+    dissent_notes:      list[str]
+    scenario_buy:       dict
+    scenario_sell:      dict
+    scenario_watch:     dict
+    support_levels:     list
+    resistance_levels:  list
+    rr_warning:         str
+    main_risks:         list[str]
+    key_catalysts:      list[str]
+    shelf_life_days:    int
+    expires_at:         str
+    review_date:        str
+    expert_opinions:    list[ExpertOpinion]
+    debate_rounds:      list[DebateRound]
+    moderator_summary:  str
     moderator_raw_json: dict
-    input_summary:     str
-    tech_data:         dict
+    input_summary:      str
+    tech_data:          dict
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM CLIENT
+# LLM CLIENT — waterfall: DeepSeek → OpenRouter → Groq → Gemini → Ollama
 # ══════════════════════════════════════════════════════════════════════════════
 
 class LLMClient:
-    """Waterfall: DeepSeek → OpenRouter → Groq → Gemini → Ollama"""
 
     def __init__(self):
         self.provider, self.model = self._detect_provider()
@@ -340,9 +402,11 @@ class LLMClient:
         ]:
             key = os.environ.get(env_key, "").strip()
             if key:
-                model = os.environ.get(f"{provider.upper()}_MODEL",
-                                       _DEFAULT_MODELS[provider])
+                model = os.environ.get(
+                    f"{provider.upper()}_MODEL", _DEFAULT_MODELS[provider]
+                )
                 return provider, model
+        # Ollama fallback
         ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
         try:
             r = requests.get(f"{ollama_url}/api/tags", timeout=3)
@@ -369,7 +433,7 @@ class LLMClient:
                 system, user, max_tokens,
                 extra_headers={
                     "HTTP-Referer": "https://github.com/vnsignalbot",
-                    "X-Title": "VN Signal Bot",
+                    "X-Title":      "VN Signal Bot",
                 },
             )
         if self.provider == "groq":
@@ -416,7 +480,7 @@ class LLMClient:
             f"{self.model}:generateContent?key={api_key}"
         )
         payload = {
-            "contents": [{"parts": [{"text": f"{system}\n\n{user}"}]}],
+            "contents":       [{"parts": [{"text": f"{system}\n\n{user}"}]}],
             "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.6},
         }
         r = requests.post(url, json=payload, timeout=LLM_TIMEOUT)
@@ -437,7 +501,7 @@ class LLMClient:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EXPERT DEFINITIONS
+# EXPERT DEFINITIONS — 5 chuyên gia với skill keys cụ thể
 # ══════════════════════════════════════════════════════════════════════════════
 
 EXPERTS = [
@@ -447,51 +511,59 @@ EXPERTS = [
         "emoji": "📊",
         "focus": (
             "Bạn là chuyên gia phân tích kỹ thuật 15 năm kinh nghiệm HOSE/HNX. "
-            "Trường phái: Classic TA, Ichimoku Cloud, Volume analysis, Candlestick patterns. "
-            "Phân tích RSI, MACD, Bollinger, MA crossover, "
-            "Ichimoku Tenkan/Kijun/Kumo, volume confirmation. "
-            "KHÔNG được nói chung chung — PHẢI dẫn số liệu cụ thể từ dữ liệu được cấp."
+            "Trường phái: Classic TA, Ichimoku Cloud, Volume Analysis, Candlestick. "
+            "Phân tích RSI, MACD histogram, Bollinger Bands, MA crossover, "
+            "Ichimoku Tenkan/Kijun/Kumo, volume confirmation, ADX trend strength. "
+            "PHẢI dẫn số liệu cụ thể: tên chỉ báo + giá trị số + vị trí tương đối."
         ),
-        "skill_keys": ["TechnicalBasic", "Ichimoku", "Candlestick", "ElliottWave"],
+        "skill_keys": [
+            "TechnicalBasic", "Ichimoku", "Candlestick", "ElliottWave",
+        ],
     },
     {
         "id":    "smc_trader",
         "role":  "Smart Money Concepts Trader",
         "emoji": "💡",
         "focus": (
-            "Bạn là SMC trader chuyên theo dòng tiền tổ chức trên HOSE. "
-            "Trường phái: Order Blocks, Fair Value Gaps, BOS/ChoCH, Liquidity Pools, "
-            "Wyckoff Method, Market Structure. "
-            "Xác định điểm POI (Point of Interest) dựa trên SMC engine detail và structure. "
-            "PHẢI dẫn chứng từ SMC engine detail — không tự suy diễn."
+            "Bạn là SMC trader theo dòng tiền tổ chức HOSE. "
+            "Trường phái: Order Blocks, Fair Value Gaps (FVG), BOS/ChoCH, "
+            "Liquidity Pools, Wyckoff, Market Structure Shift. "
+            "Xác định POI (Point of Interest) từ engine detail. "
+            "PHẢI dẫn chứng từ SMC/Chanlun detail — không tự suy diễn giá."
         ),
-        "skill_keys": ["SMC", "Chanlun", "ElliottWave", "MultiFactor"],
+        "skill_keys": [
+            "SMC", "Chanlun", "ElliottWave", "MultiFactor",
+        ],
     },
     {
         "id":    "macro_strategist",
         "role":  "Chiến lược gia Vĩ mô",
         "emoji": "🌏",
         "focus": (
-            "Bạn là chiến lược gia vĩ mô từ Dragon Capital. "
-            "Trường phái: Market Regime, VNMacro context, tác động Fed/SBV, "
-            "tỷ giá USD/VND, giá vàng/dầu, News Sentiment. "
-            "Nhìn big picture — skeptical với signals kỹ thuật đơn thuần. "
-            "PHẢI phân tích market_regime, macro_label, và news headlines cụ thể."
+            "Bạn là chiến lược gia vĩ mô, từng làm tại Dragon Capital. "
+            "Trường phái: Market Regime, Fed/SBV policy, tỷ giá USD/VND, "
+            "giá vàng/dầu tác động đến ngành, News Sentiment theo sector. "
+            "Nhìn big-picture, skeptical với signals kỹ thuật đơn thuần. "
+            "PHẢI phân tích market_regime cụ thể và dẫn tin tức headline."
         ),
-        "skill_keys": ["MarketRegime", "VNMacro", "CommodityContext", "NewsSentiment"],
+        "skill_keys": [
+            "MarketRegime", "VNMacro", "CommodityContext", "NewsSentiment",
+        ],
     },
     {
         "id":    "risk_manager",
         "role":  "Nhà Quản trị Rủi ro",
         "emoji": "🛡️",
         "focus": (
-            "Bạn là risk manager chuyên nghiệp — LUÔN bảo vệ vốn trước tiên. "
-            "Tính R:R chính xác, đặt SL/TP hợp lý dựa trên ATR và S/R, "
-            "phân tích Volatility, xác định max drawdown tiềm năng. "
-            "PHẢI phản đối bất kỳ kịch bản nào có R:R < 1.5. "
-            "PHẢI dẫn chứng: ATR, BB width, khoảng cách đến SL, VaR."
+            "Bạn là risk manager chuyên nghiệp — BẢO VỆ VỐN TRƯỚC TIÊN. "
+            "Tính R:R chính xác từ ATR và S/R, đặt SL tight nhưng hợp lý, "
+            "phân tích Volatility (BB width, ATR), tính max drawdown tiềm năng. "
+            "PHẢI phản đối bất kỳ kịch bản nào có R:R < 1.5 bằng số liệu cụ thể. "
+            "Dẫn chứng: ATR value, BB width %, khoảng cách % đến SL."
         ),
-        "skill_keys": ["Volatility", "TechnicalBasic", "MarketRegime"],
+        "skill_keys": [
+            "Volatility", "TechnicalBasic", "MarketRegime",
+        ],
     },
     {
         "id":    "fundamental_filter",
@@ -499,12 +571,15 @@ EXPERTS = [
         "emoji": "📋",
         "focus": (
             "Bạn là chuyên gia phân tích cơ bản và đa nhân tố. "
-            "Trường phái: FundamentalFilter (P/E, P/B, ROE), MLStrategy (Random Forest signal), "
-            "Seasonal patterns, sector rotation. "
-            "PHẢI dẫn chứng từ FundamentalFilter detail và MLStrategy detail. "
-            "Đặt câu hỏi: tại sao mua mã này mà không mua mã khác cùng ngành?"
+            "Trường phái: FundamentalFilter (P/E, P/B, ROE so ngành), "
+            "MLStrategy (Random Forest signal, feature importance), "
+            "Seasonal (tháng mạnh/yếu theo lịch sử), sector rotation. "
+            "PHẢI dẫn chứng từ FundamentalFilter và MLStrategy detail. "
+            "Đặt câu hỏi phản biện: tại sao mã này hơn mã khác cùng ngành?"
         ),
-        "skill_keys": ["FundamentalFilter", "MLStrategy", "Seasonal", "Harmonic"],
+        "skill_keys": [
+            "FundamentalFilter", "MLStrategy", "Seasonal", "Harmonic",
+        ],
     },
 ]
 
@@ -515,8 +590,9 @@ EXPERTS = [
 
 def _build_data_block(td: dict) -> str:
     """Block dữ liệu kỹ thuật chung — truyền cho tất cả experts."""
-    price = td["price"]
-    sr    = td["sr_levels"]
+    price  = td["price"]
+    sr     = td["sr_levels"]
+    ma50_s = f"{td['ma50']:,.0f}" if td["ma50"] else "N/A (<50 bars)"
 
     s_lines = "\n".join(
         f"  S{i+1}: {s['price']:,.0f}  ({s['dist_pct']:+.1f}%)  — {s['reason']}"
@@ -527,102 +603,126 @@ def _build_data_block(td: dict) -> str:
         for i, r in enumerate(sr["resistance"][:3])
     )
 
-    bull_engines = [k for k, v in td["signals"].items() if v > 0]
-    bear_engines = [k for k, v in td["signals"].items() if v < 0]
-    neu_engines  = [k for k, v in td["signals"].items() if v == 0]
-    ma50_str     = f"{td['ma50']:,.0f}" if td["ma50"] else "N/A (<50 bars)"
+    bull_eng = [k for k, v in td["signals"].items() if v > 0]
+    bear_eng = [k for k, v in td["signals"].items() if v < 0]
+    neu_eng  = [k for k, v in td["signals"].items() if v == 0]
 
     news_str = ""
     if td["news_headlines"]:
         news_str = "\nTIN TỨC GẦN ĐÂY:\n" + "\n".join(
-            f"  • {h[:120]}" for h in td["news_headlines"][:4]
+            f"  • {h[:120]}" for h in td["news_headlines"][:5]
         )
 
     comm_str = ""
     if td["commodity_detail"]:
         sig_em = "🟢" if td["commodity_signal"] > 0 else "🔴" if td["commodity_signal"] < 0 else "⚪"
-        comm_str = f"\nHÀNG HÓA ({sig_em}): {td['commodity_detail'][:120]}"
+        comm_str = f"\nHÀNG HÓA ({sig_em}): {td['commodity_detail'][:150]}"
+
+    rsi_flag = ""
+    if td["rsi"] > 70:
+        rsi_flag = "  ⚠️ QUÁ MUA"
+    elif td["rsi"] < 30:
+        rsi_flag = "  ⚠️ QUÁ BÁN"
 
     return (
         f"=== DỮ LIỆU KỸ THUẬT: {td['symbol']} ===\n"
-        f"Thời điểm: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        f"Thời điểm   : {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
         f"--- GIÁ & INDICATORS ---\n"
-        f"Giá hiện tại  : {price:,.0f} VND\n"
-        f"Thay đổi      : 1W={td['change_1w_pct']:+.1f}%  |  1M={td['change_1m_pct']:+.1f}%\n"
-        f"RSI(14)       : {td['rsi']:.1f}"
-        f"{'  ⚠️ Quá mua' if td['rsi']>70 else '  ⚠️ Quá bán' if td['rsi']<30 else ''}\n"
-        f"MACD          : {td['macd']:.4f}  |  Hist={td['macd_hist']:+.4f}  |  Signal={td['macd_signal']:.4f}\n"
-        f"Volume        : {td['volume_ratio']:.2f}x TB20\n"
-        f"MA20={td['ma20']:,.0f}  |  MA50={ma50_str}\n"
-        f"BB Upper={td['bb_upper']:,.0f}  |  Lower={td['bb_lower']:,.0f}  |  Mid={td['bb_mid']:,.0f}\n\n"
+        f"Giá hiện tại: {price:,.0f} VND\n"
+        f"Thay đổi    : 1W={td['change_1w_pct']:+.1f}%  |  1M={td['change_1m_pct']:+.1f}%\n"
+        f"RSI(14)     : {td['rsi']:.1f}{rsi_flag}\n"
+        f"MACD        : {td['macd']:.4f}  |  Hist={td['macd_hist']:+.4f}"
+        f"{'  ▲' if td['macd_hist']>0 else '  ▼'}  |  Signal={td['macd_signal']:.4f}\n"
+        f"Volume      : {td['volume_ratio']:.2f}x TB20"
+        f"{'  ✅ Xác nhận' if td['volume_ratio']>1.5 else '  ⚠️ Yếu' if td['volume_ratio']<0.7 else ''}\n"
+        f"MA20={td['ma20']:,.0f}  |  MA50={ma50_s}\n"
+        f"BB Upper={td['bb_upper']:,.0f}  |  BB Mid={td['bb_mid']:,.0f}  |  BB Lower={td['bb_lower']:,.0f}\n"
+        f"BB Width    : {(td['bb_upper']-td['bb_lower'])/td['bb_mid']*100:.1f}% (độ biến động)\n\n"
         f"--- HỖ TRỢ (gần → xa) ---\n{s_lines}\n\n"
         f"--- KHÁNG CỰ (gần → xa) ---\n{r_lines}\n\n"
         f"--- KẾT QUẢ 16 ENGINES ---\n"
-        f"Phán quyết: {td['verdict_label']}  ({td['confidence_pct']:.0f}%)\n"
-        f"Bull: {td['bull_count']}/{td['active_agents']} → {', '.join(bull_engines) or 'Không có'}\n"
-        f"Bear: {td['bear_count']}/{td['active_agents']} → {', '.join(bear_engines) or 'Không có'}\n"
-        f"Neutral: {len(neu_engines)} engines ({', '.join(neu_engines[:4])})\n\n"
+        f"Phán quyết  : {td['verdict_label']}  ({td['confidence_pct']:.0f}%)\n"
+        f"Bull engines: {td['bull_count']}/{td['active_agents']} — {', '.join(bull_eng) or 'Không có'}\n"
+        f"Bear engines: {td['bear_count']}/{td['active_agents']} — {', '.join(bear_eng) or 'Không có'}\n"
+        f"Neutral     : {len(neu_eng)} — {', '.join(neu_eng[:5])}\n\n"
         f"--- VĨ MÔ ---\n"
         f"Market Regime : {td['market_regime']}\n"
-        f"Macro context : {td['macro_label']} {td['macro_detail'][:80] if td['macro_detail'] else ''}"
+        f"Macro context : {td['macro_label']}"
+        f"{' — ' + td['macro_detail'][:100] if td['macro_detail'] else ''}"
         f"{comm_str}{news_str}\n\n"
-        f"--- MÂU THUẪN ---\n"
-        f"{chr(10).join(td['contradictions'][:4]) if td['contradictions'] else 'Không có mâu thuẫn'}\n\n"
+        f"--- MÂU THUẪN ENGINES ---\n"
+        f"{chr(10).join(td['contradictions'][:4]) if td['contradictions'] else 'Không có mâu thuẫn rõ ràng'}\n\n"
         f"--- ACTION PLAN TỪ /CHECK ---\n"
-        f"TP={td['tp_check']:,.0f}  |  SL={td['sl_check']:,.0f}  |  Entry={td['entry_check']:,.0f}"
+        f"Entry={td['entry_check']:,.0f}  |  TP={td['tp_check']:,.0f}"
+        f"{'  (hợp lệ)' if td['tp_check']>0 else '  (chưa xác định)'}  "
+        f"|  SL={td['sl_check']:,.0f}"
+        f"{'  (hợp lệ)' if td['sl_check']>0 else '  (chưa xác định)'}"
     ).strip()
 
 
 def _get_skill_block(expert: dict, td: dict) -> str:
-    """Trích skill details theo từng chuyên gia."""
+    """
+    Trích skill details theo từng chuyên gia — đầy đủ, có label rõ ràng.
+    Nếu engine không có detail → ghi rõ 'không có dữ liệu'.
+    """
     lines = []
     for sk in expert["skill_keys"]:
-        detail = td["engine_details"].get(sk, "")
-        if detail and len(detail) > 15:
-            lines.append(f"  [{sk}] {detail[:200]}")
-    return "\n".join(lines) if lines else "  (Không có detail từ engine này)"
+        detail = td["engine_details"].get(sk, "").strip()
+        signal = td["signals"].get(sk, None)
+        sig_em = ""
+        if signal is not None:
+            sig_em = " [🟢 BUY]" if signal > 0 else " [🔴 SELL]" if signal < 0 else " [⚪ NEU]"
+        if detail and len(detail) > 10:
+            lines.append(f"  [{sk}]{sig_em}:\n    {detail[:280]}")
+        else:
+            lines.append(f"  [{sk}]{sig_em}: (không có detail từ engine này)")
+    return "\n".join(lines)
 
 
 def _build_round1_prompt(
     expert: dict, data_block: str, skill_block: str, td: dict
 ) -> tuple[str, str]:
-    price_lo = round(td["price"] * (1 - PRICE_BAND_PCT), 0)
-    price_hi = round(td["price"] * (1 + PRICE_BAND_PCT), 0)
+    price    = td["price"]
+    price_lo = round(price * (1 - PRICE_BAND_PCT), 0)
+    price_hi = round(price * (1 + PRICE_BAND_PCT), 0)
+
     system = (
         f"Bạn là {expert['role']} trong Hội đồng Chuyên gia Phân tích Cổ phiếu VN.\n"
         f"{expert['focus']}\n\n"
-        "QUY TẮC BẮT BUỘC:\n"
-        "1. Dẫn chứng SỐ LIỆU CỤ THỂ — tên chỉ báo + mức giá + vị trí.\n"
-        "   TỐT: 'RSI=62 tiếp cận quá mua, MACD hist=+0.0012 đang tăng'\n"
-        "   XẤU: 'các chỉ báo cho thấy tích cực' (quá chung chung)\n"
-        "2. STANCE=MUA/BAN → bắt buộc Entry, SL, TP, R:R cụ thể.\n"
-        "3. R:R = (TP-Entry)/(Entry-SL). Nếu R:R < 1.5 → BẮT BUỘC đổi THEO DOI.\n"
-        "4. SCORE từ -5 đến +5: âm=bearish, dương=bullish, 0=neutral.\n"
-        "5. Chỉ phân tích theo trường phái của mình.\n"
-        f"6. ⚠️ RÀNG BUỘC GIÁ CỨNG: Mọi mức giá bạn đề xuất (Entry, SL, TP, S/R)\n"
-        f"   PHẢI nằm trong biên độ [{price_lo:,.0f} – {price_hi:,.0f}] (±30% giá hiện tại).\n"
-        f"   CHỈ sử dụng dữ liệu được cung cấp. KHÔNG tự suy diễn giá.\n"
-        f"   Nếu thiếu dữ liệu → ghi rõ 'không đủ thông tin' thay vì đoán.\n"
-        f"   Số có dấu [~xxx] trong SKILL DETAILS = giá ngoài biên, KHÔNG được dùng.\n\n"
-        "ĐỊNH DẠNG (bắt buộc, đúng thứ tự):\n"
+        "═══ QUY TẮC BẮT BUỘC ═══\n"
+        "1. ĐỌC KỸ SKILL DETAILS → dẫn chứng số liệu cụ thể (tên chỉ báo + giá trị).\n"
+        "   VÍ DỤ TỐT: 'RSI=62 tiếp cận vùng quá mua, MACD hist=+0.0032 tăng 3 phiên'\n"
+        "   VÍ DỤ XẤU: 'các chỉ báo cho thấy xu hướng tích cực' (quá chung chung)\n"
+        "2. STANCE=MUA hoặc BAN → BẮT BUỘC cung cấp Entry, SL, TP, tính R:R.\n"
+        "3. R:R = (TP - Entry) / (Entry - SL). Nếu R:R < 1.5 → ĐỔI SANG THEO DOI.\n"
+        "4. SCORE từ -5 đến +5 (âm=bearish, dương=bullish, 0=neutral).\n"
+        "5. Chỉ phân tích theo trường phái của mình — không lấn sang trường phái khác.\n"
+        f"6. ⚠️ RÀNG BUỘC GIÁ CỨNG: Mọi giá đề xuất PHẢI trong [{price_lo:,.0f}–{price_hi:,.0f}].\n"
+        f"   Số có dấu [~xxx] trong Skill Details = giá ngoài biên, TUYỆT ĐỐI KHÔNG dùng.\n"
+        "7. KHÔNG tự suy diễn giá không có trong dữ liệu — nếu thiếu, ghi 'không đủ thông tin'.\n\n"
+        "═══ ĐỊNH DẠNG ĐẦU RA (theo đúng thứ tự) ═══\n"
         "STANCE: [MUA/BAN/THEO DOI]\n"
         "SCORE: [-5..+5]\n"
         "CONFIDENCE: [0-100]\n"
-        "REASON: [1 câu có số liệu cụ thể]\n"
-        "ENTRY: [giá hoặc 0]\n"
-        "SL: [giá]  TP: [giá]  RR: [số]\n"
-        "TRIGGER: [điều kiện kích hoạt có giá + indicator]\n"
-        "RISK: [rủi ro có số liệu]\n"
-        "KEY_DATA: [2-3 bullet từ skill của mình, mỗi bullet có số liệu]"
+        "REASON: [1-2 câu — dẫn số liệu cụ thể từ skill]\n"
+        "ENTRY: [giá VND hoặc 0 nếu chờ]\n"
+        "SL: [giá] | TP: [giá] | RR: [số thập phân]\n"
+        "TRIGGER: [điều kiện kích hoạt — phải có giá + tên indicator]\n"
+        "RISK: [rủi ro chính — dẫn số liệu]\n"
+        "KEY_DATA:\n"
+        "  - [bullet 1 — số liệu từ skill]\n"
+        "  - [bullet 2 — số liệu từ skill]\n"
+        "  - [bullet 3 — số liệu từ skill]"
     )
+
     user = (
-        f"Phân tích {td['symbol']} từ góc nhìn {expert['role']}:\n\n"
+        f"Phân tích {td['symbol']} từ góc nhìn {expert['role']}.\n\n"
         f"{data_block}\n\n"
-        f"=== SKILL DETAILS CHO {expert['role'].upper()} ===\n"
+        f"═══ SKILL DETAILS CHO {expert['role'].upper()} ═══\n"
         f"{skill_block}\n\n"
-        "Phân tích dựa trên SKILL DETAILS trên. "
-        "Dẫn chứng số liệu cụ thể, tính R:R thực tế. "
-        "R:R < 1.5 → BẮT BUỘC đổi THEO DOI."
+        "Phân tích DỰA TRÊN SKILL DETAILS trên. "
+        "Mỗi điểm phải có số liệu cụ thể. "
+        "Tính R:R thực tế từ ATR và S/R. R:R < 1.5 → BẮT BUỘC THEO DOI."
     )
     return system, user
 
@@ -635,39 +735,48 @@ def _build_round2_prompt(
     for op in r1_opinions:
         if op.expert_id == expert["id"]:
             continue
-        kp = op.key_points[0][:100] if op.key_points else op.concern[:80]
-        others.append(f"[{op.role}] {op.stance}({op.confidence}%, Score={op.score:+d}) — {kp}")
+        kp = op.key_points[0][:110] if op.key_points else op.concern[:90]
+        others.append(
+            f"  [{op.role}] → {op.stance} (Score={op.score:+d}, Conf={op.confidence}%)\n"
+            f"    Lý do: {kp}\n"
+            f"    Rủi ro: {op.concern[:70]}"
+        )
 
-    price_lo = round(td["price"] * (1 - PRICE_BAND_PCT), 0)
-    price_hi = round(td["price"] * (1 + PRICE_BAND_PCT), 0)
+    price    = td["price"]
+    price_lo = round(price * (1 - PRICE_BAND_PCT), 0)
+    price_hi = round(price * (1 + PRICE_BAND_PCT), 0)
+
     system = (
-        f"Bạn là {expert['role']} — VÒNG 2 PHẢN BIỆN.\n"
+        f"Bạn là {expert['role']} — VÒNG 2: PHẢN BIỆN CHÉO.\n"
         f"{expert['focus']}\n\n"
-        "YÊU CẦU:\n"
-        "1. Bảo vệ hoặc điều chỉnh stance sau khi nghe experts khác.\n"
-        "2. PHẢN BIỆN trực tiếp ít nhất 1 expert đối lập — dẫn số liệu cụ thể.\n"
-        "3. Ghi rõ: đồng ý với ai, điểm gì.\n"
-        "4. Nếu Risk Manager chỉ ra R:R < 1.5 → BẮT BUỘC điều chỉnh.\n"
-        "5. Cập nhật SCORE nếu cần.\n"
-        f"6. ⚠️ Mọi giá đề xuất PHẢI trong [{price_lo:,.0f} – {price_hi:,.0f}]. "
-        f"KHÔNG tự bịa giá. Số [~xxx] = giá ngoài biên, KHÔNG dùng.\n\n"
-        "ĐỊNH DẠNG:\n"
+        "═══ NHIỆM VỤ VÒNG 2 ═══\n"
+        "1. Bảo vệ hoặc điều chỉnh stance sau khi nghe ý kiến các expert khác.\n"
+        "2. PHẢN BIỆN TRỰC TIẾP ít nhất 1 expert có stance đối lập — dẫn số liệu.\n"
+        "3. Ghi rõ: đồng ý với ai (điểm gì cụ thể).\n"
+        "4. Nếu Risk Manager chỉ ra R:R < 1.5 → BẮT BUỘC điều chỉnh stance.\n"
+        "5. Cập nhật SCORE nếu quan điểm thay đổi.\n"
+        f"6. ⚠️ GIÁ PHẢI trong [{price_lo:,.0f}–{price_hi:,.0f}]. Số [~xxx] = ngoài biên, KHÔNG dùng.\n\n"
+        "═══ ĐỊNH DẠNG ═══\n"
         "STANCE: [MUA/BAN/THEO DOI]\n"
         "SCORE: [-5..+5]\n"
         "CONFIDENCE: [0-100]\n"
-        "REASON: [1 câu có số liệu cập nhật]\n"
-        "ENTRY: [giá]  SL: [giá]  TP: [giá]  RR: [số]\n"
-        "REBUTS: [phản biện ai, điểm gì, dẫn số liệu]\n"
-        "AGREES: [đồng ý với ai, điểm gì]\n"
+        "REASON: [1-2 câu cập nhật — có số liệu]\n"
+        "ENTRY: [giá] | SL: [giá] | TP: [giá] | RR: [số]\n"
+        "REBUTS: [phản biện expert nào, điểm gì, dẫn số liệu đối chiếu]\n"
+        "AGREES: [đồng ý với expert nào, điểm gì]\n"
         "TRIGGER: [điều kiện kích hoạt]\n"
         "RISK: [rủi ro cập nhật]"
     )
+
     user = (
-        f"Vòng 1 của bạn: {own_r1.stance}({own_r1.confidence}%, Score={own_r1.score:+d})\n"
+        f"Vòng 1 của bạn: {own_r1.stance} (Score={own_r1.score:+d}, Conf={own_r1.confidence}%)\n"
         f"Lý do: {own_r1.key_points[0] if own_r1.key_points else 'N/A'}\n\n"
-        f"Ý kiến experts khác:\n" + "\n".join(others) +
-        f"\n\nSkill của bạn:\n{skill_block[:400]}\n\n"
-        "Cập nhật stance có dẫn chứng số liệu cụ thể. R:R < 1.5 → THEO DOI."
+        f"═══ Ý KIẾN VÒNG 1 CỦA CÁC EXPERTS KHÁC ═══\n"
+        + "\n".join(others) +
+        f"\n\n═══ SKILL CỦA BẠN (tóm tắt) ═══\n{skill_block[:450]}\n\n"
+        "Cập nhật stance với dẫn chứng số liệu. "
+        "R:R < 1.5 → đổi THEO DOI. "
+        "Phản biện ít nhất 1 expert đối lập."
     )
     return system, user
 
@@ -677,22 +786,24 @@ def _build_round3_prompt(
     r2_opinions: list[ExpertOpinion], own_r2: ExpertOpinion, td: dict,
 ) -> tuple[str, str]:
     others = [
-        f"[{op.role}] {op.stance}({op.confidence}%, Score={op.score:+d})"
+        f"  [{op.role}] {op.stance} Score={op.score:+d}"
         for op in r2_opinions if op.expert_id != expert["id"]
     ]
-    price_lo = round(td["price"] * (1 - PRICE_BAND_PCT), 0)
-    price_hi = round(td["price"] * (1 + PRICE_BAND_PCT), 0)
+
+    price    = td["price"]
+    price_lo = round(price * (1 - PRICE_BAND_PCT), 0)
+    price_hi = round(price * (1 + PRICE_BAND_PCT), 0)
+
     system = (
-        f"Bạn là {expert['role']} — VÒNG 3 KẾT LUẬN CUỐI.\n"
+        f"Bạn là {expert['role']} — VÒNG 3: KẾT LUẬN CUỐI CÙNG.\n"
         f"{expert['focus']}\n\n"
-        "ĐÂY LÀ VÒNG CUỐI:\n"
-        "1. Xác nhận stance cuối — không đổi trừ khi có lý do số liệu mạnh.\n"
-        "2. Đề xuất kịch bản cụ thể nhất với Entry/SL/TP rõ ràng.\n"
-        "3. Nêu 1 rủi ro quan trọng nhất mà các expert khác bỏ qua.\n"
-        "4. Viết KEY_TAKEAWAY 1-2 câu — dẫn số liệu.\n"
-        f"5. ⚠️ Mọi giá PHẢI trong [{price_lo:,.0f} – {price_hi:,.0f}]. "
-        f"KHÔNG tự bịa. Số [~xxx] = ngoài biên, KHÔNG dùng.\n\n"
-        "ĐỊNH DẠNG NGẮN GỌN:\n"
+        "═══ VÒNG CUỐI — NGẮN GỌN, SỐ LIỆU ═══\n"
+        "1. Xác nhận stance cuối — không thay đổi trừ khi có bằng chứng số liệu mạnh.\n"
+        "2. Đề xuất kịch bản cụ thể nhất: Entry/SL/TP rõ ràng.\n"
+        "3. Nêu 1 rủi ro quan trọng mà experts khác CHƯA đề cập.\n"
+        "4. Viết KEY_TAKEAWAY 1-2 câu — số liệu cụ thể, súc tích.\n"
+        f"5. ⚠️ Mọi giá PHẢI trong [{price_lo:,.0f}–{price_hi:,.0f}]. Số [~xxx] = KHÔNG dùng.\n\n"
+        "═══ ĐỊNH DẠNG NGẮN GỌN ═══\n"
         "STANCE: [MUA/BAN/THEO DOI]\n"
         "SCORE: [-5..+5]\n"
         "CONFIDENCE: [0-100]\n"
@@ -701,32 +812,38 @@ def _build_round3_prompt(
         "ALERT: [rủi ro bị bỏ qua]\n"
         "KEY_TAKEAWAY: [1-2 câu kết luận có số liệu]"
     )
+
     user = (
-        f"Vòng 2 của bạn: {own_r2.stance}({own_r2.confidence}%, Score={own_r2.score:+d})\n"
-        f"Experts khác: {' | '.join(others)}\n\n"
-        "Xác nhận kịch bản cuối. R:R = (TP-Entry)/(Entry-SL). R:R < 1.5 → THEO DOI."
+        f"Vòng 2 của bạn: {own_r2.stance} (Score={own_r2.score:+d}, Conf={own_r2.confidence}%)\n"
+        f"Experts vòng 2: {' | '.join(others)}\n\n"
+        "Xác nhận kịch bản cuối. "
+        "R:R = (TP-Entry)/(Entry-SL). "
+        "R:R < 1.5 → THEO DOI."
     )
     return system, user
 
 
 def _build_moderator_prompt(
-    td: dict, data_block: str,
+    td: dict,
+    data_block: str,
     r1: list[ExpertOpinion],
     r2: list[ExpertOpinion],
     r3: list[ExpertOpinion],
 ) -> tuple[str, str]:
-    final    = r3 or r2
+    final    = r3 or r2 or r1
     stances  = [op.stance for op in final]
     scores   = [op.score  for op in final]
     buy_c    = stances.count("MUA")
     sell_c   = stances.count("BAN")
     watch_c  = stances.count("THEO DOI")
     n_exp    = len(stances) or 5
-    avg_score = sum(scores) / len(scores) if scores else 0
-    dominant  = max(buy_c, sell_c, watch_c)
-    avg_conf  = sum(op.confidence for op in final) / len(final) if final else 60
-    base_conf = max(40, round((dominant / n_exp) * avg_conf))
+    avg_score = sum(scores) / max(len(scores), 1)
+    avg_conf  = sum(op.confidence for op in final) / max(len(final), 1)
 
+    dominant  = max(buy_c, sell_c, watch_c)
+    base_conf = max(45, round((dominant / n_exp) * avg_conf))
+
+    # S/R
     price  = td["price"]
     sr     = td["sr_levels"]
     s1     = sr["support"][0]["price"]
@@ -735,86 +852,109 @@ def _build_moderator_prompt(
     sl_est = td["sl_check"] or s1
     rr_est = round((tp_est - price) / max(price - sl_est, 1), 2) if tp_est > sl_est else 2.0
 
+    # Opinion text
     opinions_text = ""
     for op in final:
         em = next((e["emoji"] for e in EXPERTS if e["id"] == op.expert_id), "👤")
-        kp = "; ".join(op.key_points[:2])[:150]
+        kp = "; ".join(op.key_points[:2])[:160]
         opinions_text += (
-            f"\n{em} {op.role}: {op.stance}({op.confidence}%, Score={op.score:+d})\n"
-            f"  {kp}\n"
-            f"  Rủi ro: {op.concern[:80]}\n"
+            f"\n{em} {op.role}: {op.stance} Score={op.score:+d} Conf={op.confidence}%\n"
+            f"  Lý do: {kp}\n"
+            f"  Rủi ro: {op.concern[:90]}\n"
         )
 
     sr_text = (
-        f"S1={s1:,.0f} S2={sr['support'][1]['price']:,.0f} S3={sr['support'][2]['price']:,.0f}\n"
-        f"R1={r1_p:,.0f} R2={sr['resistance'][1]['price']:,.0f} R3={sr['resistance'][2]['price']:,.0f}"
+        f"S1={s1:,.0f}  S2={sr['support'][1]['price']:,.0f}  S3={sr['support'][2]['price']:,.0f}\n"
+        f"R1={r1_p:,.0f}  R2={sr['resistance'][1]['price']:,.0f}  R3={sr['resistance'][2]['price']:,.0f}"
     )
 
-    # Nếu dominant là THEO DOI → scenario_watch là ưu tiên
-    watch_dominant = (watch_c >= buy_c and watch_c >= sell_c and watch_c > 0)
-    sc_watch_prob  = 60 if watch_dominant else 30
-    sc_buy_prob    = 15 if watch_dominant else 50
-    sc_sell_prob   = 15 if watch_dominant else 20
+    # Scenario probability logic — nhất quán với dominant stance
+    watch_dominant = watch_c >= buy_c and watch_c >= sell_c and watch_c > 0
+    buy_dominant   = buy_c > watch_c and buy_c > sell_c
+    sell_dominant  = sell_c > watch_c and sell_c > buy_c
+
+    if watch_dominant:
+        sc_watch_prob = 60
+        sc_buy_prob   = 20
+        sc_sell_prob  = 15
+    elif buy_dominant:
+        sc_buy_prob   = 55
+        sc_watch_prob = 30
+        sc_sell_prob  = 15
+    elif sell_dominant:
+        sc_sell_prob  = 50
+        sc_watch_prob = 30
+        sc_buy_prob   = 15
+    else:
+        sc_buy_prob = sc_sell_prob = sc_watch_prob = 33
+
     price_lo = round(price * (1 - PRICE_BAND_PCT), 0)
     price_hi = round(price * (1 + PRICE_BAND_PCT), 0)
 
-    watch_rule = (
-        f"9. ⚠️ LOGIC STANCE: {watch_c}/{n_exp} experts THEO DOI → "
-        f"scenario_watch phải là ưu tiên (probability ~{sc_watch_prob}%).\n"
-        f"   scenario_buy/sell chỉ là dự phòng (prob ~{sc_buy_prob}% / {sc_sell_prob}%).\n"
-        if watch_dominant else ""
-    )
+    watch_rule = ""
+    if watch_dominant:
+        watch_rule = (
+            f"9. ⚠️ LOGIC: {watch_c}/{n_exp} experts THEO DOI → "
+            f"panel_verdict='THEO DOI', scenario_watch ưu tiên (~{sc_watch_prob}%).\n"
+            f"   scenario_buy/sell chỉ dự phòng (~{sc_buy_prob}%/{sc_sell_prob}%).\n"
+        )
 
     system = (
         "Bạn là MODERATOR Hội đồng Chuyên gia Phân tích Cổ phiếu VN.\n"
-        "Tổng hợp 3 vòng tranh luận → JSON THUẦN (không markdown, không cắt).\n\n"
-        "QUY TẮC:\n"
+        "Tổng hợp 3 vòng tranh luận → trả về JSON THUẦN (không markdown, không backtick).\n\n"
+        "═══ QUY TẮC JSON ═══\n"
         f"1. panel_confidence >= {base_conf}.\n"
-        "2. R:R = (tp1-entry)/(entry-sl). R:R < 1.5 → entry=0, rr_warning có nội dung.\n"
-        "3. support_levels: S1 gần nhất dưới giá, cách nhau >= 2.5%.\n"
-        "4. resistance_levels: R1 gần nhất trên giá, cách nhau >= 2.5%.\n"
-        "5. main_risks và key_catalysts: PHẢI dẫn số liệu cụ thể.\n"
-        "6. moderator_summary: TEXT THUẦN tiếng Việt 80-120 từ, KHÔNG JSON.\n"
-        f"7. final_score = {round(avg_score, 1)}\n"
+        "2. R:R = (tp1-entry)/(entry-sl). R:R < 1.5 → entry=0, rr_warning='R:R=X < 1.5'.\n"
+        "3. support_levels: S1 gần nhất dưới giá, cách nhau >= 2.5%, có lý do kỹ thuật.\n"
+        "4. resistance_levels: R1 gần nhất trên giá, cách nhau >= 2.5%, có lý do.\n"
+        "5. main_risks: MỖI mục phải có số liệu cụ thể (giá/%, tên indicator).\n"
+        "6. key_catalysts: MỖI mục phải có số liệu/điều kiện cụ thể.\n"
+        "7. moderator_summary: TEXT THUẦN tiếng Việt 80-120 từ, KHÔNG lẫn JSON.\n"
         f"8. ⚠️ RÀNG BUỘC GIÁ: Mọi entry/sl/tp/support/resistance PHẢI trong "
-        f"[{price_lo:,.0f} – {price_hi:,.0f}] (±30% giá {price:,.0f}). KHÔNG tự bịa giá.\n"
+        f"[{price_lo:,.0f}–{price_hi:,.0f}] (±30% giá {price:,.0f}). KHÔNG tự bịa giá.\n"
         + watch_rule +
-        "OUTPUT JSON THUẦN:\n"
+        "═══ CẤU TRÚC JSON ĐẦY ĐỦ ═══\n"
         "{\n"
         '  "panel_verdict": "MUA|BAN|THEO DOI",\n'
         f'  "panel_confidence": {base_conf},\n'
         f'  "final_score": {round(avg_score, 1)},\n'
         '  "rr_warning": "",\n'
         '  "consensus_level": "DONG THUAN|PHAN BIEN|CHIA RE",\n'
-        f'  "scenario_buy": {{"probability": {sc_buy_prob}, "entry": {round(price,0)}, '
-        f'"tp1": {round(tp_est,0)}, "tp2": {round(tp_est*1.04,0)}, '
-        f'"sl": {round(sl_est,0)}, "rr": {rr_est}, '
-        '"trigger": "MUA khi [giá]+[volume]+[indicator]", "catalyst": "[cụ thể]"}},\n'
-        f'  "scenario_sell": {{"probability": {sc_sell_prob}, "entry": 0, '
-        f'"tp": {round(sl_est*0.97,0)}, "sl": {round(r1_p*1.02,0)}, "rr": 2.0, '
-        '"trigger": "BÁN khi [điều kiện]", "catalyst": "[cụ thể]"}},\n'
-        f'  "scenario_watch": {{"probability": {sc_watch_prob}, "trigger": "Chờ [điều kiện cụ thể]", '
-        '"watch_for": "[tín hiệu có số liệu]"}},\n'
-        f'  "support_levels": [{{"price": {s1}, "reason": "[lý do kỹ thuật]", '
-        f'"dist_pct": {round((s1-price)/price*100,1)}}}, '
+        f'  "scenario_buy": {{"probability": {sc_buy_prob}, '
+        f'"entry": {round(price, 0)}, '
+        f'"tp1": {round(tp_est, 0)}, "tp2": {round(tp_est * 1.04, 0)}, '
+        f'"sl": {round(sl_est, 0)}, "rr": {rr_est}, '
+        '"trigger": "MUA khi [giá cụ thể]+[volume]+[indicator]", '
+        '"catalyst": "[điều kiện cụ thể có số]"}},\n'
+        f'  "scenario_sell": {{"probability": {sc_sell_prob}, '
+        '"entry": 0, '
+        f'"tp": {round(sl_est * 0.97, 0)}, "sl": {round(r1_p * 1.02, 0)}, "rr": 2.0, '
+        '"trigger": "BÁN khi [điều kiện]", '
+        '"catalyst": "[điều kiện cụ thể]"}},\n'
+        f'  "scenario_watch": {{"probability": {sc_watch_prob}, '
+        '"trigger": "Chờ [điều kiện cụ thể có số]", '
+        '"watch_for": "[tín hiệu cụ thể: tên indicator + ngưỡng]"}},\n'
+        f'  "support_levels": [{{"price": {s1}, "reason": "[lý do kỹ thuật cụ thể]", '
+        f'"dist_pct": {round((s1 - price) / price * 100, 1)}}}, '
         f'{{"price": {sr["support"][1]["price"]}, "reason": "[lý do]", "dist_pct": 0}}, '
         f'{{"price": {sr["support"][2]["price"]}, "reason": "[lý do]", "dist_pct": 0}}],\n'
-        f'  "resistance_levels": [{{"price": {r1_p}, "reason": "[lý do kỹ thuật]", '
-        f'"dist_pct": {round((r1_p-price)/price*100,1)}}}, '
+        f'  "resistance_levels": [{{"price": {r1_p}, "reason": "[lý do kỹ thuật cụ thể]", '
+        f'"dist_pct": {round((r1_p - price) / price * 100, 1)}}}, '
         f'{{"price": {sr["resistance"][1]["price"]}, "reason": "[lý do]", "dist_pct": 0}}, '
         f'{{"price": {sr["resistance"][2]["price"]}, "reason": "[lý do]", "dist_pct": 0}}],\n'
-        '  "main_risks": ["[rủi ro 1 có số liệu]", "[rủi ro 2]", "[rủi ro 3]"],\n'
-        '  "key_catalysts": ["[catalyst 1 có số liệu]", "[catalyst 2]"],\n'
+        '  "main_risks": ["[rủi ro 1 có số liệu]", "[rủi ro 2 có số]", "[rủi ro 3 có số]"],\n'
+        '  "key_catalysts": ["[catalyst 1 có số/điều kiện]", "[catalyst 2]"],\n'
         '  "shelf_life_days": 7,\n'
-        '  "moderator_summary": "TEXT THUẦN 80-120 từ tiếng Việt, không JSON."\n'
+        '  "moderator_summary": "TEXT THUẦN tiếng Việt 80-120 từ."\n'
         "}"
     )
+
     user = (
-        f"Mã: {td['symbol']} | Giá: {price:,.0f}\n"
-        f"Vote 3 vòng: MUA={buy_c} BAN={sell_c} THEO DOI={watch_c}\n"
+        f"Mã: {td['symbol']}  |  Giá: {price:,.0f}  |  {td['verdict_label']}\n"
+        f"Vote cuối: MUA={buy_c} BAN={sell_c} THEO DOI={watch_c}\n"
         f"Avg Score: {avg_score:+.1f}  |  Confidence floor: {base_conf}%\n\n"
-        f"Ý kiến vòng cuối:{opinions_text}\n"
-        f"S/R:\n{sr_text}\n"
+        f"Ý kiến 3 vòng (final):{opinions_text}\n"
+        f"S/R từ 16 engines:\n{sr_text}\n\n"
         f"TP={tp_est:,.0f}  SL={sl_est:,.0f}  R:R={rr_est:.2f}\n\n"
         "Trả về JSON ĐẦY ĐỦ, đóng tất cả ngoặc. "
         "moderator_summary là TEXT THUẦN, không JSON."
@@ -827,6 +967,7 @@ def _build_moderator_prompt(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _parse_expert_response(expert: dict, raw: str, round_num: int) -> ExpertOpinion:
+    """Parse output từ LLM expert theo định dạng structured."""
     lines      = raw.strip().split("\n")
     stance     = "THEO DOI"
     score      = 0
@@ -845,7 +986,7 @@ def _parse_expert_response(expert: dict, raw: str, round_num: int) -> ExpertOpin
 
         elif lu.startswith("SCORE:"):
             try:
-                score = int(float(re.sub(r"[^\d\.\-\+]", "", l.split(":", 1)[1].strip()[:5])))
+                score = int(float(re.sub(r"[^\d\.\-\+]", "", l.split(":", 1)[1].strip()[:6])))
                 score = max(-5, min(5, score))
             except Exception:
                 pass
@@ -860,58 +1001,82 @@ def _parse_expert_response(expert: dict, raw: str, round_num: int) -> ExpertOpin
         elif lu.startswith(("REASON:", "FINAL_REASON:")):
             txt = l.split(":", 1)[1].strip()
             if txt:
-                key_points.insert(0, txt[:150])
+                key_points.insert(0, txt[:180])
 
         elif lu.startswith(("KEY_TAKEAWAY:", "KEY_DATA:")):
             txt = l.split(":", 1)[1].strip()
             if txt:
-                key_points.append(txt[:150])
+                key_points.append(txt[:180])
 
         elif lu.startswith("ENTRY:"):
-            m = re.search(r"[\d]+\.?\d*", l.split(":", 1)[1].replace(",", ""))
+            # Handle "ENTRY: 68000 | SL: 65000 | TP: 72000 | RR: 1.7"
+            rest = l.split(":", 1)[1]
+            entry_part = rest.split("|")[0] if "|" in rest else rest
+            m = re.search(r"[\d,]+(?:\.\d+)?", entry_part)
             if m:
                 try:
-                    entry = float(m.group())
+                    entry = float(m.group().replace(",", ""))
                 except Exception:
                     pass
+            # Parse inline SL/TP/RR if on same line
+            if "|" in rest.upper():
+                for seg in rest.split("|"):
+                    seg = seg.strip()
+                    su  = seg.upper()
+                    mv  = re.search(r"[\d,]+(?:\.\d+)?", seg)
+                    if not mv:
+                        continue
+                    try:
+                        val = float(mv.group().replace(",", ""))
+                    except Exception:
+                        continue
+                    if su.startswith("SL:"):
+                        sl = val
+                    elif su.startswith("TP:"):
+                        tp = val
+                    elif su.startswith("RR:"):
+                        rr = val
+
+        elif lu.startswith("SL:") and not lu.startswith("SL: "):
+            # SL standalone line
+            parts = l.split(":", 1)[1] if ":" in l else l
+            # Extract from pipes if present
+            for seg in (parts.split("|") + [parts]):
+                su = seg.strip().upper()
+                mv = re.search(r"[\d,]+(?:\.\d+)?", seg.replace(",", ""))
+                if not mv:
+                    continue
+                try:
+                    val = float(mv.group().replace(",", ""))
+                except Exception:
+                    continue
+                if su.startswith("SL") and sl == 0:
+                    sl = val
+                elif su.startswith("TP") and tp == 0:
+                    tp = val
+                elif su.startswith("RR") and rr == 0:
+                    rr = val
 
         elif lu.startswith("SL:"):
-            parts = l.split("SL:", 1)[1]
-            sl_part = parts.split("TP:")[0] if "TP:" in parts.upper() else parts
-            m = re.search(r"[\d]+\.?\d*", sl_part.replace(",", ""))
-            if m:
+            rest = l.split(":", 1)[1]
+            m = re.search(r"[\d,]+(?:\.\d+)?", rest.split("|")[0])
+            if m and sl == 0:
                 try:
-                    sl = float(m.group())
+                    sl = float(m.group().replace(",", ""))
                 except Exception:
                     pass
-            if "TP:" in parts.upper():
-                tp_part = parts.upper().split("TP:")[1].split("RR:")[0] if "RR:" in parts.upper() else parts.upper().split("TP:")[1]
-                m2 = re.search(r"[\d]+\.?\d*", tp_part.replace(",", ""))
-                if m2:
-                    try:
-                        tp = float(m2.group())
-                    except Exception:
-                        pass
-            if "RR:" in parts.upper():
-                rr_part = parts.upper().split("RR:")[1]
-                m3 = re.search(r"[\d\.]+", rr_part)
-                if m3:
-                    try:
-                        rr = float(m3.group())
-                    except Exception:
-                        pass
 
         elif lu.startswith("TP:"):
-            m = re.search(r"[\d]+\.?\d*", l.split(":", 1)[1].replace(",", ""))
-            if m:
+            m = re.search(r"[\d,]+(?:\.\d+)?", l.split(":", 1)[1])
+            if m and tp == 0:
                 try:
-                    tp = float(m.group())
+                    tp = float(m.group().replace(",", ""))
                 except Exception:
                     pass
 
         elif lu.startswith("RR:"):
             m = re.search(r"[\d\.]+", l.split(":", 1)[1])
-            if m:
+            if m and rr == 0:
                 try:
                     rr = float(m.group())
                 except Exception:
@@ -921,62 +1086,72 @@ def _parse_expert_response(expert: dict, raw: str, round_num: int) -> ExpertOpin
             for kv in l.split(":", 1)[1].split():
                 if "=" in kv:
                     k_s, v_str = kv.split("=", 1)
-                    m = re.search(r"[\d\.]+", v_str.replace(",", ""))
-                    if m:
+                    mv = re.search(r"[\d,]+(?:\.\d+)?", v_str.replace(",", ""))
+                    if mv:
                         try:
-                            val = float(m.group())
+                            val = float(mv.group())
                             ku  = k_s.upper()
-                            if ku == "ENTRY": entry = val
-                            elif ku == "SL":  sl    = val
-                            elif ku == "TP":  tp    = val
-                            elif ku == "RR":  rr    = val
+                            if ku == "ENTRY" and entry == 0: entry = val
+                            elif ku == "SL"  and sl == 0:    sl    = val
+                            elif ku == "TP"  and tp == 0:    tp    = val
+                            elif ku == "RR"  and rr == 0:    rr    = val
                         except Exception:
                             pass
 
         elif lu.startswith(("TRIGGER:", "TRIGGER CẬP NHẬT:")):
-            txt = l.split(":", 1)[1].strip()[:150]
+            txt = l.split(":", 1)[1].strip()[:160]
             if txt:
                 key_points.append(f"Trigger: {txt}")
 
         elif lu.startswith(("RISK:", "ALERT:")):
-            txt = l.split(":", 1)[1].strip()[:150]
+            txt = l.split(":", 1)[1].strip()[:160]
             if txt:
                 concern = txt
 
         elif lu.startswith("REBUTS:"):
-            txt = l.split(":", 1)[1].strip()[:120]
+            txt = l.split(":", 1)[1].strip()[:130]
             if txt:
                 key_points.append(f"Phản biện: {txt}")
 
-        elif l.startswith("- ") and len(key_points) < 5:
-            key_points.append(l[2:].strip()[:120])
+        elif l.startswith("  - ") and len(key_points) < 6:
+            key_points.append(l[4:].strip()[:160])
 
-    # Kiểm tra sơ bộ: nếu entry/sl/tp spread quá rộng (>3x) → LLM có thể sai mã
+        elif l.startswith("- ") and len(key_points) < 6:
+            key_points.append(l[2:].strip()[:160])
+
+    # Kiểm tra spread bất thường (giá nhầm mã)
     if entry > 0 and sl > 0 and tp > 0:
         ratio_max = max(entry, sl, tp) / max(min(entry, sl, tp), 1)
         if ratio_max > 3.0:
+            logger.warning(
+                f"[Expert][R{round_num}] {expert['id']} spread bất thường "
+                f"entry={entry:.0f} sl={sl:.0f} tp={tp:.0f} → reset"
+            )
             entry = sl = tp = 0.0
-            concern = concern or "Giá entry/sl/tp spread bất thường — có thể nhầm mã"
+            concern = concern or "Giá spread bất thường — có thể nhầm mã"
 
-    # Validate R:R
-    if entry > 0 and tp > 0 and sl > 0 and entry != sl:
+    # Validate R:R logic
+    if entry > 0 and tp > 0 and sl > 0 and abs(entry - sl) > 0:
         rr_calc = round(abs(tp - entry) / abs(entry - sl), 2)
         if stance == "MUA" and (entry <= sl or entry >= tp or rr_calc < 1.5):
-            stance = "THEO DOI"
+            stance  = "THEO DOI"
             concern = concern or f"R:R={rr_calc:.1f} hoặc giá không hợp lệ"
-            entry  = 0
-            score  = max(0, score - 1)
+            entry   = 0
+            score   = max(0, score - 1)
         elif stance == "BAN" and (entry >= sl or entry <= tp or rr_calc < 1.5):
-            stance = "THEO DOI"
-            concern = concern or f"R:R={rr_calc:.1f} không hợp lệ"
-            entry  = 0
+            stance  = "THEO DOI"
+            concern = concern or f"R:R={rr_calc:.1f} — đổi THEO DOI"
+            entry   = 0
 
+    # Fallback key_points
     if not key_points:
-        for sent in raw.split("."):
+        for sent in re.split(r"[.!?]", raw):
             s = sent.strip()
-            if len(s) > 20:
-                key_points.append(s[:150])
+            if len(s) > 25:
+                key_points.append(s[:180])
                 break
+    if not key_points:
+        key_points = ["Xem raw text để biết chi tiết"]
 
     return ExpertOpinion(
         expert_id  = expert["id"],
@@ -984,14 +1159,16 @@ def _parse_expert_response(expert: dict, raw: str, round_num: int) -> ExpertOpin
         stance     = stance,
         score      = score,
         confidence = confidence,
-        key_points = (key_points or ["Không có lý do"])[:5],
+        key_points = key_points[:6],
         concern    = concern or "Xem phân tích chi tiết",
         raw_text   = raw,
     )
 
 
 def _parse_moderator_json(raw: str, td: dict) -> dict:
+    """Parse JSON từ moderator, fallback gracefully."""
     text = raw.strip()
+    # Strip markdown fences
     if text.startswith("```"):
         text = "\n".join(text.split("\n")[1:]).rsplit("```", 1)[0].strip()
 
@@ -1002,10 +1179,10 @@ def _parse_moderator_json(raw: str, td: dict) -> dict:
         json_text = text[start:end]
     elif start != -1:
         json_text = text[start:]
-        open_n = json_text.count("{") - json_text.count("}")
+        open_n    = json_text.count("{") - json_text.count("}")
         json_text += "}" * max(0, open_n)
-        json_text = re.sub(r",\s*}", "}", json_text)
-        json_text = re.sub(r",\s*]", "]", json_text)
+        json_text  = re.sub(r",\s*}", "}", json_text)
+        json_text  = re.sub(r",\s*]", "]", json_text)
     else:
         json_text = "{}"
 
@@ -1018,45 +1195,52 @@ def _parse_moderator_json(raw: str, td: dict) -> dict:
             pass
 
     if data is None:
-        logger.warning("Moderator JSON parse failed — using fallback")
+        logger.warning("[Moderator] JSON parse failed → fallback")
         data = _moderator_fallback(td)
 
+    # Clean up summary
     summary = str(data.get("moderator_summary", ""))
     if "{" in summary and ("panel_verdict" in summary or '"entry"' in summary):
         summary = summary[:summary.find("{")].strip()
-    data["moderator_summary"] = summary[:600] or "Hội đồng đã hoàn tất phân tích 3 vòng."
-    data["panel_confidence"]  = max(25.0, float(data.get("panel_confidence", 60)))
-    data["shelf_life_days"]   = max(5, int(data.get("shelf_life_days", 7)))
+    data["moderator_summary"] = summary[:700] or "Hội đồng đã hoàn tất phân tích 3 vòng."
 
+    data["panel_confidence"] = max(30.0, _safe_float(data.get("panel_confidence", 60), 60.0))
+    data["shelf_life_days"]  = max(5, int(data.get("shelf_life_days", 7)))
+
+    # Validate
     data, rr_warning = _validate_rr(data, td)
     data["rr_warning"] = rr_warning
     data = _fix_sr(data, td)
-    data = _validate_prices_in_output(data, td)  # kiểm tra giá ngoài biên
+    data = _validate_prices_in_output(data, td)
     return data
 
 
 def _validate_rr(data: dict, td: dict) -> tuple[dict, str]:
+    """Kiểm tra R:R của từng kịch bản — reset entry nếu không hợp lệ."""
     rr_warning = ""
     for sc_key in ["scenario_buy", "scenario_sell"]:
         sc = data.get(sc_key, {})
         if not sc:
             continue
-        entry = float(sc.get("entry", 0) or 0)
-        sl    = float(sc.get("sl",    0) or 0)
-        tp1   = float(sc.get("tp1",   sc.get("tp", 0)) or 0)
+        entry = _safe_float(sc.get("entry", 0))
+        sl    = _safe_float(sc.get("sl",    0))
+        tp1   = _safe_float(sc.get("tp1",   sc.get("tp", 0)))
         if entry <= 0 or sl <= 0 or tp1 <= 0:
             continue
         is_buy = sc_key == "scenario_buy"
-        if (is_buy and (entry <= sl or entry >= tp1)) or \
-           (not is_buy and (entry >= sl or entry <= tp1)):
-            sc["entry"] = 0
-            rr_warning  = f"Entry không hợp lệ kịch bản {'MUA' if is_buy else 'BÁN'}"
+        wrong_direction = (
+            (is_buy  and (entry <= sl or entry >= tp1)) or
+            (not is_buy and (entry >= sl or entry <= tp1))
+        )
+        if wrong_direction:
+            sc["entry"]  = 0
+            rr_warning   = f"Entry không hợp lệ kịch bản {'MUA' if is_buy else 'BÁN'}"
         else:
-            rr_calc = round(abs(tp1 - entry) / abs(entry - sl), 2)
+            rr_calc  = round(abs(tp1 - entry) / abs(entry - sl), 2)
             sc["rr"] = rr_calc
             if rr_calc < 1.5:
-                rr_warning = f"R:R={rr_calc:.1f} < 1.5 — chưa tối ưu"
-                sc["entry"] = 0
+                rr_warning               = f"R:R={rr_calc:.1f} < 1.5 — chưa tối ưu"
+                sc["entry"]              = 0
                 data["panel_confidence"] = max(25, data.get("panel_confidence", 60) - 10)
             elif rr_calc < 2.0 and not rr_warning:
                 rr_warning = f"R:R={rr_calc:.1f} dưới ngưỡng tối ưu 2.0"
@@ -1066,55 +1250,47 @@ def _validate_rr(data: dict, td: dict) -> tuple[dict, str]:
 
 def _validate_prices_in_output(data: dict, td: dict) -> dict:
     """
-    Kiểm tra tính nhất quán: entry/sl/tp trong scenarios phải nằm trong ±30% giá.
-    Nếu không → reset về 0 và gắn rr_warning.
-    Cũng enforce scenario_watch priority nếu panel_verdict là THEO DOI.
+    Lớp bảo vệ cuối: kiểm tra entry/sl/tp/support/resistance trong scenarios
+    phải nằm trong ±30% giá. Nếu không → reset về 0 + log + gắn warning.
+    Cũng enforce scenario_watch priority nếu panel_verdict = THEO DOI.
     """
     price    = td["price"]
-    warnings = []
+    warnings: list[str] = []
 
     for sc_key in ["scenario_buy", "scenario_sell"]:
         sc = data.get(sc_key, {})
         if not sc:
             continue
-        for field in ["entry", "sl", "tp1", "tp", "tp2"]:
-            val = float(sc.get(field, 0) or 0)
+        for field_name in ["entry", "sl", "tp1", "tp", "tp2"]:
+            val = _safe_float(sc.get(field_name, 0))
             if val > 0 and not _price_in_band(val, price):
                 logger.warning(
-                    f"[PriceGuard] {sc_key}.{field}={val:,.0f} ngoài band "
-                    f"±{PRICE_BAND_PCT*100:.0f}% (giá={price:,.0f}) → reset 0"
+                    f"[PriceGuard] {sc_key}.{field_name}={val:,.0f} "
+                    f"ngoài band ±{PRICE_BAND_PCT*100:.0f}% (giá={price:,.0f}) → reset 0"
                 )
-                sc[field] = 0
-                warnings.append(
-                    f"{sc_key}.{field}={val:,.0f} ngoài biên ±30%"
-                )
-        # Nếu entry đã bị reset → xóa luôn rr
-        if float(sc.get("entry", 0) or 0) == 0:
-            sc["entry"] = 0
+                sc[field_name] = 0
+                warnings.append(f"{sc_key}.{field_name}={val:,.0f} ngoài biên ±30%")
         data[sc_key] = sc
 
     if warnings:
-        existing = data.get("rr_warning", "")
-        extra    = " | ".join(warnings)
-        data["rr_warning"] = (f"{existing} | {extra}" if existing else extra)[:200]
+        existing        = data.get("rr_warning", "")
+        extra           = " | ".join(warnings)
+        data["rr_warning"] = (f"{existing} | {extra}" if existing else extra)[:250]
 
-    # Enforce: nếu panel_verdict là THEO DOI,
-    # scenario_watch phải có probability cao nhất
+    # Enforce THEO DOI dominant → scenario_watch priority
     verdict = data.get("panel_verdict", "")
     if verdict == "THEO DOI":
-        sc_w = data.get("scenario_watch", {})
-        sc_b = data.get("scenario_buy",   {})
-        sc_s = data.get("scenario_sell",  {})
+        sc_w = data.get("scenario_watch", {}) or {}
+        sc_b = data.get("scenario_buy",   {}) or {}
+        sc_s = data.get("scenario_sell",  {}) or {}
         p_w  = int(sc_w.get("probability", 0))
         p_b  = int(sc_b.get("probability", 0))
         p_s  = int(sc_s.get("probability", 0))
         if p_w <= p_b or p_w <= p_s:
-            # Điều chỉnh: watch lấy phần lớn nhất
-            total     = max(p_w + p_b + p_s, 100)
-            new_p_w   = max(50, round(total * 0.60))
-            remaining = 100 - new_p_w
-            new_p_b   = remaining // 2
-            new_p_s   = remaining - new_p_b
+            new_p_w           = max(55, round((p_w + p_b + p_s) * 0.60))
+            remaining         = 100 - new_p_w
+            new_p_b           = remaining // 2
+            new_p_s           = remaining - new_p_b
             if sc_w: sc_w["probability"] = new_p_w
             if sc_b: sc_b["probability"] = new_p_b
             if sc_s: sc_s["probability"] = new_p_s
@@ -1122,28 +1298,29 @@ def _validate_prices_in_output(data: dict, td: dict) -> dict:
             data["scenario_buy"]   = sc_b
             data["scenario_sell"]  = sc_s
             logger.info(
-                f"[ScenarioFix] THEO DOI dominant → watch={new_p_w}% "
-                f"buy={new_p_b}% sell={new_p_s}%"
+                f"[ScenarioFix] THEO DOI → watch={new_p_w}% buy={new_p_b}% sell={new_p_s}%"
             )
 
     return data
 
 
 def _fix_sr(data: dict, td: dict) -> dict:
+    """Fix và validate support/resistance levels — fallback về computed nếu cần."""
     price    = td["price"]
     computed = td["sr_levels"]
 
-    def _fix(levels: list, direction: str) -> list:
+    def _fix(levels: list, direction: str) -> list[dict]:
         result: list[dict] = []
         if isinstance(levels, list):
             for lv in levels:
                 if not isinstance(lv, dict):
                     continue
-                p = float(lv.get("price", 0))
+                p = _safe_float(lv.get("price", 0))
                 if p <= 0:
                     continue
                 if direction == "support"    and p >= price: continue
                 if direction == "resistance" and p <= price: continue
+                if not _price_in_band(p, price, 0.28):      continue
                 if any(abs(p - r["price"]) / max(r["price"], 1) < 0.025 for r in result):
                     continue
                 result.append({
@@ -1152,8 +1329,11 @@ def _fix_sr(data: dict, td: dict) -> dict:
                     "dist_pct": round((p - price) / price * 100, 1),
                 })
             result.sort(key=lambda x: abs(x["price"] - price))
+
+        # Pad với computed nếu cần
         for fb in computed[direction]:
-            if len(result) >= 3: break
+            if len(result) >= 3:
+                break
             if not any(abs(fb["price"] - r["price"]) / max(r["price"], 1) < 0.025 for r in result):
                 result.append(fb)
         return result[:3]
@@ -1164,57 +1344,63 @@ def _fix_sr(data: dict, td: dict) -> dict:
 
 
 def _moderator_fallback(td: dict) -> dict:
+    """Fallback moderator data khi LLM không trả về JSON hợp lệ."""
     price = td["price"]
     sr    = td["sr_levels"]
     s1    = sr["support"][0]["price"]
     r1_p  = sr["resistance"][0]["price"]
     tp_e  = td["tp_check"] or r1_p
     sl_e  = td["sl_check"] or s1
-    rr_e  = round((tp_e - price) / max(price - sl_e, 1), 2)
-    vl    = td["verdict_label"].upper()
-    verdict_word = "MUA" if "MUA" in vl else ("BAN" if "BAN" in vl else "THEO DOI")
+    rr_e  = round((tp_e - price) / max(price - sl_e, 1), 2) if tp_e > sl_e else 2.0
+
+    vl      = td["verdict_label"].upper()
+    verdict = "MUA" if "MUA" in vl else ("BAN" if "BAN" in vl else "THEO DOI")
 
     return {
-        "panel_verdict":    verdict_word,
-        "panel_confidence": max(40.0, float(td["confidence_pct"])),
+        "panel_verdict":    verdict,
+        "panel_confidence": max(40.0, _safe_float(td["confidence_pct"], 50.0)),
         "final_score":      float(td["bull_count"] - td["bear_count"]),
         "rr_warning":       "" if rr_e >= 1.5 else f"R:R={rr_e:.1f} < 1.5",
         "consensus_level":  "PHAN BIEN",
         "scenario_buy": {
-            "probability": max(td["bull_count"] * 12, 35),
+            "probability": max(td["bull_count"] * 12, 30),
             "entry": round(price, 0) if rr_e >= 1.5 else 0,
-            "tp1": round(tp_e, 0), "tp2": round(tp_e * 1.04, 0),
-            "sl":  round(sl_e, 0), "rr":  rr_e,
-            "trigger":  f"MUA khi giá close trên {r1_p:,.0f} + Volume > 1.5x TB20",
+            "tp1":  round(tp_e, 0), "tp2": round(tp_e * 1.04, 0),
+            "sl":   round(sl_e, 0), "rr":  rr_e,
+            "trigger":  f"MUA khi close qua {r1_p:,.0f} + Volume > 1.5x TB20",
             "catalyst": f"Breakout {r1_p:,.0f} xác nhận uptrend",
         },
         "scenario_sell": {
             "probability": max(td["bear_count"] * 12, 20),
             "entry": 0, "tp": round(sl_e * 0.97, 0),
             "sl": round(r1_p * 1.02, 0), "rr": 2.0,
-            "trigger":  f"BÁN khi phá vỡ {s1:,.0f} + Volume > 2x TB20",
+            "trigger":  f"BÁN khi phá {s1:,.0f} + Volume > 2x TB20",
             "catalyst": f"Breakdown {s1:,.0f} xác nhận downtrend",
         },
         "scenario_watch": {
-            "probability": 30,
-            "trigger":   f"Theo dõi vùng {round(price*0.99,0):,.0f}–{round(price*1.01,0):,.0f}",
-            "watch_for": f"RSI={td['rsi']:.0f}, chờ Volume > 1.5x TB20 + close qua MA20={td['ma20']:,.0f}",
+            "probability": 35,
+            "trigger":   f"Quan sát vùng {round(price*0.99,0):,.0f}–{round(price*1.01,0):,.0f}",
+            "watch_for": (
+                f"RSI={td['rsi']:.0f}, chờ Volume > 1.5x TB20 "
+                f"+ close qua MA20={td['ma20']:,.0f}"
+            ),
         },
         "support_levels":    sr["support"],
         "resistance_levels": sr["resistance"],
         "main_risks": [
             f"Giá phá {s1:,.0f} → xác nhận downtrend (RSI={td['rsi']:.0f})",
-            f"Volume={td['volume_ratio']:.1f}x TB20 chưa đủ xác nhận xu hướng",
+            f"Volume={td['volume_ratio']:.1f}x TB20 — chưa xác nhận xu hướng",
             f"Market Regime {td['market_regime']} — rủi ro đảo chiều",
         ],
         "key_catalysts": [
             f"Breakout {r1_p:,.0f} + Volume > 1.5x TB20 xác nhận",
             f"Kết quả kinh doanh {td['symbol']} — catalyst nội tại",
         ],
-        "shelf_life_days": 7,
+        "shelf_life_days":   7,
         "moderator_summary": (
             f"Fallback: {td['verdict_label']}, RSI={td['rsi']:.0f}, "
-            f"Vol={td['volume_ratio']:.1f}x. Bull={td['bull_count']}/{td['active_agents']}, "
+            f"Vol={td['volume_ratio']:.1f}x TB20. "
+            f"Bull={td['bull_count']}/{td['active_agents']}, "
             f"Bear={td['bear_count']}/{td['active_agents']}. "
             f"Regime={td['market_regime']}."
         ),
@@ -1222,7 +1408,7 @@ def _moderator_fallback(td: dict) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SWARM ORCHESTRATOR
+# SWARM ORCHESTRATOR — 3 vòng tranh luận
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SwarmOrchestrator:
@@ -1248,7 +1434,10 @@ class SwarmOrchestrator:
             raw     = self.llm.chat(system, user, LLM_MAX_TOKENS)
             op      = _parse_expert_response(expert, raw, round_num)
             elapsed = round(time.time() - t0, 1)
-            logger.info(f"[Expert][R{round_num}] {expert['id']} → {op.stance} Score={op.score:+d} ({elapsed}s)")
+            logger.info(
+                f"[Expert][R{round_num}] {expert['id']} → "
+                f"{op.stance} Score={op.score:+d} ({elapsed}s)"
+            )
             return op
         except Exception as e:
             elapsed = round(time.time() - t0, 1)
@@ -1259,7 +1448,7 @@ class SwarmOrchestrator:
                 stance     = "THEO DOI",
                 score      = 0,
                 confidence = 40,
-                key_points = [f"Lỗi LLM: {str(e)[:80]}"],
+                key_points = [f"Lỗi LLM: {str(e)[:100]}"],
                 concern    = "N/A",
                 raw_text   = str(e),
             )
@@ -1269,19 +1458,22 @@ class SwarmOrchestrator:
         symbol     = td["symbol"]
         data_block = _build_data_block(td)
 
-        # ── VÒNG 1 ──────────────────────────────────────────────────────────
+        # ── VÒNG 1: Phân tích độc lập ────────────────────────────────────────
         self._progress(f"📊 Vòng 1/3 — {len(EXPERTS)} chuyên gia phân tích độc lập...")
         r1: list[ExpertOpinion] = []
         for expert in EXPERTS:
             self._progress(f"  {expert['emoji']} {expert['role']}...")
-            skill_block = _get_skill_block(expert, td)
+            skill_block  = _get_skill_block(expert, td)
             sys_p, usr_p = _build_round1_prompt(expert, data_block, skill_block, td)
             op = self._call_expert(expert, sys_p, usr_p, 1)
             r1.append(op)
-            self._progress(f"  → {expert['emoji']} {op.stance} Score={op.score:+d} ({op.confidence}%)")
+            self._progress(
+                f"  → {expert['emoji']} {op.stance} Score={op.score:+d} ({op.confidence}%)"
+            )
 
-        # ── VÒNG 2 ──────────────────────────────────────────────────────────
-        self._progress("💬 Vòng 2/3 — Phản biện chéo có dẫn chứng...")
+        # ── VÒNG 2: Phản biện chéo ───────────────────────────────────────────
+        r1_summary = ", ".join(f"{op.role[:15]}={op.stance}" for op in r1)
+        self._progress(f"💬 Vòng 2/3 — Phản biện [{r1_summary}]...")
         r2: list[ExpertOpinion] = []
         debate_r2 = DebateRound(round_num=2, exchanges=[])
         for expert in EXPERTS:
@@ -1292,7 +1484,9 @@ class SwarmOrchestrator:
             op = self._call_expert(expert, sys_p, usr_p, 2)
             r2.append(op)
             change = " ⚡ ĐỔI!" if own_r1.stance != op.stance else ""
-            self._progress(f"  → {expert['emoji']}: {own_r1.stance}→{op.stance}{change}")
+            self._progress(
+                f"  → {expert['emoji']}: {own_r1.stance}→{op.stance}{change}"
+            )
             debate_r2.exchanges.append({
                 "expert":    expert["id"],
                 "role":      expert["role"],
@@ -1302,7 +1496,7 @@ class SwarmOrchestrator:
                 "text":      op.raw_text[:200],
             })
 
-        # ── VÒNG 3 ──────────────────────────────────────────────────────────
+        # ── VÒNG 3: Kết luận cuối ────────────────────────────────────────────
         self._progress("🏁 Vòng 3/3 — Kết luận cuối + kịch bản...")
         r3: list[ExpertOpinion] = []
         debate_r3 = DebateRound(round_num=3, exchanges=[])
@@ -1323,7 +1517,7 @@ class SwarmOrchestrator:
                 "text":      op.raw_text[:200],
             })
 
-        # ── MODERATOR ────────────────────────────────────────────────────────
+        # ── MODERATOR: Tổng hợp JSON ─────────────────────────────────────────
         self._progress("🔍 Moderator tổng hợp 3 vòng → JSON...")
         t_mod = time.time()
         try:
@@ -1334,9 +1528,8 @@ class SwarmOrchestrator:
         except Exception as e:
             logger.warning(f"[Moderator] FAIL: {e}")
             mod_data = _moderator_fallback(td)
-            mod_data["rr_warning"] = ""
 
-        # ── BUILD REPORT ─────────────────────────────────────────────────────
+        # ── BUILD REPORT ──────────────────────────────────────────────────────
         elapsed = round(time.time() - t0, 1)
 
         stances_final = [op.stance for op in r3]
@@ -1344,24 +1537,26 @@ class SwarmOrchestrator:
         vote_bull     = stances_final.count("MUA")
         vote_bear     = stances_final.count("BAN")
         vote_neutral  = stances_final.count("THEO DOI")
-        n_exp         = len(r3) or 5
+        n_exp         = max(len(r3), 1)
 
-        final_score = float(mod_data.get(
-            "final_score",
-            sum(scores_final) / max(len(scores_final), 1),
-        ))
+        final_score = _safe_float(
+            mod_data.get("final_score", sum(scores_final) / max(len(scores_final), 1))
+        )
         final_score = max(-5.0, min(5.0, final_score))
 
         dominant_stance = max(stances_final, key=stances_final.count) if stances_final else "THEO DOI"
         dom_ops         = [op for op in r3 if op.stance == dominant_stance]
-        dom_avg_conf    = sum(op.confidence for op in dom_ops) / len(dom_ops) if dom_ops else 60
+        dom_avg_conf    = sum(op.confidence for op in dom_ops) / max(len(dom_ops), 1)
         resonance_pct   = round((len(dom_ops) / n_exp) * dom_avg_conf, 1)
         dom_count       = len(dom_ops)
 
         conf_floor = max(40, round((dom_count / n_exp) * dom_avg_conf))
-        if dom_count == n_exp:       conf_floor = max(conf_floor, 65)
-        elif dom_count >= n_exp - 1: conf_floor = max(conf_floor, 55)
-        final_confidence = max(float(mod_data.get("panel_confidence", 60)), conf_floor)
+        if dom_count == n_exp:        conf_floor = max(conf_floor, 68)
+        elif dom_count >= n_exp - 1:  conf_floor = max(conf_floor, 58)
+        final_confidence = max(
+            _safe_float(mod_data.get("panel_confidence", 60), 60.0),
+            conf_floor,
+        )
 
         consensus_level = (
             "DONG THUAN" if dom_count == n_exp else
@@ -1373,7 +1568,7 @@ class SwarmOrchestrator:
         for op in r3:
             if op.stance != dominant_stance:
                 em   = next((e["emoji"] for e in EXPERTS if e["id"] == op.expert_id), "👤")
-                note = op.key_points[0][:100] if op.key_points else op.concern[:80]
+                note = op.key_points[0][:110] if op.key_points else op.concern[:90]
                 dissent_notes.append(f"{em} {op.role}: {note}")
 
         shelf_life  = max(5, int(mod_data.get("shelf_life_days", 7)))
@@ -1381,36 +1576,36 @@ class SwarmOrchestrator:
         expires_at  = (datetime.now() + timedelta(days=shelf_life)).strftime("%Y-%m-%d")
 
         return SwarmReport(
-            symbol            = symbol,
-            timestamp         = datetime.now().strftime("%Y-%m-%d %H:%M"),
-            elapsed_s         = elapsed,
-            llm_provider      = self.llm.provider,
-            llm_model         = self.llm.model,
-            panel_verdict     = mod_data.get("panel_verdict", dominant_stance),
-            panel_confidence  = final_confidence,
-            final_score       = final_score,
-            resonance_pct     = resonance_pct,
-            consensus_level   = consensus_level,
-            vote_bull         = vote_bull,
-            vote_neutral      = vote_neutral,
-            vote_bear         = vote_bear,
-            dissent_notes     = dissent_notes,
-            scenario_buy      = mod_data.get("scenario_buy",   {}),
-            scenario_sell     = mod_data.get("scenario_sell",  {}),
-            scenario_watch    = mod_data.get("scenario_watch", {}),
-            support_levels    = mod_data.get("support_levels",    []),
-            resistance_levels = mod_data.get("resistance_levels", []),
-            rr_warning        = mod_data.get("rr_warning", ""),
-            main_risks        = mod_data.get("main_risks",     []),
-            key_catalysts     = mod_data.get("key_catalysts",  []),
-            shelf_life_days   = shelf_life,
-            expires_at        = expires_at,
-            review_date       = review_date,
-            expert_opinions   = r3,
-            debate_rounds     = [debate_r2, debate_r3],
-            moderator_summary = mod_data.get("moderator_summary", ""),
-            moderator_raw_json= mod_data,
-            input_summary     = (
+            symbol             = symbol,
+            timestamp          = datetime.now().strftime("%Y-%m-%d %H:%M"),
+            elapsed_s          = elapsed,
+            llm_provider       = self.llm.provider,
+            llm_model          = self.llm.model,
+            panel_verdict      = mod_data.get("panel_verdict", dominant_stance),
+            panel_confidence   = final_confidence,
+            final_score        = final_score,
+            resonance_pct      = resonance_pct,
+            consensus_level    = consensus_level,
+            vote_bull          = vote_bull,
+            vote_neutral       = vote_neutral,
+            vote_bear          = vote_bear,
+            dissent_notes      = dissent_notes,
+            scenario_buy       = mod_data.get("scenario_buy",   {}),
+            scenario_sell      = mod_data.get("scenario_sell",  {}),
+            scenario_watch     = mod_data.get("scenario_watch", {}),
+            support_levels     = mod_data.get("support_levels",    []),
+            resistance_levels  = mod_data.get("resistance_levels", []),
+            rr_warning         = mod_data.get("rr_warning", ""),
+            main_risks         = mod_data.get("main_risks",     []),
+            key_catalysts      = mod_data.get("key_catalysts",  []),
+            shelf_life_days    = shelf_life,
+            expires_at         = expires_at,
+            review_date        = review_date,
+            expert_opinions    = r3,
+            debate_rounds      = [debate_r2, debate_r3],
+            moderator_summary  = mod_data.get("moderator_summary", ""),
+            moderator_raw_json = mod_data,
+            input_summary      = (
                 f"{symbol} | {td['verdict_label']} {td['confidence_pct']:.0f}% | "
                 f"RSI={td['rsi']:.0f} Vol={td['volume_ratio']:.1f}x"
             ),
@@ -1419,30 +1614,81 @@ class SwarmOrchestrator:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FORMATTER
+# FORMATTER — Telegram-safe, không cắt chữ, không cắt dòng
 # ══════════════════════════════════════════════════════════════════════════════
 
 _SEP  = "═" * 32
 _SEP2 = "─" * 32
+_LINE_WIDTH = 60   # giới hạn mỗi dòng cho Telegram mobile
 
 
 def _score_bar(score: float) -> str:
+    """Thanh bar điểm -5..+5 dùng emoji."""
     filled = round(abs(score))
     empty  = 5 - filled
     return ("🟢" * filled + "⬜" * empty) if score >= 0 else ("⬜" * empty + "🔴" * filled)
 
 
-def format_swarm_report(report: SwarmReport) -> str:
-    """Format SwarmReport thành text Telegram-ready, không cắt chữ."""
-    v_em = {"MUA": "🟢", "BAN": "🔴", "THEO DOI": "🟡"}.get(report.panel_verdict, "🟡")
+def _wrap(text: str, width: int = _LINE_WIDTH, indent: str = "") -> list[str]:
+    """
+    Wrap text thành các dòng không vượt quá width ký tự.
+    Cắt tại dấu cách — không bao giờ cắt giữa từ.
+    """
+    if not text:
+        return []
+    text = text.strip()
+    if len(text) <= width:
+        return [indent + text]
 
-    lines: list[str] = [
+    words  = text.split(" ")
+    lines  = []
+    cur    = ""
+    for word in words:
+        test = (cur + " " + word).strip()
+        if len(test) <= width:
+            cur = test
+        else:
+            if cur:
+                lines.append(indent + cur)
+            cur = word
+    if cur:
+        lines.append(indent + cur)
+    return lines
+
+
+def _truncate_line(text: str, max_len: int = _LINE_WIDTH) -> str:
+    """
+    Cắt text tại dấu cách cuối cùng trước max_len,
+    thêm '…' nếu bị cắt. Không bao giờ cắt giữa từ.
+    """
+    if not text or len(text) <= max_len:
+        return text
+    cut = text.rfind(" ", 0, max_len - 1)
+    if cut > max_len // 2:
+        return text[:cut] + "…"
+    return text[:max_len - 1] + "…"
+
+
+def format_swarm_report(report: SwarmReport) -> str:
+    """
+    Format SwarmReport thành text Telegram-ready.
+    Đảm bảo: không cắt dòng giữa từ, mỗi dòng ≤ 60-70 ký tự,
+    mỗi dòng kết thúc bằng dấu câu hoặc text hoàn chỉnh.
+    """
+    v_em = {"MUA": "🟢", "BAN": "🔴", "THEO DOI": "🟡"}.get(report.panel_verdict, "🟡")
+    lines: list[str] = []
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    lines += [
         _SEP,
         f"🤖 LOCAL SWARM v{SWARM_VERSION}: {report.symbol}",
         f"📅 {report.timestamp}  ⏱️ {report.elapsed_s:.0f}s",
         f"🔗 {report.llm_provider}/{report.llm_model}",
-        _SEP,
-        "",
+        _SEP, "",
+    ]
+
+    # ── Resonance Panel ──────────────────────────────────────────────────────
+    lines += [
         "RESONANCE PANEL:",
         f"  Verdict   : {v_em} {report.panel_verdict}",
         f"  Score     : {report.final_score:+.1f}/5  {_score_bar(report.final_score)}",
@@ -1453,42 +1699,44 @@ def format_swarm_report(report: SwarmReport) -> str:
         "",
     ]
 
-    # ── Bảng chuyên gia ─────────────────────────────────────────────────────
+    # ── Bảng Chuyên gia ──────────────────────────────────────────────────────
     lines += [_SEP2, "CHUYÊN GIA (3 VÒNG):", _SEP2]
     for op in report.expert_opinions:
         em   = next((e["emoji"] for e in EXPERTS if e["id"] == op.expert_id), "👤")
         s_em = {"MUA": "🟢", "BAN": "🔴", "THEO DOI": "🟡"}.get(op.stance, "🟡")
         lines.append(f"{em} {op.role}")
         lines.append(f"   {s_em} {op.stance}  Score={op.score:+d}  Conf={op.confidence}%")
-        # Key takeaway — không cắt chữ giữa chừng
-        kp = op.key_points[0] if op.key_points else op.concern
-        kp = kp.strip()
-        if len(kp) > 90:
-            last_sp = kp.rfind(" ", 0, 87)
-            kp = (kp[:last_sp] + "…") if last_sp > 50 else (kp[:87] + "…")
-        lines.append(f"   └─ {kp}")
+
+        # Key takeaway — wrap để không cắt chữ
+        kp = (op.key_points[0] if op.key_points else op.concern).strip()
+        kp_lines = _wrap(kp, width=58, indent="   └─ ")
+        lines.extend(kp_lines[:2])  # tối đa 2 dòng
+
+        # Concern / risk — 1 dòng, không cắt chữ
         if op.concern and op.concern not in ("N/A", "Xem phân tích chi tiết"):
-            lines.append(f"   ⚠️ {op.concern.strip()[:80]}")
+            concern_line = _truncate_line(op.concern.strip(), max_len=65)
+            lines.append(f"   ⚠️ {concern_line}")
         lines.append("")
 
-    # Debate changes
+    # Debate — đổi ý kiến
     changed_all = [x for rd in report.debate_rounds for x in rd.exchanges if x.get("changed")]
     if changed_all:
         lines.append(f"⚡ ĐỔI Ý KIẾN: {len(changed_all)} lần qua 3 vòng")
         for x in changed_all[-3:]:
             r1_s = x.get("stance_r1", x.get("stance_r2", "?"))
             r2_s = x.get("stance_r2", x.get("stance_r3", "?"))
-            lines.append(f"  • {x['role'][:20]}: {r1_s}→{r2_s}")
+            role  = x.get("role", "")[:22]
+            lines.append(f"  • {role}: {r1_s}→{r2_s}")
         lines.append("")
 
-    # ── Dissent Notes ────────────────────────────────────────────────────────
+    # ── Dissent Notes ─────────────────────────────────────────────────────────
     if report.dissent_notes:
         lines += [_SEP2, "DISSENT NOTE:", _SEP2]
         for note in report.dissent_notes[:3]:
-            lines.append(textwrap.fill(note, width=72, subsequent_indent="    "))
+            lines.extend(_wrap(note.strip(), width=68, indent="  "))
         lines.append("")
 
-    # ── Hỗ trợ / Kháng cự ───────────────────────────────────────────────────
+    # ── Hỗ trợ / Kháng cự ────────────────────────────────────────────────────
     sup_levels = report.support_levels    or []
     res_levels = report.resistance_levels or []
     if sup_levels or res_levels:
@@ -1497,17 +1745,17 @@ def format_swarm_report(report: SwarmReport) -> str:
             if isinstance(s, dict):
                 dist     = s.get("dist_pct", "")
                 dist_str = f" ({dist:+.1f}%)" if isinstance(dist, (int, float)) else ""
-                reason   = str(s.get("reason", ""))[:55]
+                reason   = _truncate_line(str(s.get("reason", "")), 52)
                 lines.append(f"  🔵 S{i}: {s.get('price',0):,.0f}{dist_str}  — {reason}")
         for i, r in enumerate(res_levels[:3], 1):
             if isinstance(r, dict):
                 dist     = r.get("dist_pct", "")
                 dist_str = f" ({dist:+.1f}%)" if isinstance(dist, (int, float)) else ""
-                reason   = str(r.get("reason", ""))[:55]
+                reason   = _truncate_line(str(r.get("reason", "")), 52)
                 lines.append(f"  🔴 R{i}: {r.get('price',0):,.0f}{dist_str}  — {reason}")
         lines.append("")
 
-    # ── Kịch bản ─────────────────────────────────────────────────────────────
+    # ── Kịch bản đầu tư ──────────────────────────────────────────────────────
     lines += [_SEP2, "KỊCH BẢN ĐẦU TƯ:", _SEP2]
     all_sc = sorted([
         ("MUA",      report.scenario_buy   or {}, "🟢"),
@@ -1525,48 +1773,57 @@ def format_swarm_report(report: SwarmReport) -> str:
         priority = "ƯU TIÊN" if idx == 0 else "DỰ PHÒNG"
         lines.append(f"{sc_em} {priority} — {sc_type} ({prob}%):")
 
-        entry = float(sc.get("entry", 0) or 0)
-        tp1   = float(sc.get("tp1",   sc.get("tp", 0)) or 0)
-        tp2   = float(sc.get("tp2", 0) or 0)
-        sl    = float(sc.get("sl",   0) or 0)
-        rr    = float(sc.get("rr",   0) or 0)
+        entry = _safe_float(sc.get("entry", 0))
+        tp1   = _safe_float(sc.get("tp1", sc.get("tp", 0)))
+        tp2   = _safe_float(sc.get("tp2", 0))
+        sl    = _safe_float(sc.get("sl",  0))
+        rr    = _safe_float(sc.get("rr",  0))
 
         lines.append(
             f"  Entry    : {f'{entry:,.0f}' if entry > 0 else '— (chờ trigger)'}"
         )
         if tp1 > 0:
-            lines.append(f"  TP       : {tp1:,.0f}" + (f" / {tp2:,.0f}" if tp2 > 0 else ""))
+            tp_str = f"{tp1:,.0f}" + (f" / {tp2:,.0f}" if tp2 > 0 else "")
+            lines.append(f"  TP       : {tp_str}")
         if sl > 0:
             lines.append(f"  Stop Loss: {sl:,.0f}")
         if rr > 0:
             rr_flag = " ⚠️ <1.5" if rr < 1.5 else (" ⚠️ <2.0" if rr < 2.0 else "")
             lines.append(f"  R:R      : {rr:.1f}{rr_flag}")
 
-        trigger = sc.get("trigger", sc.get("condition", ""))
+        trigger = str(sc.get("trigger", sc.get("condition", ""))).strip()
         if trigger:
-            lines.append(f"  🎯 {str(trigger)[:100]}")
-        catalyst = sc.get("catalyst", sc.get("watch_for", ""))
+            for tl in _wrap(trigger, width=62, indent="  🎯 "):
+                lines.append(tl)
+
+        catalyst = str(sc.get("catalyst", sc.get("watch_for", ""))).strip()
         if catalyst:
-            lines.append(f"  💡 {str(catalyst)[:90]}")
+            for cl in _wrap(catalyst, width=62, indent="  💡 "):
+                lines.append(cl)
+
         lines.append("")
 
     if report.rr_warning:
-        lines += [f"⚠️ {report.rr_warning}", ""]
+        for wl in _wrap(report.rr_warning, width=62, indent="⚠️ "):
+            lines.append(wl)
+        lines.append("")
 
     # ── Risks & Catalysts ────────────────────────────────────────────────────
     if report.main_risks:
         lines += [_SEP2, "RỦI RO CHÍNH:", _SEP2]
         for i, risk in enumerate(report.main_risks[:4], 1):
-            lines.append(f"  {i}. {str(risk)[:100]}")
+            for rl in _wrap(str(risk), width=62, indent=f"  {i}. "):
+                lines.append(rl)
         lines.append("")
 
     if report.key_catalysts:
         lines.append("CATALYST:")
         for cat in report.key_catalysts[:3]:
-            lines.append(f"  + {str(cat)[:90]}")
+            for cl in _wrap(str(cat), width=62, indent="  + "):
+                lines.append(cl)
         lines.append("")
 
-    # ── Shelf life + Summary ─────────────────────────────────────────────────
+    # ── Shelf life ───────────────────────────────────────────────────────────
     lines += [
         _SEP2,
         f"Hạn tín hiệu : {report.shelf_life_days} ngày",
@@ -1576,6 +1833,7 @@ def format_swarm_report(report: SwarmReport) -> str:
         "TỔNG HỢP:", "",
     ]
 
+    # Moderator summary — wrap text, không cắt chữ
     summary = report.moderator_summary or ""
     if "{" in summary and "panel_verdict" in summary:
         summary = summary[:summary.find("{")].strip()
@@ -1583,7 +1841,7 @@ def format_swarm_report(report: SwarmReport) -> str:
         for para in summary.split("\n"):
             para = para.strip()
             if para:
-                lines.append(textwrap.fill(para, width=56))
+                lines.extend(_wrap(para, width=_LINE_WIDTH))
     lines.append("")
 
     lines += [
@@ -1591,6 +1849,7 @@ def format_swarm_report(report: SwarmReport) -> str:
         "⚠️ Chỉ mang tính tham khảo, không phải khuyến nghị đầu tư.",
         f"📋 Local Swarm v{SWARM_VERSION} | /local_swarm {report.symbol}",
     ]
+
     return "\n".join(lines)
 
 
@@ -1605,11 +1864,11 @@ def run_local_swarm(
     progress_cb  = None,
 ) -> tuple[str, SwarmReport]:
     """
-    Entry point chính — chạy Local Swarm Panel v2.0.
+    Entry point chính.
 
     Args:
         symbol:      Mã cổ phiếu
-        meta:        dict từ analyze_stock_full() [ưu tiên — nhiều detail nhất]
+        meta:        dict từ analyze_stock_full() [ưu tiên cao nhất]
         vibe_result: dict từ run_vibe_agents() [fallback]
         progress_cb: callback(msg) để stream progress về Telegram
 
@@ -1633,15 +1892,16 @@ def run_local_swarm(
 
 
 def _td_from_vibe_result(symbol: str, vibe_result: dict) -> dict:
-    """Fallback khi không có meta đầy đủ."""
-    ind     = vibe_result.get("indicators", {})
-    signals = vibe_result.get("signals", {})
-    details = vibe_result.get("details", {})
-    price   = float(ind.get("current_price", 0))
-    bull    = sum(1 for v in signals.values() if v > 0)
-    bear    = sum(1 for v in signals.values() if v < 0)
-    n       = len(signals)
-    conf    = round((max(bull, bear) / n * 100) if n > 0 else 50, 1)
+    """Fallback khi chỉ có vibe_result, không có meta đầy đủ."""
+    ind      = vibe_result.get("indicators", {}) or {}
+    signals  = vibe_result.get("signals",    {}) or {}
+    details  = vibe_result.get("details",    {}) or {}
+    price    = _safe_float(ind.get("current_price", 0))
+    bull     = sum(1 for v in signals.values() if v > 0)
+    bear     = sum(1 for v in signals.values() if v < 0)
+    n        = max(len(signals), 1)
+    conf     = round((max(bull, bear) / n * 100) if n > 0 else 50, 1)
+
     if n > 0:
         verdict = (
             "DONG THUAN MUA" if bull / n > 0.6 else
@@ -1653,35 +1913,44 @@ def _td_from_vibe_result(symbol: str, vibe_result: dict) -> dict:
     else:
         verdict = "TRUNG LAP"
 
-    sup_20d = float(ind.get("support",    price * 0.95))
-    res_20d = float(ind.get("resistance", price * 1.05))
-    bb_low  = float(ind.get("bb_lower",   price * 0.96))
-    bb_up   = float(ind.get("bb_upper",   price * 1.04))
-    ma20    = float(ind.get("sma20",      price))
+    sup_20d = _safe_float(ind.get("support",    price * 0.95))
+    res_20d = _safe_float(ind.get("resistance", price * 1.05))
+    bb_low  = _safe_float(ind.get("bb_lower",   price * 0.96))
+    bb_up   = _safe_float(ind.get("bb_upper",   price * 1.04))
+    ma20    = _safe_float(ind.get("sma20",       price))
     ma50    = ind.get("sma50")
     atr     = price * 0.02
-    sr      = _compute_sr_levels_v2(price, sup_20d, res_20d, bb_low, bb_up, ma20,
-                                     float(ma50) if ma50 else None, atr)
-    sig_ints = {}
+    sr      = _compute_sr_levels_v2(
+        price, sup_20d, res_20d, bb_low, bb_up, ma20,
+        _safe_float(ma50, 0) if ma50 else None, atr,
+    )
+
+    sig_ints: dict[str, int] = {}
     for k, v in signals.items():
         try:
             sig_ints[k] = int(v)
         except Exception:
             pass
 
+    # Sanitize engine details
+    engine_details = {
+        k: _sanitize_engine_detail(str(v)[:280], price)
+        for k, v in details.items()
+    }
+
     return {
         "symbol":           symbol.upper(),
         "price":            price,
         "change_1d_pct":    0.0,
-        "change_1w_pct":    float(ind.get("change_1w_pct", 0)),
-        "change_1m_pct":    float(ind.get("change_1m_pct", 0)),
-        "rsi":              float(ind.get("rsi", 50)),
-        "macd":             float(ind.get("macd", 0)),
-        "macd_hist":        float(ind.get("macd_hist", 0)),
-        "macd_signal":      float(ind.get("macd_signal", 0)),
-        "volume_ratio":     float(ind.get("volume_ratio", 1.0)),
+        "change_1w_pct":    _safe_float(ind.get("change_1w_pct", 0)),
+        "change_1m_pct":    _safe_float(ind.get("change_1m_pct", 0)),
+        "rsi":              _safe_float(ind.get("rsi",          50), 50.0),
+        "macd":             _safe_float(ind.get("macd",          0)),
+        "macd_hist":        _safe_float(ind.get("macd_hist",     0)),
+        "macd_signal":      _safe_float(ind.get("macd_signal",   0)),
+        "volume_ratio":     _safe_float(ind.get("volume_ratio", 1.0), 1.0),
         "ma20":             ma20,
-        "ma50":             float(ma50) if ma50 else None,
+        "ma50":             _safe_float(ma50, 0.0) if ma50 else None,
         "bb_upper":         bb_up,
         "bb_lower":         bb_low,
         "bb_mid":           ma20,
@@ -1689,8 +1958,8 @@ def _td_from_vibe_result(symbol: str, vibe_result: dict) -> dict:
         "support_20d":      sup_20d,
         "resistance_20d":   res_20d,
         "sr_levels":        sr,
-        "tp_check":         float(ind.get("tp", 0)),
-        "sl_check":         float(ind.get("sl", 0)),
+        "tp_check":         _safe_float(ind.get("tp", 0)),
+        "sl_check":         _safe_float(ind.get("sl", 0)),
         "entry_check":      price,
         "verdict_label":    verdict,
         "confidence_pct":   conf,
@@ -1699,7 +1968,7 @@ def _td_from_vibe_result(symbol: str, vibe_result: dict) -> dict:
         "active_agents":    n,
         "contradictions":   vibe_result.get("contradictions", []),
         "signals":          sig_ints,
-        "engine_details":   {k: str(v)[:200] for k, v in details.items()},
+        "engine_details":   engine_details,
         "market_regime":    ind.get("market_regime", "UNKNOWN"),
         "macro_label":      "",
         "macro_detail":     "",
