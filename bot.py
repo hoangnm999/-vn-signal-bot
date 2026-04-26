@@ -44,6 +44,13 @@ except ImportError:
     logger.warning("local_swarm_cmd.py chua co — /local_swarm bi tat")
 
 try:
+    from backtest_rule_cmd import backtest_rule_cmd
+    _BACKTEST_RULE = True
+except ImportError:
+    _BACKTEST_RULE = False
+    logger.warning("backtest_rule_cmd.py chua co — /backtest_rule bi tat")
+
+try:
     from vibe_client import (
         is_available as vibe_available,
         start_swarm, poll_swarm, format_swarm_result,
@@ -1188,6 +1195,8 @@ def main():
     app.add_handler(CommandHandler("vibestatus",   vibe_status_cmd))
     app.add_handler(CommandHandler("vibetest",     vibetest_cmd))
     app.add_handler(CommandHandler("deepscan",    deepscan_cmd))
+    if _BACKTEST_RULE:
+        app.add_handler(CommandHandler("backtest_rule", backtest_rule_cmd))
     if _LOCAL_SWARM:
         app.add_handler(CommandHandler("local_swarm",  local_swarm_cmd))
         app.add_handler(CommandHandler("cancel",       cancel_swarm_cmd))
