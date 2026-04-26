@@ -106,8 +106,22 @@ def compute_base_stats(analogs: list) -> dict:
     median_ret = float(np.median(f30s))
     std_ret    = float(np.std(f30s, ddof=1)) if n > 1 else 0.0
     win_rate   = sum(1 for x in f30s if x > 0) / n
-    sharpe     = (median_ret / std_ret) if std_ret > 0 else 0.0
     median_mdd = float(np.median(mdds)) if mdds else 0.0
+
+    # Return/Vol ratio 30D — ĐƠN GIẢN HÓA, không phải Sharpe học thuật
+    # (không annualized, không trừ risk-free rate, dùng median thay mean)
+    return_vol_ratio = (median_ret / std_ret) if std_ret > 0 else 0.0
+
+    # Expectancy = mean của TẤT CẢ forward return 30D (lãi + lỗ)
+    # Đây là forward return của analog, không phải per-trade riêng lẻ
+    # → dùng mean trực tiếp, không cần tách Win/Loss
+    expectancy = round(float(np.mean(f30s)), 2)
+
+    # Profit Factor = Σ(return dương) / |Σ(return âm)|
+    # Nếu không có lần âm → PF = 99 (tránh inf gây lỗi format/JSON)
+    pos_sum = sum(x for x in f30s if x > 0)
+    neg_sum = abs(sum(x for x in f30s if x < 0))
+    profit_factor = round(pos_sum / neg_sum, 2) if neg_sum > 0 else 99.0
 
     # P25 / P75 để hiển thị confidence interval
     p25 = float(np.percentile(f30s, 25)) if n >= 4 else None
@@ -115,29 +129,30 @@ def compute_base_stats(analogs: list) -> dict:
 
     # Recency: % mẫu trong 12 tháng gần nhất
     from datetime import datetime, timedelta
-    cutoff_12m = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-    n_recent   = sum(1 for a in analogs if a.get("date", "") >= cutoff_12m)
+    cutoff_12m    = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+    n_recent      = sum(1 for a in analogs if a.get("date", "") >= cutoff_12m)
     recency_ratio = n_recent / len(analogs) if analogs else 0
 
     return {
-        "valid":          True,
-        "n":              n,
-        "median_ret":     round(median_ret, 2),
-        "std_ret":        round(std_ret, 2),
-        "win_rate":       round(win_rate, 4),
-        "sharpe":         round(sharpe, 3),
-        "median_mdd":     round(median_mdd, 2),
-        "p25_ret":        round(p25, 2) if p25 is not None else None,
-        "p75_ret":        round(p75, 2) if p75 is not None else None,
-        "recency_ratio":  round(recency_ratio, 3),
-        "close":          close,
-        # Consistency: 30D vs 60D vs 90D
-        "median_60":      round(float(np.median(
-                              [a["fwd_60"] for a in analogs if a.get("fwd_60") is not None]
-                          )), 2) if any(a.get("fwd_60") for a in analogs) else None,
-        "median_90":      round(float(np.median(
-                              [a["fwd_90"] for a in analogs if a.get("fwd_90") is not None]
-                          )), 2) if any(a.get("fwd_90") for a in analogs) else None,
+        "valid":            True,
+        "n":                n,
+        "median_ret":       round(median_ret, 2),
+        "std_ret":          round(std_ret, 2),
+        "win_rate":         round(win_rate, 4),
+        "return_vol_ratio": round(return_vol_ratio, 3),
+        "median_mdd":       round(median_mdd, 2),
+        "expectancy":       expectancy,
+        "profit_factor":    profit_factor,
+        "p25_ret":          round(p25, 2) if p25 is not None else None,
+        "p75_ret":          round(p75, 2) if p75 is not None else None,
+        "recency_ratio":    round(recency_ratio, 3),
+        "close":            close,
+        "median_60":        round(float(np.median(
+                                [a["fwd_60"] for a in analogs if a.get("fwd_60") is not None]
+                            )), 2) if any(a.get("fwd_60") for a in analogs) else None,
+        "median_90":        round(float(np.median(
+                                [a["fwd_90"] for a in analogs if a.get("fwd_90") is not None]
+                            )), 2) if any(a.get("fwd_90") for a in analogs) else None,
     }
 
 
@@ -208,7 +223,7 @@ def compute_reference_score(
     n          = stats["n"]
     win_rate   = stats["win_rate"]
     median_ret = stats["median_ret"]
-    sharpe     = stats["sharpe"]
+    rvr        = stats.get("return_vol_ratio", 0)  # Return/Vol ratio
     median_mdd = stats["median_mdd"]
     penalties  = []
     risk_tier  = "NORMAL"
@@ -228,15 +243,15 @@ def compute_reference_score(
         return float(np.clip(-z if invert else z, -3, 3))
 
     z_ret   = _zscore_field("median_ret", median_ret)
-    z_sh    = _zscore_field("sharpe",     sharpe)
+    z_rvr   = _zscore_field("return_vol_ratio", rvr)
     z_mdd   = _zscore_field("median_mdd", median_mdd, invert=True)  # mdd âm → invert
 
-    # ── Composite formula ──────────────────────────────────────────────
+    # ── Reference Score formula ────────────────────────────────────────
     raw_score = (
-        win_rate          * 0.35 +
-        z_ret             * 0.25 +
-        z_sh              * 0.25 -
-        z_mdd             * 0.15
+        win_rate  * 0.35 +
+        z_ret     * 0.25 +
+        z_rvr     * 0.25 -
+        z_mdd     * 0.15
     )
     # Scale về 0–10 (z-score range ~[-3,3] → raw ~ [-1.35, 1.35])
     score = float(np.clip((raw_score + 1.35) / 2.70 * 10, 0, 10))
@@ -263,9 +278,9 @@ def compute_reference_score(
         )
 
     # Rule 3: Sharpe thấp
-    if sharpe < SHARPE_FLOOR and risk_tier == "NORMAL":
+    if rvr < SHARPE_FLOOR and risk_tier == "NORMAL":
         score *= 0.8
-        penalties.append(f"Sharpe {sharpe:.2f} < {SHARPE_FLOOR} → score × 0.8")
+        penalties.append(f"Return/Vol {rvr:.2f} < {SHARPE_FLOOR} → score × 0.8")
 
     # Rule 4: Mẫu nhỏ
     if n < MIN_SAMPLE_FOR_RANK:
@@ -281,10 +296,9 @@ def compute_reference_score(
 
     # High dispersion → Sharpe = 0 trong score
     if any("HIGH_DISPERSION" in f for f in flags):
-        # Tính lại không có z_sh
         raw2  = win_rate * 0.35 + z_ret * 0.25 - z_mdd * 0.15
         score = float(np.clip((raw2 + 1.35) / 2.70 * 10, 0, 10))
-        penalties.append("High dispersion → Sharpe = 0 trong công thức")
+        penalties.append("High dispersion → Return/Vol = 0 trong công thức")
 
     # Score ceiling
     score = min(score, SCORE_MAX)
@@ -328,7 +342,10 @@ def format_symbol_entry(
     win_rate   = stats["win_rate"]
     median_ret = stats["median_ret"]
     median_mdd = stats["median_mdd"]
-    sharpe     = stats["sharpe"]
+    rvr        = stats.get("return_vol_ratio", 0)
+    expectancy = stats.get("expectancy", 0)
+    pf         = stats.get("profit_factor", 0)
+    pf_str     = "99.00" if pf >= 99 else f"{pf:.2f}"
     p25        = stats.get("p25_ret")
     p75        = stats.get("p75_ret")
     close      = stats.get("close", 0)
@@ -356,8 +373,12 @@ def format_symbol_entry(
     )
 
     lines.append(
-        f"📈 Sharpe: {sharpe:.2f} | "
-        f"Reference Score: {score:.1f}/10 *"
+        f"📉 Expectancy: {expectancy:+.1f}% | "
+        f"Profit Factor: {pf_str} | "
+        f"Return/Vol 30D: {rvr:.2f}"
+    )
+    lines.append(
+        f"🎯 Reference Score: {score:.1f}/10 *"
     )
 
     if risk_tier == "HIGH_RISK":
@@ -421,11 +442,16 @@ def format_full_report(
         parts.append("─" * 38)
         parts.append("CƠ HỘI RỦI RO RẤT CAO (MaxDD < -25%):")
         for r in excluded:
-            s = r["stats"]
+            s   = r["stats"]
+            exp    = s.get("expectancy", 0)
+            pf     = s.get("profit_factor", 0)
+            pf_str = "99.00" if pf >= 99 else f"{pf:.2f}"
             parts.append(
                 f"  {r['symbol']}: Score {r['score']:.1f} | "
                 f"WR {s['win_rate']:.0%} | "
-                f"Median return {s['median_ret']:+.1f}% | "
+                f"Median {s['median_ret']:+.1f}% | "
+                f"Expectancy {exp:+.1f}% | "
+                f"PF {pf_str} | "
                 f"MDD {s['median_mdd']:.1f}%"
             )
         parts.append("  ⚠️ Chỉ phù hợp cho nhà đầu tư chấp nhận rủi ro rất cao.")

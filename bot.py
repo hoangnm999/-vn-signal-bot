@@ -44,6 +44,13 @@ except ImportError:
     logger.warning("local_swarm_cmd.py chua co — /local_swarm bi tat")
 
 try:
+    from backtest_rule_cmd import backtest_rule_cmd
+    _BACKTEST_RULE = True
+except ImportError:
+    _BACKTEST_RULE = False
+    logger.warning("backtest_rule_cmd.py chua co — /backtest_rule bi tat")
+
+try:
     from batch_scanner import scan_watchlist_cmd, _start_scan_cron
     _BATCH_SCANNER = True
 except ImportError:
@@ -1195,6 +1202,8 @@ def main():
     app.add_handler(CommandHandler("vibestatus",   vibe_status_cmd))
     app.add_handler(CommandHandler("vibetest",     vibetest_cmd))
     app.add_handler(CommandHandler("deepscan",    deepscan_cmd))
+    if _BACKTEST_RULE:
+        app.add_handler(CommandHandler("backtest_rule",  backtest_rule_cmd))
     if _BATCH_SCANNER:
         app.add_handler(CommandHandler("scan_watchlist", scan_watchlist_cmd))
     if _LOCAL_SWARM:
@@ -1210,7 +1219,6 @@ def main():
     async def post_init(application):
         asyncio.create_task(_start_cron())
         if _BATCH_SCANNER:
-            # Lấy ALLOWED_IDS để gửi auto-scan kết quả
             _scan_chat_ids = [
                 int(x.strip()) for x in
                 os.environ.get("ALLOWED_IDS", "").split(",")
@@ -1221,8 +1229,7 @@ def main():
                     _start_scan_cron(application.bot, _scan_chat_ids)
                 )
                 logger.info(
-                    f"ScanCron: dang ky cho {len(_scan_chat_ids)} chat_ids, "
-                    f"chay luc 08:00 hang ngay"
+                    f"ScanCron: {len(_scan_chat_ids)} chat_ids, chay luc 08:00"
                 )
             else:
                 logger.warning("ScanCron: ALLOWED_IDS trong env, scan cron bi tat")
