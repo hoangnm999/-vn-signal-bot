@@ -179,14 +179,14 @@ def _format_rule_result(
 
     # Dynamic exit summary
     dyn_parts = []
-    if exit_ec_exit.trailing_stop_pct:
-        dyn_parts.append(f"TrailingStop {exit_ec_exit.trailing_stop_pct:.1f}%")
-    if exit_ec_exit.take_profit_pct:
-        dyn_parts.append(f"TakeProfit {exit_ec_exit.take_profit_pct:.1f}%")
-    if exit_ec_exit.stop_loss_pct:
-        dyn_parts.append(f"StopLoss {exit_ec_exit.stop_loss_pct:.1f}%")
-    if exit_ec_exit.hold_bars:
-        dyn_parts.append(f"MaxHold {exit_ec_exit.hold_bars}bar")
+    _ts_pct = getattr(exit_ec_exit, "trailing_stop_pct", None)
+    _tp_pct = getattr(exit_ec_exit, "take_profit_pct",  None)
+    _sl_pct = getattr(exit_ec_exit, "stop_loss_pct",    None)
+    _hb     = getattr(exit_ec_exit, "hold_bars",        None)
+    if _ts_pct: dyn_parts.append(f"TrailingStop {_ts_pct:.1f}%")
+    if _tp_pct: dyn_parts.append(f"TakeProfit {_tp_pct:.1f}%")
+    if _sl_pct: dyn_parts.append(f"StopLoss {_sl_pct:.1f}%")
+    if _hb:     dyn_parts.append(f"MaxHold {_hb}bar")
     dyn_str = " + ".join(dyn_parts) if dyn_parts else "Khong"
 
     lines = [
@@ -268,12 +268,15 @@ def _run_rule_backtest_sync(
     Pipeline hoàn chỉnh: load data → parse rules → run backtest → chart.
     Chạy trong asyncio.to_thread.
     """
-    from vn_loader import load_vn_ohlcv
-    from rule_engine import (
-        generate_rule_signals, apply_dynamic_exit, parse_rule,
-        format_rule_explanation,
-    )
-    from backtest_engine import _run_backtest_core, _calc_metrics, _draw_chart
+    try:
+        from vn_loader import load_vn_ohlcv
+        from rule_engine import (
+            generate_rule_signals, apply_dynamic_exit, parse_rule,
+            format_rule_explanation,
+        )
+        from backtest_engine import _run_backtest_core, _calc_metrics, _draw_chart
+    except ImportError as _ie:
+        return {"status": "error", "error": f"Thieu module: {_ie}"}
 
     config = {
         "symbol":           symbol,
@@ -371,13 +374,20 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
       2b. Chỉ có state_vector → analog search.
       3. Không có gì → hướng dẫn.
     """
-    from auto_context import (
-        load_auto_context, trade_plan_to_rules,
-        format_trade_plan_summary, format_no_context_msg,
-    )
-    from historical_analog import (
-        cache_exists, find_similar, format_analog_report, build_vector_cache,
-    )
+    try:
+        from auto_context import (
+            load_auto_context, trade_plan_to_rules,
+            format_trade_plan_summary, format_no_context_msg,
+        )
+        from historical_analog import (
+            cache_exists, find_similar, format_analog_report, build_vector_cache,
+        )
+    except ImportError as _ie:
+        await update.message.reply_text(
+            f"Thieu module: {_ie}\n"
+            f"De dung rule thu cong: /backtest_rule {symbol} \"rsi < 30\" \"rsi > 70\""
+        )
+        return
 
     NL      = "\n"
     chat_id = update.effective_chat.id
@@ -747,12 +757,17 @@ async def backtest_rule_cmd(update, context):
         except Exception as e:
             import traceback
             logger.error(f"backtest_rule_cmd bg error: {e}\n{traceback.format_exc()}")
+            err_text = f"Loi xu ly /backtest_rule: {str(e)[:300]}"
             try:
                 await context.bot.edit_message_text(
                     chat_id=chat_id, message_id=msg.message_id,
-                    text=f"Loi xu ly /backtest_rule: {str(e)[:300]}",
+                    text=err_text,
                 )
             except Exception:
-                pass
+                # edit fail (msg đã bị xoá hoặc timeout) → gửi message mới
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=err_text)
+                except Exception:
+                    pass
 
-    asyncio.create_task(_bg())
+    await _bg()
