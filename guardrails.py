@@ -153,6 +153,37 @@ def compute_base_stats(analogs: list) -> dict:
         "median_90":        round(float(np.median(
                                 [a["fwd_90"] for a in analogs if a.get("fwd_90") is not None]
                             )), 2) if any(a.get("fwd_90") for a in analogs) else None,
+        # MAE/MFE từ price journey (max_drawdown = MAE, max_gain = MFE trong 90D)
+        # Đây là excursion thực tế của từng analog — tương đương MAE/MFE backtest
+        "mae_avg":    round(float(np.mean(
+                          [a["max_drawdown"] for a in analogs if a.get("max_drawdown") is not None]
+                      )), 2) if any(a.get("max_drawdown") for a in analogs) else None,
+        "mae_worst":  round(float(np.min(
+                          [a["max_drawdown"] for a in analogs if a.get("max_drawdown") is not None]
+                      )), 2) if any(a.get("max_drawdown") for a in analogs) else None,
+        "mfe_avg":    round(float(np.mean(
+                          [a["max_gain"] for a in analogs if a.get("max_gain") is not None]
+                      )), 2) if any(a.get("max_gain") for a in analogs) else None,
+        "mfe_best":   round(float(np.max(
+                          [a["max_gain"] for a in analogs if a.get("max_gain") is not None]
+                      )), 2) if any(a.get("max_gain") for a in analogs) else None,
+        # Hold duration: số ngày TB đến khi đạt max_gain (proxy cho holding period)
+        "hold_avg":   round(float(np.mean(
+                          [a["max_gain_day"] for a in analogs if a.get("max_gain_day") is not None]
+                      )), 1) if any(a.get("max_gain_day") for a in analogs) else None,
+        "hold_median":round(float(np.median(
+                          [a["max_gain_day"] for a in analogs if a.get("max_gain_day") is not None]
+                      )), 1) if any(a.get("max_gain_day") for a in analogs) else None,
+        # MFE capture rate: fwd_30 / max_gain = % MFE thực thu được trong 30D
+        "mfe_capture_rate": round(float(np.mean(
+                          [a["fwd_30"] / a["max_gain"] * 100
+                           for a in analogs
+                           if a.get("fwd_30") is not None
+                           and a.get("max_gain") is not None
+                           and a["max_gain"] > 0]
+                      )), 1) if any(
+                          a.get("max_gain") and a["max_gain"] > 0 for a in analogs
+                      ) else None,
     }
 
 
@@ -206,9 +237,10 @@ def sanity_check(stats: dict) -> list[str]:
 # ══════════════════════════════════════════════════════════════════════
 
 def compute_reference_score(
-    stats:      dict,
-    flags:      list[str],
-    all_stats:  list[dict],   # toàn bộ mã để z-score
+    stats:       dict,
+    flags:       list[str],
+    all_stats:   list[dict],          # toàn bộ mã để z-score
+    n_override:  Optional[int] = None,  # mẫu độc lập SAU lọc khoảng cách
 ) -> tuple[float, list[str], str]:
     """
     Tính Reference Score (0–8.5) với các penalties.
@@ -220,7 +252,9 @@ def compute_reference_score(
     if not stats.get("valid"):
         return 0.0, ["Không đủ dữ liệu thống kê"], "EXCLUDED"
 
-    n          = stats["n"]
+    # Dùng n_override (số mẫu độc lập sau lọc khoảng cách) nếu có
+    # Gate "mẫu nhỏ" phải check trên số mẫu SAU lọc, không phải số thô
+    n          = n_override if n_override is not None else stats["n"]
     win_rate   = stats["win_rate"]
     median_ret = stats["median_ret"]
     rvr        = stats.get("return_vol_ratio", 0)  # Return/Vol ratio
@@ -329,14 +363,15 @@ _SYSTEM_DISCLAIMER = (
 
 
 def format_symbol_entry(
-    rank:       int,
-    symbol:     str,
-    stats:      dict,
-    score:      float,
-    flags:      list[str],
-    penalties:  list[str],
-    risk_tier:  str,
-    n_total:    int,     # tổng số ngày tương đồng (kể cả mốc khác)
+    rank:          int,
+    symbol:        str,
+    stats:         dict,
+    score:         float,
+    flags:         list[str],
+    penalties:     list[str],
+    risk_tier:     str,
+    n_total:       int,   # ngày thô vượt ngưỡng similarity
+    n_independent: int = 0,  # mẫu độc lập sau Minimum Distance Sampling
 ) -> str:
     """Format một mã trong output top 5."""
     win_rate   = stats["win_rate"]
@@ -355,11 +390,12 @@ def format_symbol_entry(
 
     lines = [f"{em} #{rank} — {symbol} (Giá: {close:,.0f})"]
 
-    # Sample info
-    sample_note = f" ⚠️ Mẫu nhỏ" if n < MIN_SAMPLE_FOR_RANK else ""
+    # Sample info — hiển thị mẫu độc lập (sau Minimum Distance Sampling)
+    n_ind = n_independent if n_independent > 0 else n
+    sample_note = " ⚠️ Mẫu nhỏ" if n_ind < MIN_SAMPLE_FOR_RANK else ""
     lines.append(
-        f"📊 Mẫu: {n} ngày (tổng {n_total} khớp) | "
-        f"Tỷ lệ thắng 30D: {win_rate:.0%} | Tỷ lệ thua: {1-win_rate:.0%}"
+        f"📊 Mẫu độc lập: {n_ind}/{n_total} | "
+        f"WR 30D: {win_rate:.0%} | Thua: {1-win_rate:.0%}"
         f"{sample_note}"
     )
 
@@ -380,6 +416,22 @@ def format_symbol_entry(
     lines.append(
         f"🎯 Reference Score: {score:.1f}/10 *"
     )
+
+    # MAE/MFE + Hold Duration từ price journey của các analog
+    mae_avg = stats.get("mae_avg")
+    mfe_avg = stats.get("mfe_avg")
+    hold_avg = stats.get("hold_avg")
+    capture = stats.get("mfe_capture_rate")
+    if mae_avg is not None and mfe_avg is not None:
+        capture_str = ""
+        if capture is not None:
+            cap_note = " ⚠️ exit sớm" if capture < 40 else " ✅ hiệu quả" if capture > 80 else ""
+            capture_str = f" | Thu: {capture:.0f}%{cap_note}"
+        lines.append(
+            f"📉 MAE TB: {mae_avg:+.1f}% | MFE TB: {mfe_avg:+.1f}%{capture_str}"
+        )
+    if hold_avg is not None:
+        lines.append(f"⏱️  Hold đỉnh TB: {hold_avg:.0f} ngày")
 
     if risk_tier == "HIGH_RISK":
         lines.append("🔴 Rủi ro cao")
@@ -422,14 +474,15 @@ def format_full_report(
         top5 = [r for r in ranked if r["risk_tier"] != "EXCLUDED"][:5]
         for i, r in enumerate(top5, 1):
             entry = format_symbol_entry(
-                rank      = i,
-                symbol    = r["symbol"],
-                stats     = r["stats"],
-                score     = r["score"],
-                flags     = r["flags"],
-                penalties = r["penalties"],
-                risk_tier = r["risk_tier"],
-                n_total   = r.get("n_total", r["stats"]["n"]),
+                rank          = i,
+                symbol        = r["symbol"],
+                stats         = r["stats"],
+                score         = r["score"],
+                flags         = r["flags"],
+                penalties     = r["penalties"],
+                risk_tier     = r["risk_tier"],
+                n_total       = r.get("n_total", r["stats"]["n"]),
+                n_independent = r.get("n_independent", 0),
             )
             parts.append(entry)
             parts.append("")
@@ -502,14 +555,15 @@ def run_guardrails_for_symbol(
     Returns dict kết quả với đầy đủ thông tin.
     """
     result = {
-        "symbol":    symbol,
-        "gate":      "PASS",
-        "stats":     {},
-        "flags":     [],
-        "score":     0.0,
-        "penalties": [],
-        "risk_tier": "EXCLUDED",
-        "n_total":   0,
+        "symbol":        symbol,
+        "gate":          "PASS",
+        "stats":         {},
+        "flags":         [],
+        "score":         0.0,
+        "penalties":     [],
+        "risk_tier":     "EXCLUDED",
+        "n_total":       0,
+        "n_independent": 0,
     }
 
     # Layer 1
@@ -526,7 +580,11 @@ def run_guardrails_for_symbol(
         result["reason"] = "Không tìm được ngày tương đồng"
         return result
 
-    result["n_total"] = analogs[0].get("_meta", {}).get("total_matches", len(analogs))
+    meta          = analogs[0].get("_meta", {})
+    n_total       = meta.get("total_matches",   len(analogs))
+    n_independent = meta.get("independent_n",   len(analogs))
+    result["n_total"]       = n_total
+    result["n_independent"] = n_independent
 
     # Layer 2
     stats = compute_base_stats(analogs)
@@ -539,8 +597,10 @@ def run_guardrails_for_symbol(
     flags = sanity_check(stats)
     result["flags"] = flags
 
-    # Layer 3
-    score, penalties, risk_tier = compute_reference_score(stats, flags, all_stats)
+    # Layer 3: truyền n_independent để gate mẫu nhỏ check đúng
+    score, penalties, risk_tier = compute_reference_score(
+        stats, flags, all_stats, n_override=n_independent
+    )
     result["score"]     = score
     result["penalties"] = penalties
     result["risk_tier"] = risk_tier

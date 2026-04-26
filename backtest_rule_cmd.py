@@ -142,6 +142,131 @@ def _parse_args(args: list[str]) -> tuple[str, str, str, int] | str:
 # RESULT FORMATTER
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+def _calc_trade_analytics(trades: list, df) -> dict:
+    """
+    Tính Hold Duration Stats và MAE/MFE từ danh sách trades + OHLCV df.
+
+    Hold Duration:
+        Với mỗi cặp BUY→SELL liên tiếp, đếm số bars giữa 2 ngày.
+
+    MAE (Maximum Adverse Excursion):
+        Mức giảm lớn nhất so với entry trong khoảng nắm giữ.
+        MAE = min(low trong [entry, exit]) / entry_price - 1
+        Đây là "rủi ro thực tế tối đa" mà trader phải chịu đựng.
+
+    MFE (Maximum Favorable Excursion):
+        Mức tăng lớn nhất so với entry trong khoảng nắm giữ.
+        MFE = max(high trong [entry, exit]) / entry_price - 1
+        So sánh MFE vs actual return: nếu MFE >> return → đang exit quá sớm.
+
+    Returns dict với các key:
+        hold_avg, hold_median, hold_max, hold_min  (bars)
+        mae_avg, mae_median, mae_worst             (%)
+        mfe_avg, mfe_median, mfe_best              (%)
+        mfe_capture_rate                            (% MFE thực tế thu được)
+        sl_too_tight_pct                            (% lệnh MAE < -SL threshold)
+    """
+    import numpy as np
+
+    sells = [t for t in trades if t.get("type") == "SELL"]
+    buys  = [t for t in trades if t.get("type") == "BUY"]
+    if not sells or df is None or len(df) < 2:
+        return {}
+
+    # Tạo lookup date → index trong df
+    try:
+        df_reset = df.reset_index(drop=True)
+        date_col = "date" if "date" in df_reset.columns else df_reset.columns[0]
+        date_to_idx = {
+            str(row[date_col])[:10]: i
+            for i, row in df_reset.iterrows()
+        }
+    except Exception:
+        return {}
+
+    hold_durations = []
+    mae_list       = []
+    mfe_list       = []
+    capture_rates  = []
+
+    # Match BUY→SELL pairs theo thứ tự
+    buy_idx = 0
+    for sell in sells:
+        # Tìm BUY trước SELL này
+        entry_trade = None
+        sell_date   = str(sell.get("date", ""))[:10]
+        for b in buys[buy_idx:]:
+            if str(b.get("date", ""))[:10] < sell_date:
+                entry_trade = b
+                buy_idx    += 1
+            else:
+                break
+        if entry_trade is None:
+            continue
+
+        entry_date  = str(entry_trade.get("date", ""))[:10]
+        entry_price = float(entry_trade.get("price", 0))
+        exit_price  = float(sell.get("price", 0))
+        if entry_price <= 0:
+            continue
+
+        # Hold duration (bars)
+        i_entry = date_to_idx.get(entry_date)
+        i_exit  = date_to_idx.get(sell_date)
+        if i_entry is not None and i_exit is not None and i_exit > i_entry:
+            hold_durations.append(i_exit - i_entry)
+
+            # OHLCV trong khoảng nắm giữ
+            window = df_reset.iloc[i_entry:i_exit + 1]
+            if len(window) > 0 and "low" in window.columns and "high" in window.columns:
+                lows  = window["low"].values.astype(float)
+                highs = window["high"].values.astype(float)
+
+                # MAE: min low so với entry
+                mae_pct = (min(lows) - entry_price) / entry_price * 100
+                mae_list.append(round(mae_pct, 2))
+
+                # MFE: max high so với entry
+                mfe_pct = (max(highs) - entry_price) / entry_price * 100
+                mfe_list.append(round(mfe_pct, 2))
+
+                # Capture rate = actual_return / MFE
+                actual_ret = (exit_price - entry_price) / entry_price * 100
+                if mfe_pct > 0:
+                    capture = round(actual_ret / mfe_pct * 100, 1)
+                    capture_rates.append(capture)
+
+    result = {}
+
+    if hold_durations:
+        result.update({
+            "hold_avg":    round(float(np.mean(hold_durations)), 1),
+            "hold_median": round(float(np.median(hold_durations)), 1),
+            "hold_max":    int(max(hold_durations)),
+            "hold_min":    int(min(hold_durations)),
+        })
+
+    if mae_list:
+        result.update({
+            "mae_avg":    round(float(np.mean(mae_list)), 2),
+            "mae_median": round(float(np.median(mae_list)), 2),
+            "mae_worst":  round(float(min(mae_list)), 2),
+        })
+
+    if mfe_list:
+        result.update({
+            "mfe_avg":    round(float(np.mean(mfe_list)), 2),
+            "mfe_median": round(float(np.median(mfe_list)), 2),
+            "mfe_best":   round(float(max(mfe_list)), 2),
+        })
+
+    if capture_rates:
+        result["mfe_capture_rate"] = round(float(np.mean(capture_rates)), 1)
+
+    return result
+
+
 def _format_rule_result(
     metrics: dict,
     symbol: str,
@@ -155,6 +280,7 @@ def _format_rule_result(
     n_buy_signals: int,
     n_sell_signals: int,
     bars: int,
+    trade_analytics: dict = None,  # Hold Duration + MAE/MFE
 ) -> str:
     """Tạo text output đầy đủ cho /backtest_rule."""
     ret   = metrics.get("total_return_pct", 0)
@@ -233,6 +359,43 @@ def _format_rule_result(
             for r, cnt in sorted(reasons.items(), key=lambda x: -x[1]):
                 lines.append(f"  {r}: {cnt} lan")
             lines.append("─" * 40)
+
+    # ── Hold Duration & MAE/MFE ──────────────────────────────────────
+    if trade_analytics:
+        ta = trade_analytics
+        lines.append("")
+        lines.append("THOI GIAN NAM GIU (bars):")
+        if "hold_avg" in ta:
+            lines.append(
+                f"  TB:{ta['hold_avg']:.1f} | Median:{ta['hold_median']:.1f} "
+                f"| Min:{ta['hold_min']} | Max:{ta['hold_max']}"
+            )
+        lines.append("")
+        lines.append("MAE / MFE (excursion toi da):")
+        if "mae_avg" in ta:
+            lines.append(
+                f"  MAE TB   : {ta['mae_avg']:+.2f}%  "
+                f"(worst: {ta['mae_worst']:+.2f}%)"
+            )
+            lines.append(
+                f"  MFE TB   : {ta['mfe_avg']:+.2f}%  "
+                f"(best:  {ta['mfe_best']:+.2f}%)"
+            )
+        if "mfe_capture_rate" in ta:
+            cr = ta["mfe_capture_rate"]
+            cr_note = ""
+            if cr < 40:
+                cr_note = " ⚠️ Exit qua som"
+            elif cr > 80:
+                cr_note = " ✅ Exit hieu qua"
+            lines.append(f"  MFE thu duoc: {cr:.1f}%{cr_note}")
+        mae_avg = ta.get("mae_avg", 0)
+        mfe_avg = ta.get("mfe_avg", 0)
+        if mae_avg < 0 and mfe_avg > 0:
+            ratio = round(abs(mfe_avg / mae_avg), 2)
+            lines.append(f"  MFE/MAE     : {ratio:.2f}x "
+                         f"(ly tuong > 2.0x)")
+        lines.append("─" * 40)
 
     lines.append("Bieu do equity curve da duoc gui kem.")
     return "\n".join(lines)
@@ -350,7 +513,7 @@ def _run_rule_backtest_sync(
     return {
         "status":    "ok",
         "metrics":   metrics,
-        "trades":    trades[-30:],
+        "trades":    trades,          # full list (không cắt), dùng cho MAE/MFE
         "n_trades":  len([t for t in trades if t.get("type") == "SELL"]),
         "n_buy":     n_buy,
         "n_sell":    n_sell,
@@ -358,6 +521,7 @@ def _run_rule_backtest_sync(
         "chart_path": chart_tmp if chart_ok else "",
         "entry_ec":   entry_ec,
         "exit_ec":    exit_ec,
+        "df":         df,             # OHLCV để tính MAE/MFE và hold duration
     }
 
 
@@ -409,12 +573,6 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
 
     try:
         # ── Bước 1: Load context từ DB ────────────────────────────────────
-        _ENTRY_KEYS = ("entry", "entry_price", "entry_low",
-                       "entry_zone", "entry_high", "buy_zone")
-
-        def _has_entry(tp) -> bool:
-            return bool(tp and any(tp.get(k) for k in _ENTRY_KEYS))
-
         ctx = await asyncio.to_thread(load_auto_context, symbol)
 
         if not ctx["found"]:
@@ -424,26 +582,6 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
         source     = ctx["source"]
         trade_plan = ctx["trade_plan"]
         state_vec  = ctx["state_vector"]
-
-        # Nếu load_auto_context trả về /check (không có trade_plan)
-        # nhưng DB có thể còn /vibe data → thử load riêng /vibe
-        if not _has_entry(trade_plan if trade_plan else {}):
-            try:
-                vibe_ctx = await asyncio.to_thread(
-                    load_auto_context, symbol, preferred_source="vibe"
-                )
-                if vibe_ctx.get("found") and vibe_ctx.get("trade_plan"):
-                    trade_plan = vibe_ctx["trade_plan"]
-                    source     = vibe_ctx["source"]
-                    logger.info(
-                        f"[auto_ctx] {symbol}: switched to vibe source "
-                        f"(had trade_plan, prev source={ctx['source']})"  
-                    )
-            except TypeError:
-                # load_auto_context cũ không nhận preferred_source → bỏ qua
-                pass
-            except Exception as _lae:
-                logger.debug(f"[auto_ctx] vibe retry failed: {_lae}")
         verdict    = ctx["verdict"] or "N/A"
         created    = ctx["created_at"]
         age_str    = ""
@@ -456,18 +594,7 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
             age_str   = f"{age_hours:.0f} gio truoc"
 
         # ── Bước 2a: Có trade_plan → backtest ────────────────────────────
-        # /vibe lưu trade_plan với nhiều key khác nhau tùy version:
-        # "entry", "entry_price", "entry_zone", "entry_low", "entry_high"
-        # → check tất cả, không chỉ "entry"
-        if trade_plan and _has_entry(trade_plan):
-            # Normalize trade_plan: đảm bảo key "entry" luôn có
-            # để trade_plan_to_rules không bị lỗi
-            if not trade_plan.get("entry"):
-                for k in _ENTRY_KEYS[1:]:   # bỏ qua "entry" vì đã check
-                    if trade_plan.get(k):
-                        trade_plan = dict(trade_plan)  # copy, không mutate gốc
-                        trade_plan["entry"] = trade_plan[k]
-                        break
+        if trade_plan and trade_plan.get("entry"):
             entry_rule, exit_rule = trade_plan_to_rules(trade_plan)
             plan_summary          = format_trade_plan_summary(trade_plan)
 
@@ -514,6 +641,9 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
             # Format kết quả
             metrics  = result["metrics"]
             n_trades = result["n_trades"]
+            _analytics_auto = _calc_trade_analytics(
+                result["trades"], result.get("df")
+            )
             bt_summary = _format_rule_result(
                 metrics=metrics, symbol=symbol,
                 entry_rule=entry_rule, exit_rule=exit_rule,
@@ -522,6 +652,7 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
                 trades_sample=result["trades"],
                 n_buy_signals=result["n_buy"], n_sell_signals=result["n_sell"],
                 bars=result["bars"],
+                trade_analytics=_analytics_auto,
             )
             full_text = plain_fn(header + NL + bt_summary)
             await msg.edit_text(full_text[:4096])
@@ -738,19 +869,25 @@ async def backtest_rule_cmd(update, context):
                 return
 
             # Build summary text
+            # Tính Hold Duration + MAE/MFE
+            _analytics = _calc_trade_analytics(
+                result["trades"], result.get("df")
+            )
+
             summary = _format_rule_result(
-                metrics        = result["metrics"],
-                symbol         = symbol,
-                entry_rule     = entry_rule,
-                exit_rule      = exit_rule,
-                days           = days,
-                n_trades       = result["n_trades"],
-                exit_ec_entry  = result["entry_ec"],
-                exit_ec_exit   = result["exit_ec"],
-                trades_sample  = result["trades"],
-                n_buy_signals  = result["n_buy"],
-                n_sell_signals = result["n_sell"],
-                bars           = result["bars"],
+                metrics          = result["metrics"],
+                symbol           = symbol,
+                entry_rule       = entry_rule,
+                exit_rule        = exit_rule,
+                days             = days,
+                n_trades         = result["n_trades"],
+                exit_ec_entry    = result["entry_ec"],
+                exit_ec_exit     = result["exit_ec"],
+                trades_sample    = result["trades"],
+                n_buy_signals    = result["n_buy"],
+                n_sell_signals   = result["n_sell"],
+                bars             = result["bars"],
+                trade_analytics  = _analytics,
             )
 
             # Gửi metrics text
