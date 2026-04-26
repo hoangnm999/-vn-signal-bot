@@ -34,7 +34,10 @@ except ImportError:
     _ALERT_AVAILABLE = False
     logger.warning("alert_system.py chua co — /alert va /alerts bi tat")
 try:
-    from local_swarm_cmd import local_swarm_cmd, install_vibe_failover, cancel_swarm_cmd
+    from local_swarm_cmd import (
+        local_swarm_cmd, install_vibe_failover,
+        cancel_swarm_cmd, lswarm_fast_cmd,
+    )
     _LOCAL_SWARM = True
 except ImportError:
     _LOCAL_SWARM = False
@@ -204,6 +207,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/check <MA>          — Phan tich 16 engines + Action Plan\n"
         "/vibe <MA>           — Vibe-Trading swarm (35 agents, AI)\n"
         "/local_swarm <MA>    — Hoi dong 5 chuyen gia AI noi bo\n"
+        "/lswarm_fast <MA>    — Fast mode: 2 chuyen gia, ~60s\n"
         "/cancel              — Huy tac vu local_swarm dang chay\n"
         "/scan                — Quet nhanh RSI+Vol toan watchlist\n"
         "/deepscan            — Phan tich sau 16 engines toan watchlist\n\n"
@@ -1185,8 +1189,9 @@ def main():
     app.add_handler(CommandHandler("vibetest",     vibetest_cmd))
     app.add_handler(CommandHandler("deepscan",    deepscan_cmd))
     if _LOCAL_SWARM:
-        app.add_handler(CommandHandler("local_swarm", local_swarm_cmd))
-        app.add_handler(CommandHandler("cancel",      cancel_swarm_cmd))
+        app.add_handler(CommandHandler("local_swarm",  local_swarm_cmd))
+        app.add_handler(CommandHandler("cancel",       cancel_swarm_cmd))
+        app.add_handler(CommandHandler("lswarm_fast",  lswarm_fast_cmd))   # fast mode: 2 experts, ~60s
         install_vibe_failover(app)   # failover khi Vibe offline
     if _ALERT_AVAILABLE:
         app.add_handler(CommandHandler("alert",    alert_cmd))

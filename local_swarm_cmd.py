@@ -17,6 +17,12 @@ Giải pháp: tách hoàn toàn 2 luồng:
      └─ Hard timeout 600s
 
 Không còn callback asyncio từ sync thread → không còn deadlock.
+
+DEBUG PATCH v2:
+  - Log chi tiết từng bước với timestamp
+  - Heartbeat 60s + cảnh báo 5 phút
+  - Per-LLM-call timeout 120s (tránh hang vô tận)
+  - /lswarm_fast: 2 chuyên gia, 1 vòng, tối đa 60s
 ─────────────────────────────────────────────────────────────────────
 """
 
@@ -33,16 +39,20 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-SWARM_COOLDOWN   = 120      # giây giữa 2 lần /local_swarm cùng user
-SWARM_TIMEOUT    = 600      # hard timeout 10 phút (Fix #2)
-MAX_PROGRESS_MSG = 30       # tối đa 30 dòng progress trước khi im lặng (Fix #3)
-PROGRESS_INTERVAL = 8       # giây cập nhật message Telegram
-SPAM_WARNING     = "⚠️ Đang xử lý tác vụ phức tạp, vui lòng đợi thêm..."
+SWARM_COOLDOWN    = 120      # giây giữa 2 lần /local_swarm cùng user
+SWARM_TIMEOUT     = 600      # hard timeout 10 phút
+FAST_TIMEOUT      = 90       # hard timeout cho /lswarm_fast
+MAX_PROGRESS_MSG  = 30       # tối đa 30 dòng progress trước khi im lặng
+PROGRESS_INTERVAL = 8        # giây cập nhật message Telegram
+HEARTBEAT_INTERVAL = 60      # gửi heartbeat mỗi N giây
+WARN_LONG_TASK    = 300      # cảnh báo sau 5 phút
+LLM_CALL_TIMEOUT  = 120      # timeout cứng mỗi lần gọi LLM (giây)
+SPAM_WARNING      = "⚠️ Đang xử lý tác vụ phức tạp, vui lòng đợi thêm..."
 
 # ── Global state ──────────────────────────────────────────────────────────────
 _last_local_swarm: dict[str, float] = {}    # user_id → timestamp
 
-# Lưu task đang chạy để /cancel có thể hủy (Fix #4)
+# Lưu task đang chạy để /cancel có thể hủy
 # key: chat_id, value: {"future": Future, "cancel_event": Event, "symbol": str}
 _active_swarm_tasks: dict[int, dict] = {}
 
@@ -50,7 +60,25 @@ _active_swarm_tasks: dict[int, dict] = {}
 _swarm_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="swarm")
 
 
-# ── Cancel command (Fix #4) ───────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER: log với timestamp rõ ràng
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ts() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+def _log_step(step: str, symbol: str, extra: str = ""):
+    """Log chi tiết từng bước với timestamp."""
+    msg = f"[SWARM][{_ts()}] [{symbol}] {step}"
+    if extra:
+        msg += f" | {extra}"
+    logger.info(msg)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CANCEL command
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def cancel_swarm_cmd(update, context):
     """
@@ -73,9 +101,9 @@ async def cancel_swarm_cmd(update, context):
         return
 
     symbol = task.get("symbol", "?")
-    task["cancel_event"].set()    # báo cho thread dừng
+    task["cancel_event"].set()
     future: Future = task["future"]
-    future.cancel()               # cancel future nếu chưa start
+    future.cancel()
     _active_swarm_tasks.pop(chat_id, None)
 
     await update.message.reply_text(
@@ -84,7 +112,233 @@ async def cancel_swarm_cmd(update, context):
     )
 
 
-# ── Main command handler ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# FAST MODE: /lswarm_fast — 2 chuyên gia, 1 vòng, tối đa 90s
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def lswarm_fast_cmd(update, context):
+    """
+    /lswarm_fast <MA> — chế độ rút gọn:
+      - Chỉ 2 chuyên gia (tech_analyst + risk_manager)
+      - 1 vòng tranh luận
+      - Timeout cứng 90 giây
+      - Không cần cooldown dài
+    Dùng để test xem vấn đề có phải do độ phức tạp prompt gốc không.
+    """
+    try:
+        from bot import is_allowed, _deny, plain, _validate_symbol
+    except ImportError:
+        def is_allowed(_): return True
+        async def _deny(_): pass
+        def plain(t): return t
+        def _validate_symbol(s):
+            s = s.upper().strip()
+            return (s.isalnum() and 2 <= len(s) <= 10), s
+
+    if not is_allowed(update):
+        await _deny(update); return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Cú pháp: /lswarm_fast <MA>\n"
+            "Ví dụ : /lswarm_fast VCB\n"
+            "⚡ Chế độ nhanh: 2 chuyên gia, 1 vòng, tối đa 90s."
+        )
+        return
+
+    valid, symbol = _validate_symbol(args[0])
+    if not valid:
+        await update.message.reply_text(f"Mã '{args[0]}' không hợp lệ."); return
+
+    chat_id = update.effective_chat.id
+    _log_step("lswarm_fast STARTED", symbol)
+
+    msg = await update.message.reply_text(
+        f"⚡ FAST SWARM: {symbol}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ 2 chuyên gia | 1 vòng | tối đa {FAST_TIMEOUT}s\n"
+        f"Đang lấy dữ liệu..."
+    )
+
+    progress_queue: queue.Queue[str] = queue.Queue()
+    done_event    = threading.Event()
+    cancel_event  = threading.Event()
+    result_holder : dict = {"text": None, "error": None}
+
+    def progress_cb(msg_text: str):
+        if cancel_event.is_set():
+            raise RuntimeError("Cancelled by user")
+        progress_queue.put_nowait(str(msg_text))
+
+    def _fast_worker():
+        t_start = time.time()
+        try:
+            _log_step("fast_worker: import modules", symbol)
+            from analyzer import analyze_stock_full
+
+            progress_cb(f"📊 Lấy dữ liệu {symbol}...")
+            _log_step("fast_worker: calling analyze_stock_full", symbol)
+
+            try:
+                result_text_check, meta = _call_with_timeout(
+                    analyze_stock_full, [symbol], {},
+                    timeout=60, label="analyze_stock_full"
+                )
+            except TimeoutError:
+                result_holder["error"] = f"⏰ Lấy dữ liệu {symbol} quá 60s — API có thể đang chậm. Thử lại sau."
+                _log_step("fast_worker: analyze_stock_full TIMEOUT", symbol)
+                return
+            except Exception as e:
+                result_holder["error"] = f"❌ Lấy dữ liệu lỗi: {e}"
+                _log_step("fast_worker: analyze_stock_full ERROR", symbol, str(e))
+                return
+
+            if meta is None:
+                result_holder["error"] = f"Không lấy được dữ liệu cho {symbol}."
+                return
+
+            elapsed_data = round(time.time() - t_start, 1)
+            _log_step(f"fast_worker: data OK in {elapsed_data}s", symbol)
+            progress_cb(f"✅ Dữ liệu OK ({elapsed_data}s) | Bắt đầu fast swarm...")
+
+            # Chạy fast swarm
+            text = _run_fast_swarm(symbol, meta, progress_cb, cancel_event)
+            result_holder["text"] = text
+            elapsed_total = round(time.time() - t_start, 1)
+            _log_step(f"fast_worker: DONE in {elapsed_total}s", symbol)
+
+        except RuntimeError as e:
+            if "Cancelled" in str(e):
+                result_holder["error"] = "✅ Đã hủy theo yêu cầu."
+            else:
+                result_holder["error"] = f"Lỗi runtime: {e}"
+            _log_step("fast_worker: RuntimeError", symbol, str(e))
+        except Exception as e:
+            result_holder["error"] = f"Lỗi fast swarm: {e}"
+            _log_step("fast_worker: EXCEPTION", symbol, str(e))
+            logger.error(f"fast_worker error [{symbol}]:", exc_info=True)
+        finally:
+            _log_step("fast_worker: setting done_event", symbol)
+            done_event.set()
+
+    future = _swarm_executor.submit(_fast_worker)
+    _active_swarm_tasks[chat_id] = {
+        "future": future,
+        "cancel_event": cancel_event,
+        "symbol": symbol,
+        "started_at": time.time(),
+    }
+
+    await _watch_swarm_progress(
+        context=context,
+        chat_id=chat_id,
+        msg=msg,
+        progress_queue=progress_queue,
+        done_event=done_event,
+        cancel_event=cancel_event,
+        result_holder=result_holder,
+        symbol=symbol,
+        plain=plain,
+        timeout=FAST_TIMEOUT,
+        mode="fast",
+    )
+    _active_swarm_tasks.pop(chat_id, None)
+
+
+def _run_fast_swarm(symbol: str, meta: dict, progress_cb, cancel_event) -> str:
+    """
+    Fast swarm: chỉ 2 chuyên gia (tech + risk), 1 vòng, timeout cứng.
+    Trả về formatted text đơn giản.
+    """
+    from local_swarm import SwarmInput, LLMClient, EXPERTS
+    from local_swarm import (
+        _build_context_block, _build_expert_prompt_round1,
+        _parse_expert_response, _build_moderator_prompt,
+        _parse_moderator_json, format_swarm_report,
+        SwarmReport, DebateRound
+    )
+    from datetime import datetime, timedelta
+
+    t0 = time.time()
+    inp = SwarmInput.from_analyze_result(symbol, meta)
+    ctx = _build_context_block(inp)
+
+    # Chỉ dùng 2 chuyên gia quan trọng nhất
+    fast_experts = [e for e in EXPERTS if e["id"] in ("tech_analyst", "risk_manager")]
+
+    llm = LLMClient()
+    _log_step(f"fast_swarm: LLM provider={llm.provider}/{llm.model}", symbol)
+
+    r1_opinions = []
+    for expert in fast_experts:
+        if cancel_event.is_set():
+            break
+        progress_cb(f"  {expert['emoji']} {expert['role']} phân tích...")
+        t_llm = time.time()
+        _log_step(f"fast_swarm: calling LLM for {expert['id']}", symbol)
+        try:
+            sys_p, usr_p = _build_expert_prompt_round1(expert, ctx, inp)
+            raw = _llm_call_with_timeout(llm, sys_p, usr_p, 700, LLM_CALL_TIMEOUT, symbol, expert["id"])
+            op  = _parse_expert_response(expert, raw, 1)
+            r1_opinions.append(op)
+            elapsed_llm = round(time.time() - t_llm, 1)
+            _log_step(f"fast_swarm: {expert['id']} done in {elapsed_llm}s → {op.stance}", symbol)
+            progress_cb(f"  → {expert['emoji']} {op.stance}({op.confidence}%) [{elapsed_llm}s]")
+        except TimeoutError:
+            _log_step(f"fast_swarm: {expert['id']} LLM TIMEOUT", symbol)
+            progress_cb(f"  ⚠️ {expert['role']}: timeout LLM")
+            from local_swarm import ExpertOpinion
+            r1_opinions.append(ExpertOpinion(
+                expert_id=expert["id"], role=expert["role"],
+                stance="THEO DOI", confidence=40,
+                key_points=["LLM timeout"], concern="N/A", raw_text=""
+            ))
+        except Exception as e:
+            _log_step(f"fast_swarm: {expert['id']} error: {e}", symbol)
+            progress_cb(f"  ❌ {expert['role']}: {str(e)[:60]}")
+            from local_swarm import ExpertOpinion
+            r1_opinions.append(ExpertOpinion(
+                expert_id=expert["id"], role=expert["role"],
+                stance="THEO DOI", confidence=40,
+                key_points=[str(e)[:80]], concern="N/A", raw_text=""
+            ))
+
+    # Tổng hợp nhanh không cần moderator LLM
+    stances = [op.stance for op in r1_opinions]
+    buy_c   = stances.count("MUA")
+    sell_c  = stances.count("BAN")
+    watch_c = stances.count("THEO DOI")
+    verdict = "MUA" if buy_c > sell_c else ("BAN" if sell_c > buy_c else "THEO DOI")
+
+    elapsed = round(time.time() - t0, 1)
+
+    lines = [
+        f"⚡ FAST SWARM: {symbol}",
+        "━" * 26,
+        f"Verdict  : {verdict}",
+        f"Vote     : 🟢{buy_c} ⚪{watch_c} 🔴{sell_c}",
+        f"Thời gian: {elapsed}s",
+        "",
+        "CHUYÊN GIA:",
+    ]
+    for op in r1_opinions:
+        em = next((e["emoji"] for e in EXPERTS if e["id"] == op.expert_id), "👤")
+        lines.append(f"{em} {op.role}: {op.stance} ({op.confidence}%)")
+        reason = op.key_points[0] if op.key_points else op.concern
+        lines.append(f"   └─ {reason[:80]}")
+
+    lines += [
+        "",
+        "⚠️ Fast mode — 2 chuyên gia, 1 vòng.",
+        f"Dùng /local_swarm {symbol} để phân tích đầy đủ.",
+    ]
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN command handler: /local_swarm
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def local_swarm_cmd(update, context):
     """
@@ -92,10 +346,10 @@ async def local_swarm_cmd(update, context):
 
     Flow:
       1. Validate + cooldown check
-      2. Lấy meta từ analyze_stock_full (trong thread)
+      2. Lấy meta từ analyze_stock_full (trong thread, timeout 90s)
       3. Tạo progress_queue + done_event
       4. Submit run_local_swarm vào thread pool
-      5. Async watcher: poll queue, cập nhật Telegram, timeout
+      5. Async watcher: poll queue, cập nhật Telegram, heartbeat, timeout
       6. Khi done: gửi kết quả cuối
     """
     try:
@@ -116,6 +370,7 @@ async def local_swarm_cmd(update, context):
         await update.message.reply_text(
             "Cú pháp: /local_swarm <MA>\n"
             "Ví dụ : /local_swarm VCB\n"
+            "Nhanh  : /lswarm_fast VCB  (2 chuyên gia, ~60s)\n"
             "Hủy   : /cancel"
         )
         return
@@ -144,18 +399,22 @@ async def local_swarm_cmd(update, context):
         )
         return
 
+    _log_step("STARTED", symbol, f"user={user_id}")
+
     # ── Gửi loading message ───────────────────────────────────────────────────
     msg = await update.message.reply_text(
         f"🤖 LOCAL SWARM ĐANG CHẠY: {symbol}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⏳ Đang lấy dữ liệu thị trường...\n"
-        f"(Tối đa {SWARM_TIMEOUT//60} phút | /cancel để hủy)"
+        f"(Tối đa {SWARM_TIMEOUT//60} phút | /cancel để hủy)\n"
+        f"⚡ Thử nhanh hơn: /lswarm_fast {symbol}"
     )
 
     # ── Kiểm tra availability nhanh ───────────────────────────────────────────
     if check_mode:
         try:
             from local_swarm import check_local_swarm_available
+            _log_step("check_mode: testing LLM", symbol)
             ok, info = check_local_swarm_available()
             if not ok:
                 await msg.edit_text(f"❌ Local Swarm không khả dụng:\n{info}")
@@ -165,10 +424,10 @@ async def local_swarm_cmd(update, context):
             await msg.edit_text(f"❌ Lỗi kiểm tra: {e}")
             return
 
-    # ── Setup thread-safe communication (Fix #1) ──────────────────────────────
+    # ── Setup thread-safe communication ──────────────────────────────────────
     progress_queue: queue.Queue[str] = queue.Queue()
-    done_event   = threading.Event()          # set khi swarm xong
-    cancel_event = threading.Event()          # set khi user /cancel
+    done_event   = threading.Event()
+    cancel_event = threading.Event()
     result_holder: dict = {"text": None, "error": None}
 
     def progress_cb(msg_text: str):
@@ -180,18 +439,44 @@ async def local_swarm_cmd(update, context):
     # ── Worker function chạy trong thread ────────────────────────────────────
     def _swarm_worker():
         """Chạy hoàn toàn synchronous, không biết gì về asyncio."""
+        t_start = time.time()
         try:
+            _log_step("worker: importing modules", symbol)
             from analyzer import analyze_stock_full
             from local_swarm import run_local_swarm
 
             progress_cb(f"📊 Đang phân tích {symbol} qua 16 engines...")
+            _log_step("worker: calling analyze_stock_full", symbol)
+            t_analyze = time.time()
 
             if cancel_event.is_set():
                 result_holder["error"] = "Cancelled"
                 return
 
-            # Lấy meta từ analyze_stock_full
-            result_text_check, meta = analyze_stock_full(symbol)
+            # analyze_stock_full với timeout cứng 90s
+            try:
+                result_text_check, meta = _call_with_timeout(
+                    analyze_stock_full, [symbol], {},
+                    timeout=90, label="analyze_stock_full"
+                )
+            except TimeoutError:
+                elapsed = round(time.time() - t_analyze, 1)
+                result_holder["error"] = (
+                    f"⏰ analyze_stock_full({symbol}) timeout sau {elapsed}s.\n"
+                    "Có thể nguồn dữ liệu đang chậm. Thử /debug_loader để kiểm tra."
+                )
+                _log_step("worker: analyze_stock_full TIMEOUT", symbol, f"{elapsed}s")
+                return
+            except Exception as e:
+                result_holder["error"] = f"❌ Lấy dữ liệu lỗi: {type(e).__name__}: {e}"
+                _log_step("worker: analyze_stock_full ERROR", symbol, str(e))
+                logger.error(f"analyze_stock_full error [{symbol}]:", exc_info=True)
+                return
+
+            elapsed_analyze = round(time.time() - t_analyze, 1)
+            _log_step(f"worker: analyze_stock_full DONE in {elapsed_analyze}s", symbol,
+                      f"meta={'OK' if meta else 'None'}")
+
             if meta is None:
                 result_holder["error"] = f"Không lấy được dữ liệu cho {symbol}. Thử /debug {symbol}"
                 return
@@ -200,14 +485,22 @@ async def local_swarm_cmd(update, context):
                 result_holder["error"] = "Cancelled"
                 return
 
-            progress_cb(f"✅ Dữ liệu OK | Bắt đầu hội đồng 5 chuyên gia (3 vòng)...")
+            progress_cb(f"✅ Dữ liệu OK ({elapsed_analyze}s) | Bắt đầu hội đồng 5 chuyên gia (3 vòng)...")
+            _log_step("worker: calling run_local_swarm", symbol)
+            t_swarm = time.time()
 
-            # Chạy swarm với timeout tích hợp (Fix #2)
+            # Patch LLM calls trong swarm để có timeout cứng per-call
+            _patch_llm_timeout()
+
             text, report = run_local_swarm(
                 symbol,
                 meta=meta,
                 progress_cb=progress_cb,
             )
+            elapsed_swarm = round(time.time() - t_swarm, 1)
+            elapsed_total = round(time.time() - t_start, 1)
+            _log_step(f"worker: run_local_swarm DONE in {elapsed_swarm}s (total={elapsed_total}s)", symbol)
+
             result_holder["text"] = text
 
         except RuntimeError as e:
@@ -215,14 +508,18 @@ async def local_swarm_cmd(update, context):
                 result_holder["error"] = "✅ Đã hủy theo yêu cầu."
             else:
                 result_holder["error"] = f"Lỗi runtime: {e}"
-            logger.warning(f"Swarm worker RuntimeError: {e}")
+            _log_step("worker: RuntimeError", symbol, str(e))
         except Exception as e:
-            result_holder["error"] = f"Lỗi khi chạy Local Swarm: {e}"
-            logger.error(f"Swarm worker error: {e}", exc_info=True)
+            result_holder["error"] = f"Lỗi khi chạy Local Swarm: {type(e).__name__}: {e}"
+            _log_step("worker: EXCEPTION", symbol, str(e))
+            logger.error(f"Swarm worker error [{symbol}]:", exc_info=True)
         finally:
-            done_event.set()    # BẮT BUỘC set dù thành công hay lỗi (Fix #1)
+            elapsed_total = round(time.time() - t_start, 1)
+            _log_step(f"worker: FINALLY - setting done_event (elapsed={elapsed_total}s)", symbol)
+            done_event.set()    # BẮT BUỘC set dù thành công hay lỗi
 
     # ── Submit vào thread pool ────────────────────────────────────────────────
+    _log_step("submitting to thread pool", symbol)
     future = _swarm_executor.submit(_swarm_worker)
     _active_swarm_tasks[chat_id] = {
         "future":       future,
@@ -231,7 +528,7 @@ async def local_swarm_cmd(update, context):
         "started_at":   time.time(),
     }
 
-    # ── Async watcher: poll queue + done_event (Fix #1, #3) ──────────────────
+    # ── Async watcher: poll queue + done_event ────────────────────────────────
     await _watch_swarm_progress(
         context=context,
         chat_id=chat_id,
@@ -242,11 +539,18 @@ async def local_swarm_cmd(update, context):
         result_holder=result_holder,
         symbol=symbol,
         plain=plain,
+        timeout=SWARM_TIMEOUT,
+        mode="full",
     )
 
     # Cleanup
     _active_swarm_tasks.pop(chat_id, None)
+    _log_step("CLEANUP done", symbol)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASYNC WATCHER
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def _watch_swarm_progress(
     context,
@@ -258,21 +562,25 @@ async def _watch_swarm_progress(
     result_holder: dict,
     symbol: str,
     plain,
+    timeout: int = SWARM_TIMEOUT,
+    mode: str = "full",
 ):
     """
     Async watcher chạy trên event loop.
     Poll progress_queue và cập nhật Telegram message.
+    Gửi heartbeat mỗi 60s. Cảnh báo khi quá 5 phút.
     Dừng khi done_event được set hoặc timeout.
-    (Fix #1: đồng bộ đúng; Fix #2: hard timeout; Fix #3: cap 30 lines)
     """
     started     = time.time()
     status_lines: list[str] = [
         f"🤖 LOCAL SWARM: {symbol}",
         "━" * 26,
     ]
-    progress_count = 0      # số dòng progress đã nhận (Fix #3)
-    last_edit_time = 0.0
-    spam_mode      = False   # True khi vượt MAX_PROGRESS_MSG
+    progress_count  = 0
+    last_edit_time  = 0.0
+    last_heartbeat  = started
+    spam_mode       = False
+    warned_long     = False
 
     async def _try_edit(text: str):
         nonlocal last_edit_time
@@ -286,18 +594,57 @@ async def _watch_swarm_progress(
             if "message is not modified" not in str(e).lower():
                 logger.debug(f"edit_text error: {e}")
 
+    async def _send_heartbeat(elapsed: int):
+        """Gửi tin nhắn heartbeat mới (không edit) để user thấy bot còn sống."""
+        minute = elapsed // 60
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"💓 Tác vụ {symbol} đã chạy được {minute} phút...\n"
+                     f"(Gõ /cancel để hủy)"
+            )
+        except Exception as e:
+            logger.debug(f"heartbeat send error: {e}")
+
     while True:
-        # ── Kiểm tra timeout cứng (Fix #2) ───────────────────────────────────
-        elapsed = time.time() - started
-        if elapsed > SWARM_TIMEOUT:
-            logger.warning(f"Swarm {symbol} TIMEOUT after {elapsed:.0f}s")
+        now     = time.time()
+        elapsed = now - started
+
+        # ── Kiểm tra timeout cứng ─────────────────────────────────────────────
+        if elapsed > timeout:
+            logger.warning(f"[SWARM][{symbol}] TIMEOUT after {elapsed:.0f}s")
             cancel_event.set()
             result_holder["error"] = (
-                f"⏰ Đã vượt quá thời gian xử lý ({SWARM_TIMEOUT//60} phút).\n"
-                "Kết quả không đầy đủ. Thử lại sau hoặc dùng /check."
+                f"⏰ Vượt quá thời gian xử lý ({timeout//60} phút).\n"
+                "Kết quả không đầy đủ. Thử lại sau hoặc dùng /lswarm_fast."
             )
             done_event.set()
             break
+
+        # ── Cảnh báo task lâu (sau 5 phút) ───────────────────────────────────
+        if not warned_long and elapsed > WARN_LONG_TASK and mode == "full":
+            warned_long = True
+            _log_step(f"LONG TASK WARNING at {elapsed:.0f}s", symbol)
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⚠️ Tác vụ {symbol} đang mất nhiều thời gian hơn dự kiến.\n"
+                        f"Có thể hệ thống LLM đang quá tải.\n"
+                        f"Bạn có thể:\n"
+                        f"  • Gõ /cancel để hủy và thử /lswarm_fast {symbol}\n"
+                        f"  • Đợi thêm (tối đa {timeout//60} phút)"
+                    )
+                )
+            except Exception:
+                pass
+
+        # ── Heartbeat mỗi 60s ─────────────────────────────────────────────────
+        if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+            last_heartbeat = now
+            elapsed_int    = int(elapsed)
+            _log_step(f"heartbeat at {elapsed_int}s", symbol)
+            await _send_heartbeat(elapsed_int)
 
         # ── Drain progress queue ──────────────────────────────────────────────
         drained = False
@@ -308,20 +655,18 @@ async def _watch_swarm_progress(
                 drained = True
 
                 if progress_count <= MAX_PROGRESS_MSG:
-                    # Thêm dòng mới vào status (Fix #3)
                     status_lines.append(line)
-                    # Giữ tối đa 15 dòng gần nhất để message không quá dài
+                    # Giữ tối đa 17 dòng gần nhất
                     if len(status_lines) > 17:
                         status_lines = status_lines[:2] + status_lines[-15:]
                 elif not spam_mode:
-                    # Vượt giới hạn: chuyển sang spam_mode (Fix #3)
                     spam_mode = True
                     status_lines.append(SPAM_WARNING)
 
             except queue.Empty:
                 break
 
-        # ── Kiểm tra done_event (Fix #1) ─────────────────────────────────────
+        # ── Kiểm tra done_event ───────────────────────────────────────────────
         if done_event.is_set():
             # Drain lần cuối
             while True:
@@ -332,45 +677,44 @@ async def _watch_swarm_progress(
                         status_lines.append(line)
                 except queue.Empty:
                     break
+            _log_step("done_event detected, breaking watcher loop", symbol)
             break
 
         # ── Cập nhật message nếu có thay đổi ─────────────────────────────────
         if drained:
-            elapsed_s = int(time.time() - started)
-            footer = f"\n⏱️ {elapsed_s}s | /cancel để hủy"
+            elapsed_s  = int(elapsed)
+            footer     = f"\n⏱️ {elapsed_s}s | /cancel để hủy"
             await _try_edit("\n".join(status_lines) + footer)
 
-        # Chờ interval ngắn rồi check lại
         await asyncio.sleep(2.0)
 
-    # ── Gửi kết quả cuối (Fix #5) ────────────────────────────────────────────
+    # ── Gửi kết quả cuối ─────────────────────────────────────────────────────
     elapsed_total = int(time.time() - started)
+    _log_step(f"watcher: sending final result (elapsed={elapsed_total}s)", symbol,
+              f"error={'Y' if result_holder['error'] else 'N'} text={'Y' if result_holder['text'] else 'N'}")
 
     if result_holder["error"]:
         error_msg = str(result_holder["error"])
-        # Xóa message loading, gửi lỗi
         try:
             await msg.edit_text(
                 f"❌ {error_msg}\n\n"
-                f"⏱️ Đã chạy {elapsed_total}s"
+                f"⏱️ Đã chạy {elapsed_total}s\n"
+                f"💡 Thử: /lswarm_fast {symbol}"
             )
         except Exception:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"❌ {error_msg}"
+                text=f"❌ {error_msg}\n💡 Thử: /lswarm_fast {symbol}"
             )
         return
 
     if result_holder["text"]:
         result_text = str(result_holder["text"])
-        # Xóa message loading
         try:
             await msg.edit_text("✅ Hoàn tất! Đang gửi báo cáo...")
         except Exception:
             pass
 
-        # Gửi kết quả dưới dạng message mới (Fix #5)
-        # Nếu quá dài thì chia nhỏ
         chunks = _split_message(result_text, max_len=4000)
         for i, chunk in enumerate(chunks):
             try:
@@ -381,17 +725,111 @@ async def _watch_swarm_progress(
                 if i < len(chunks) - 1:
                     await asyncio.sleep(0.5)
             except Exception as e:
-                logger.error(f"Gửi swarm result chunk {i}: {e}")
+                logger.error(f"Gửi swarm result chunk {i} [{symbol}]: {e}")
                 break
     else:
         try:
             await msg.edit_text(
                 f"⚠️ Local Swarm {symbol} kết thúc nhưng không có kết quả.\n"
-                f"Thử lại: /local_swarm {symbol}"
+                f"Thử lại: /lswarm_fast {symbol}"
             )
         except Exception:
             pass
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITY: timeout wrapper cho blocking calls
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _call_with_timeout(func, args: list, kwargs: dict, timeout: int, label: str):
+    """
+    Gọi func(*args, **kwargs) trong thread riêng với timeout cứng.
+    Raise TimeoutError nếu quá timeout giây.
+    Dùng trong sync context (không phải asyncio).
+    """
+    result_box = [None, None]  # [result, exception]
+    finished   = threading.Event()
+
+    def _runner():
+        try:
+            result_box[0] = func(*args, **kwargs)
+        except Exception as e:
+            result_box[1] = e
+        finally:
+            finished.set()
+
+    t = threading.Thread(target=_runner, daemon=True, name=f"timeout_{label}")
+    t.start()
+    ok = finished.wait(timeout=timeout)
+
+    if not ok:
+        logger.warning(f"_call_with_timeout: '{label}' TIMED OUT after {timeout}s")
+        raise TimeoutError(f"'{label}' timed out after {timeout}s")
+
+    if result_box[1] is not None:
+        raise result_box[1]
+
+    return result_box[0]
+
+
+def _llm_call_with_timeout(llm, system: str, user: str, max_tokens: int,
+                            timeout: int, symbol: str, expert_id: str) -> str:
+    """
+    Gọi llm.chat() với timeout cứng per-call.
+    Đây là nơi hay bị treo nhất — DeepSeek/Groq có thể hang vô tận.
+    """
+    label = f"LLM:{expert_id}"
+    try:
+        return _call_with_timeout(
+            llm.chat,
+            [system, user],
+            {"max_tokens": max_tokens},
+            timeout=timeout,
+            label=label,
+        )
+    except TimeoutError:
+        _log_step(f"LLM call TIMEOUT for {expert_id}", symbol, f"timeout={timeout}s")
+        raise
+    except Exception as e:
+        _log_step(f"LLM call ERROR for {expert_id}: {e}", symbol)
+        raise
+
+
+def _patch_llm_timeout():
+    """
+    Monkey-patch LLMClient.chat() trong local_swarm để add timeout cứng.
+    Gọi 1 lần trước khi chạy swarm worker.
+    Idempotent — an toàn khi gọi nhiều lần.
+    """
+    try:
+        import local_swarm as _ls
+
+        if getattr(_ls.LLMClient, "_timeout_patched", False):
+            return   # đã patch rồi
+
+        original_chat = _ls.LLMClient.chat
+
+        def _chat_with_timeout(self, system: str, user: str, max_tokens: int = _ls.LLM_MAX_TOKENS) -> str:
+            label = f"LLM:{self.provider}"
+            return _call_with_timeout(
+                original_chat,
+                [self, system, user],
+                {"max_tokens": max_tokens},
+                timeout=LLM_CALL_TIMEOUT,
+                label=label,
+            )
+
+        _ls.LLMClient.chat          = _chat_with_timeout
+        _ls.LLMClient._timeout_patched = True
+        logger.info(f"✅ LLMClient.chat patched with {LLM_CALL_TIMEOUT}s per-call timeout")
+
+    except Exception as e:
+        logger.warning(f"_patch_llm_timeout failed (non-critical): {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SPLIT MESSAGE
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _split_message(text: str, max_len: int = 4000) -> list[str]:
     """Chia text thành chunks không vượt quá max_len ký tự."""
@@ -403,7 +841,6 @@ def _split_message(text: str, max_len: int = 4000) -> list[str]:
         if len(text) <= max_len:
             chunks.append(text)
             break
-        # Cắt tại newline gần nhất
         cut = text.rfind("\n", 0, max_len)
         if cut < max_len // 2:
             cut = max_len
@@ -412,7 +849,9 @@ def _split_message(text: str, max_len: int = 4000) -> list[str]:
     return chunks
 
 
-# ── Vibe failover (khi Vibe-Trading offline → dùng local swarm) ──────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# VIBE FAILOVER
+# ─────────────────────────────────────────────────────────────────────────────
 
 def install_vibe_failover(app) -> None:
     """
@@ -431,22 +870,18 @@ def install_vibe_failover(app) -> None:
             except Exception:
                 pass
 
-            # Failover: chạy local_swarm thay thế
             await update.message.reply_text(
                 "⚠️ Vibe-Trading API offline. Chuyển sang Local Swarm...\n"
                 "(Chất lượng tương đương nhưng chạy chậm hơn ~3 phút)"
             )
             return await local_swarm_cmd(update, context)
 
-        # Thay thế handler /vibe hiện tại
-        # Lưu ý: chỉ hoạt động nếu được gọi sau khi add_handler("vibe")
         for handler in app.handlers.get(0, []):
             if hasattr(handler, "command") and "vibe" in (handler.command or []):
                 handler.callback = _vibe_with_failover
                 logger.info("✅ Vibe failover đã được cài vào /vibe handler")
                 return
 
-        # Nếu không tìm thấy, add mới
         app.add_handler(CommandHandler("vibe_local", local_swarm_cmd))
         logger.info("✅ Vibe failover: thêm /vibe_local handler")
 
