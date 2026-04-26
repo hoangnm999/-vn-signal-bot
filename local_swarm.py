@@ -679,42 +679,6 @@ def _get_skill_block(expert: dict, td: dict) -> str:
     return "\n".join(lines)
 
 
-
-def _build_price_lock(td: dict) -> str:
-    """
-    HARD PRICE LOCK — block ngắn gọn đặt ĐẦU mọi user prompt.
-    Liệt kê tường minh từng con số hợp lệ.
-    LLM KHÔNG được dùng bất kỳ số giá nào ngoài danh sách này.
-    """
-    price    = td["price"]
-    price_lo = round(price * (1 - PRICE_BAND_PCT), 0)
-    price_hi = round(price * (1 + PRICE_BAND_PCT), 0)
-    sr       = td["sr_levels"]
-
-    valid = [f"{price:,.0f} (hiện tại)"]
-    for s in sr["support"][:3]:
-        valid.append(f"{s['price']:,.0f} (hỗ trợ S{sr['support'].index(s)+1})")
-    for r in sr["resistance"][:3]:
-        valid.append(f"{r['price']:,.0f} (kháng cự R{sr['resistance'].index(r)+1})")
-    if td["ma20"]:   valid.append(f"{td['ma20']:,.0f} (MA20)")
-    if td["ma50"]:   valid.append(f"{td['ma50']:,.0f} (MA50)")
-    if td["bb_upper"]: valid.append(f"{td['bb_upper']:,.0f} (BB Upper)")
-    if td["bb_lower"]: valid.append(f"{td['bb_lower']:,.0f} (BB Lower)")
-    if td["tp_check"] > 0: valid.append(f"{td['tp_check']:,.0f} (TP /check)")
-    if td["sl_check"] > 0: valid.append(f"{td['sl_check']:,.0f} (SL /check)")
-
-    lines = [
-        f"⛔ PRICE LOCK [{td['symbol']}] — CHỈ DÙNG CÁC SỐ GIÁ SAU:",
-        "   " + "  |  ".join(valid[:5]),
-    ]
-    if len(valid) > 5:
-        lines.append("   " + "  |  ".join(valid[5:]))
-    lines += [
-        f"   Biên hợp lệ: {price_lo:,.0f} – {price_hi:,.0f}",
-        f"   ❌ BẤT KỲ SỐ NÀO NGOÀI DANH SÁCH TRÊN = SAI. Ghi 'không đủ dữ liệu'.",
-    ]
-    return "\n".join(lines)
-
 def _build_round1_prompt(
     expert: dict, data_block: str, skill_block: str, td: dict
 ) -> tuple[str, str]:
@@ -751,15 +715,13 @@ def _build_round1_prompt(
         "  - [bullet 3 — số liệu từ skill]"
     )
 
-    price_lock = _build_price_lock(td)
     user = (
-        f"{price_lock}\n\n"
         f"Phân tích {td['symbol']} từ góc nhìn {expert['role']}.\n\n"
         f"{data_block}\n\n"
         f"═══ SKILL DETAILS CHO {expert['role'].upper()} ═══\n"
         f"{skill_block}\n\n"
         "Phân tích DỰA TRÊN SKILL DETAILS trên. "
-        "CHỈ dùng mức giá trong PRICE LOCK ở trên — không tự bịa số. "
+        "Mỗi điểm phải có số liệu cụ thể. "
         "Tính R:R thực tế từ ATR và S/R. R:R < 1.5 → BẮT BUỘC THEO DOI."
     )
     return system, user
@@ -807,14 +769,12 @@ def _build_round2_prompt(
     )
 
     user = (
-        f"{_build_price_lock(td)}\n\n"
         f"Vòng 1 của bạn: {own_r1.stance} (Score={own_r1.score:+d}, Conf={own_r1.confidence}%)\n"
         f"Lý do: {own_r1.key_points[0] if own_r1.key_points else 'N/A'}\n\n"
         f"═══ Ý KIẾN VÒNG 1 CỦA CÁC EXPERTS KHÁC ═══\n"
         + "\n".join(others) +
         f"\n\n═══ SKILL CỦA BẠN (tóm tắt) ═══\n{skill_block[:450]}\n\n"
         "Cập nhật stance với dẫn chứng số liệu. "
-        "CHỈ dùng mức giá trong PRICE LOCK ở trên. "
         "R:R < 1.5 → đổi THEO DOI. "
         "Phản biện ít nhất 1 expert đối lập."
     )
@@ -854,11 +814,9 @@ def _build_round3_prompt(
     )
 
     user = (
-        f"{_build_price_lock(td)}\n\n"
         f"Vòng 2 của bạn: {own_r2.stance} (Score={own_r2.score:+d}, Conf={own_r2.confidence}%)\n"
         f"Experts vòng 2: {' | '.join(others)}\n\n"
         "Xác nhận kịch bản cuối. "
-        "CHỈ dùng mức giá trong PRICE LOCK ở trên. "
         "R:R = (TP-Entry)/(Entry-SL). "
         "R:R < 1.5 → THEO DOI."
     )
@@ -1253,6 +1211,7 @@ def _parse_moderator_json(raw: str, td: dict) -> dict:
     data, rr_warning = _validate_rr(data, td)
     data["rr_warning"] = rr_warning
     data = _fix_sr(data, td)
+    data = _fix_entry_trigger(data, td)        # Fix: entry >= trigger price
     data = _validate_prices_in_output(data, td)
     return data
 
@@ -1289,6 +1248,76 @@ def _validate_rr(data: dict, td: dict) -> tuple[dict, str]:
         data[sc_key] = sc
     return data, rr_warning
 
+
+
+def _fix_entry_trigger(data: dict, td: dict) -> dict:
+    """
+    Nếu trigger của scenario_buy nói "vượt/breakout/qua X"
+    mà entry < X → đặt entry = X, scale SL/TP giữ nguyên delta, tính lại R:R.
+    Tương tự scenario_sell với "phá/breakdown/dưới X".
+    """
+    _BUY_PATS  = [r"vượt\s+([\d,\.]+)", r"breakout\s+([\d,\.]+)",
+                  r"break\s+([\d,\.]+)", r"\bqua\s+([\d,\.]+)", r">\s*([\d,\.]+)"]
+    _SELL_PATS = [r"phá\s+([\d,\.]+)",  r"breakdown\s+([\d,\.]+)",
+                  r"dưới\s+([\d,\.]+)", r"<\s*([\d,\.]+)"]
+
+    def _find_trigger_price(text: str, patterns: list) -> float:
+        for pat in patterns:
+            m = re.search(pat, text.lower())
+            if m:
+                try:
+                    v = float(m.group(1).replace(",", ""))
+                    if v > 0:
+                        return v
+                except Exception:
+                    pass
+        return 0.0
+
+    def _rescale(sc: dict, new_entry: float) -> dict:
+        old_entry = _safe_float(sc.get("entry", 0))
+        sl        = _safe_float(sc.get("sl",    0))
+        tp1       = _safe_float(sc.get("tp1",   sc.get("tp", 0)))
+        tp2       = _safe_float(sc.get("tp2",   0))
+        if old_entry <= 0:
+            sc["entry"] = round(new_entry, 0)
+            return sc
+        delta_sl  = old_entry - sl  if sl  > 0 else 0
+        delta_tp1 = tp1 - old_entry if tp1 > 0 else 0
+        delta_tp2 = tp2 - old_entry if tp2 > 0 else 0
+        sc["entry"] = round(new_entry, 0)
+        if delta_sl  > 0: sc["sl"]  = round(new_entry - delta_sl,  0)
+        if delta_tp1 > 0: sc["tp1"] = round(new_entry + delta_tp1, 0)
+        if delta_tp2 > 0: sc["tp2"] = round(new_entry + delta_tp2, 0)
+        # Tính lại R:R
+        new_sl  = _safe_float(sc.get("sl",  0))
+        new_tp1 = _safe_float(sc.get("tp1", sc.get("tp", 0)))
+        if new_sl > 0 and new_tp1 > 0 and abs(new_entry - new_sl) > 1:
+            sc["rr"] = round(abs(new_tp1 - new_entry) / abs(new_entry - new_sl), 2)
+        logger.info(
+            f"[EntryTriggerFix] entry {old_entry:.0f}→{new_entry:.0f} "
+            f"sl={sc.get('sl',0):.0f} tp1={sc.get('tp1',0):.0f} rr={sc.get('rr',0):.2f}"
+        )
+        return sc
+
+    price = td["price"]
+
+    sc_b = data.get("scenario_buy", {})
+    if sc_b:
+        trigger  = str(sc_b.get("trigger", "")).strip()
+        entry    = _safe_float(sc_b.get("entry", 0))
+        t_price  = _find_trigger_price(trigger, _BUY_PATS)
+        if t_price > 0 and entry > 0 and entry < t_price and _price_in_band(t_price, price):
+            data["scenario_buy"] = _rescale(sc_b, t_price)
+
+    sc_s = data.get("scenario_sell", {})
+    if sc_s:
+        trigger  = str(sc_s.get("trigger", "")).strip()
+        entry    = _safe_float(sc_s.get("entry", 0))
+        t_price  = _find_trigger_price(trigger, _SELL_PATS)
+        if t_price > 0 and entry > 0 and entry > t_price and _price_in_band(t_price, price):
+            data["scenario_sell"] = _rescale(sc_s, t_price)
+
+    return data
 
 def _validate_prices_in_output(data: dict, td: dict) -> dict:
     """
@@ -1576,24 +1605,18 @@ class SwarmOrchestrator:
 
         stances_final = [op.stance for op in r3]
         scores_final  = [op.score  for op in r3]
-
-        # Vote Split: tính từ score thực tế (score>0=Bull, <0=Bear, =0=Neutral)
-        # KHÔNG tính từ stance vì expert có thể stance=THEO DOI nhưng score=+2
-        vote_bull     = sum(1 for s in scores_final if s > 0)
-        vote_bear     = sum(1 for s in scores_final if s < 0)
-        vote_neutral  = sum(1 for s in scores_final if s == 0)
-
-        # Cross-check: nếu có score dương mà vote_bull=0 → có lỗi, force tính lại
-        _has_pos = any(s > 0 for s in scores_final)
-        _has_neg = any(s < 0 for s in scores_final)
-        if _has_pos and vote_bull == 0:
-            logger.warning("[VoteSplit] Cross-check fail: có score>0 nhưng vote_bull=0 → force recalc")
-            vote_bull    = sum(1 for s in scores_final if s > 0)
-        if _has_neg and vote_bear == 0:
-            logger.warning("[VoteSplit] Cross-check fail: có score<0 nhưng vote_bear=0 → force recalc")
-            vote_bear    = sum(1 for s in scores_final if s < 0)
-        vote_neutral = len(scores_final) - vote_bull - vote_bear
-
+        # Vote Split theo score: score>0=Bull, <0=Bear, =0=Neutral
+        # Tránh mâu thuẫn khi expert stance=THEO DOI nhưng score=+2
+        vote_bull    = sum(1 for op in r3 if op.score > 0)
+        vote_bear    = sum(1 for op in r3 if op.score < 0)
+        vote_neutral = sum(1 for op in r3 if op.score == 0)
+        # Cross-check safety
+        if any(op.score > 0 for op in r3) and vote_bull == 0:
+            vote_bull    = sum(1 for op in r3 if op.score > 0)
+            vote_neutral = len(r3) - vote_bull - vote_bear
+        if any(op.score < 0 for op in r3) and vote_bear == 0:
+            vote_bear    = sum(1 for op in r3 if op.score < 0)
+            vote_neutral = len(r3) - vote_bull - vote_bear
         n_exp         = max(len(r3), 1)
 
         final_score = _safe_float(
@@ -1676,7 +1699,7 @@ class SwarmOrchestrator:
 
 _SEP  = "═" * 32
 _SEP2 = "─" * 32
-_LINE_WIDTH = 60   # giới hạn mỗi dòng cho Telegram mobile
+_LINE_WIDTH = 68   # giới hạn mỗi dòng cho Telegram mobile
 
 
 def _score_bar(score: float) -> str:
@@ -1689,11 +1712,16 @@ def _score_bar(score: float) -> str:
 def _wrap(text: str, width: int = _LINE_WIDTH, indent: str = "") -> list[str]:
     """
     Wrap text thành các dòng không vượt quá width ký tự.
-    Cắt tại dấu cách — không bao giờ cắt giữa từ.
+    - Flatten embedded newlines từ LLM trước khi wrap
+    - Không bao giờ cắt giữa từ
+    - Không tự thêm dấu "…"
     """
     if not text:
         return []
-    text = text.strip()
+    # Flatten \n embedded từ LLM thành khoảng trắng
+    text = " ".join(p.strip() for p in text.strip().split("\n") if p.strip())
+    if not text:
+        return []
     if len(text) <= width:
         return [indent + text]
 
@@ -1701,6 +1729,8 @@ def _wrap(text: str, width: int = _LINE_WIDTH, indent: str = "") -> list[str]:
     lines  = []
     cur    = ""
     for word in words:
+        if not word:
+            continue
         test = (cur + " " + word).strip()
         if len(test) <= width:
             cur = test
@@ -1752,7 +1782,7 @@ def format_swarm_report(report: SwarmReport) -> str:
         f"  Resonance : {report.resonance_pct:.0f}%",
         f"  Confidence: {report.panel_confidence:.0f}%",
         f"  Consensus : {report.consensus_level}",
-        f"  Vote      : 🟢{report.vote_bull} ⚪{report.vote_neutral} 🔴{report.vote_bear}  (theo score chuyên gia)",
+        f"  Vote      : 🟢{report.vote_bull} ⚪{report.vote_neutral} 🔴{report.vote_bear}",
         "",
     ]
 
@@ -1769,10 +1799,10 @@ def format_swarm_report(report: SwarmReport) -> str:
         kp_lines = _wrap(kp, width=58, indent="   └─ ")
         lines.extend(kp_lines[:2])  # tối đa 2 dòng
 
-        # Concern / risk — 1 dòng, không cắt chữ
+        # Concern / risk — wrap đầy đủ, không bao giờ cắt giữa từ
         if op.concern and op.concern not in ("N/A", "Xem phân tích chi tiết"):
-            concern_line = _truncate_line(op.concern.strip(), max_len=65)
-            lines.append(f"   ⚠️ {concern_line}")
+            for _cl in _wrap(op.concern.strip(), width=62, indent="   ⚠️ "):
+                lines.append(_cl)
         lines.append("")
 
     # Debate — đổi ý kiến
@@ -1802,14 +1832,22 @@ def format_swarm_report(report: SwarmReport) -> str:
             if isinstance(s, dict):
                 dist     = s.get("dist_pct", "")
                 dist_str = f" ({dist:+.1f}%)" if isinstance(dist, (int, float)) else ""
-                reason   = _truncate_line(str(s.get("reason", "")), 52)
-                lines.append(f"  🔵 S{i}: {s.get('price',0):,.0f}{dist_str}  — {reason}")
+                _reason_raw = str(s.get("reason", "")).strip()
+                _s_prefix   = f"  🔵 S{i}: {s.get('price',0):,.0f}{dist_str}  — "
+                _r_parts    = _wrap(_reason_raw, width=max(30, 66 - len(_s_prefix)))
+                lines.append(_s_prefix + (_r_parts[0] if _r_parts else _reason_raw[:40]))
+                for _rp in _r_parts[1:]:
+                    lines.append("            " + _rp)
         for i, r in enumerate(res_levels[:3], 1):
             if isinstance(r, dict):
                 dist     = r.get("dist_pct", "")
                 dist_str = f" ({dist:+.1f}%)" if isinstance(dist, (int, float)) else ""
-                reason   = _truncate_line(str(r.get("reason", "")), 52)
-                lines.append(f"  🔴 R{i}: {r.get('price',0):,.0f}{dist_str}  — {reason}")
+                _reason_raw = str(r.get("reason", "")).strip()
+                _r_prefix   = f"  🔴 R{i}: {r.get('price',0):,.0f}{dist_str}  — "
+                _r_parts    = _wrap(_reason_raw, width=max(30, 66 - len(_r_prefix)))
+                lines.append(_r_prefix + (_r_parts[0] if _r_parts else _reason_raw[:40]))
+                for _rp in _r_parts[1:]:
+                    lines.append("            " + _rp)
         lines.append("")
 
     # ── Kịch bản đầu tư ──────────────────────────────────────────────────────
