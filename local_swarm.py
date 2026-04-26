@@ -1256,72 +1256,46 @@ def _fix_entry_trigger(data: dict, td: dict) -> dict:
     mà entry < X → đặt entry = X, scale SL/TP giữ nguyên delta, tính lại R:R.
     Tương tự scenario_sell với "phá/breakdown/dưới X".
     """
-    # Pattern BUY: bắt số giá sau các từ khóa breakout — kể cả có từ trung gian
-    # "breakout trên 74.5", "vượt mức 75", "break qua 76.5", "giá > 75"
-    # Dùng [\w\s]{0,10} để cho phép tối đa 10 ký tự trung gian trước số
-    _BUY_PATS  = [
-        r"vượt(?:\s+\w+){0,4}\s+([\d,\.]+)",       # "vượt 75", "vượt mức kháng cự 75.5"
-        r"breakout(?:\s+\w+){0,2}\s+([\d,\.]+)",    # "breakout 75", "breakout trên 74.5"
-        r"\bbreak(?:\s+\w+){0,2}\s+([\d,\.]+)",     # "break qua 76"
-        r"\bqua\s+([\d,\.]+)",                       # "qua 75"
-        r"trên\s+([\d,\.]+)",                        # "trên 74.5"
-        r"above\s+([\d,\.]+)",                       # "above 75"
-        r"close\s*>\s*([\d,\.]+)",                   # "close > 75"
-        r"giá\s*>\s*([\d,\.]+)",                     # "giá > 75"
-    ]
-    _SELL_PATS = [
-        r"phá(?:\s+\w+){0,4}\s+([\d,\.]+)",         # "phá 70", "phá vỡ hỗ trợ 70"
-        r"breakdown(?:\s+\w+){0,2}\s+([\d,\.]+)",   # "breakdown 70"
-        r"dưới\s+([\d,\.]+)",                        # "dưới 70"
-        r"below\s+([\d,\.]+)",                       # "below 70"
-        r"close\s*<\s*([\d,\.]+)",                   # "close < 70"
-        r"giá\s*<\s*([\d,\.]+)",                     # "giá < 70"
-    ]
+    _BUY_PATS  = [r"vượt\s+([\d,\.]+)", r"breakout\s+([\d,\.]+)",
+                  r"break\s+([\d,\.]+)", r"\bqua\s+([\d,\.]+)", r">\s*([\d,\.]+)"]
+    _SELL_PATS = [r"phá\s+([\d,\.]+)",  r"breakdown\s+([\d,\.]+)",
+                  r"dưới\s+([\d,\.]+)", r"<\s*([\d,\.]+)"]
 
-    def _find_trigger_price(text: str, patterns: list, ref_price: float) -> float:
-        """
-        Tìm giá trigger từ text. Trả về số hợp lệ gần ref_price nhất.
-        Lọc nhiễu: bỏ qua số quá nhỏ (volume ratio, RSI...) hoặc quá lớn.
-        """
-        candidates = []
+    def _find_trigger_price(text: str, patterns: list) -> float:
         for pat in patterns:
-            for m in re.finditer(pat, text.lower()):
+            m = re.search(pat, text.lower())
+            if m:
                 try:
                     v = float(m.group(1).replace(",", ""))
-                    # Lọc: số phải trong ±40% ref_price để tránh nhầm volume/RSI
-                    if v > 0 and ref_price * 0.60 <= v <= ref_price * 1.40:
-                        candidates.append(v)
+                    if v > 0:
+                        return v
                 except Exception:
                     pass
-        if not candidates:
-            return 0.0
-        # Ưu tiên số gần ref_price nhất
-        return min(candidates, key=lambda x: abs(x - ref_price))
+        return 0.0
 
     def _rescale(sc: dict, new_entry: float) -> dict:
-        """Scale SL/TP giữ nguyên delta từ entry cũ, tính lại R:R."""
         old_entry = _safe_float(sc.get("entry", 0))
         sl        = _safe_float(sc.get("sl",    0))
         tp1       = _safe_float(sc.get("tp1",   sc.get("tp", 0)))
         tp2       = _safe_float(sc.get("tp2",   0))
         if old_entry <= 0:
-            sc["entry"] = new_entry  # giữ decimal (74.5 không round thành 74)
+            sc["entry"] = round(new_entry, 0)
             return sc
         delta_sl  = old_entry - sl  if sl  > 0 else 0
         delta_tp1 = tp1 - old_entry if tp1 > 0 else 0
         delta_tp2 = tp2 - old_entry if tp2 > 0 else 0
-        sc["entry"] = new_entry      # giữ nguyên decimal
-        if delta_sl  > 0: sc["sl"]  = round(new_entry - delta_sl,  1)
-        if delta_tp1 > 0: sc["tp1"] = round(new_entry + delta_tp1, 1)
-        if delta_tp2 > 0: sc["tp2"] = round(new_entry + delta_tp2, 1)
+        sc["entry"] = round(new_entry, 0)
+        if delta_sl  > 0: sc["sl"]  = round(new_entry - delta_sl,  0)
+        if delta_tp1 > 0: sc["tp1"] = round(new_entry + delta_tp1, 0)
+        if delta_tp2 > 0: sc["tp2"] = round(new_entry + delta_tp2, 0)
         # Tính lại R:R
         new_sl  = _safe_float(sc.get("sl",  0))
         new_tp1 = _safe_float(sc.get("tp1", sc.get("tp", 0)))
-        if new_sl > 0 and new_tp1 > 0 and abs(new_entry - new_sl) > 0.5:
+        if new_sl > 0 and new_tp1 > 0 and abs(new_entry - new_sl) > 1:
             sc["rr"] = round(abs(new_tp1 - new_entry) / abs(new_entry - new_sl), 2)
         logger.info(
-            f"[EntryTriggerFix] entry {old_entry:.1f}→{new_entry:.1f} "
-            f"sl={sc.get('sl',0):.1f} tp1={sc.get('tp1',0):.1f} rr={sc.get('rr',0):.2f}"
+            f"[EntryTriggerFix] entry {old_entry:.0f}→{new_entry:.0f} "
+            f"sl={sc.get('sl',0):.0f} tp1={sc.get('tp1',0):.0f} rr={sc.get('rr',0):.2f}"
         )
         return sc
 
@@ -1331,7 +1305,7 @@ def _fix_entry_trigger(data: dict, td: dict) -> dict:
     if sc_b:
         trigger  = str(sc_b.get("trigger", "")).strip()
         entry    = _safe_float(sc_b.get("entry", 0))
-        t_price  = _find_trigger_price(trigger, _BUY_PATS, price)
+        t_price  = _find_trigger_price(trigger, _BUY_PATS)
         if t_price > 0 and entry > 0 and entry < t_price and _price_in_band(t_price, price):
             data["scenario_buy"] = _rescale(sc_b, t_price)
 
@@ -1339,7 +1313,7 @@ def _fix_entry_trigger(data: dict, td: dict) -> dict:
     if sc_s:
         trigger  = str(sc_s.get("trigger", "")).strip()
         entry    = _safe_float(sc_s.get("entry", 0))
-        t_price  = _find_trigger_price(trigger, _SELL_PATS, price)
+        t_price  = _find_trigger_price(trigger, _SELL_PATS)
         if t_price > 0 and entry > 0 and entry > t_price and _price_in_band(t_price, price):
             data["scenario_sell"] = _rescale(sc_s, t_price)
 
@@ -1347,47 +1321,145 @@ def _fix_entry_trigger(data: dict, td: dict) -> dict:
 
 def _validate_prices_in_output(data: dict, td: dict) -> dict:
     """
-    Lớp bảo vệ cuối: kiểm tra entry/sl/tp/support/resistance trong scenarios
-    phải nằm trong ±30% giá. Nếu không → reset về 0 + log + gắn warning.
-    Cũng enforce scenario_watch priority nếu panel_verdict = THEO DOI.
+    Lop bao ve cuoi -- 3 tang:
+
+    Tang 1: Validate numeric fields (entry/sl/tp) cua scenario_buy + scenario_sell
+            Band +-15% (chat hon PRICE_BAND_PCT=30%) -> reset ve 0 neu ngoai bien.
+
+    Tang 2: Validate scenario_watch -- scan text fields (trigger, watch_for)
+            tim so gia ngoai +-15% -> thay bang thong diep an toan.
+            Root cause: LLM tu bia gia vao watch_for ("quet dinh cu 85").
+
+    Tang 3: Enforce scenario_watch priority neu panel_verdict = THEO DOI.
     """
-    price    = td["price"]
+    import re as _re
+    price         = td["price"]
+    SCENARIO_BAND = 0.15
+    lo15          = price * (1 - SCENARIO_BAND)
+    hi15          = price * (1 + SCENARIO_BAND)
     warnings: list[str] = []
 
+    # Tang 1: Numeric fields scenario_buy / scenario_sell
     for sc_key in ["scenario_buy", "scenario_sell"]:
         sc = data.get(sc_key, {})
         if not sc:
             continue
         for field_name in ["entry", "sl", "tp1", "tp", "tp2"]:
             val = _safe_float(sc.get(field_name, 0))
-            if val > 0 and not _price_in_band(val, price):
+            if val <= 0:
+                continue
+            if not (lo15 <= val <= hi15):
                 logger.warning(
-                    f"[PriceGuard] {sc_key}.{field_name}={val:,.0f} "
-                    f"ngoài band ±{PRICE_BAND_PCT*100:.0f}% (giá={price:,.0f}) → reset 0"
+                    f"[PriceGuard] {sc_key}.{field_name}={val:,.1f} "
+                    f"ngoai +-15% (gia={price:,.0f} band=[{lo15:,.0f}-{hi15:,.0f}]) -> reset 0"
                 )
                 sc[field_name] = 0
-                warnings.append(f"{sc_key}.{field_name}={val:,.0f} ngoài biên ±30%")
+                warnings.append(f"{sc_key}.{field_name}={val:,.0f} ngoai +-15%")
         data[sc_key] = sc
 
-    if warnings:
-        existing        = data.get("rr_warning", "")
-        extra           = " | ".join(warnings)
-        data["rr_warning"] = (f"{existing} | {extra}" if existing else extra)[:250]
+    # Tang 2: Text fields scenario_watch -- diet gia ma
+    # Strategy: xay dung tap so hop le tu S/R thuc te, bat ky so nao ngoai tap nay
+    # va khong phai RSI/volume/pct thi la "gia ma" -> replace
+    sc_w = data.get("scenario_watch", {}) or {}
+    if sc_w:
+        sr      = td["sr_levels"]
+        ma20    = td["ma20"]
+        ma50    = td["ma50"] or 0
+        bb_up   = td["bb_upper"]
+        bb_low  = td["bb_lower"]
+        rsi_val = td["rsi"]
+        # Tap cac muc gia hop le: S/R + MA + BB + gia hien tai +-5%
+        valid_set = set()
+        valid_set.add(round(price, 1))
+        for s in sr["support"]:
+            valid_set.add(round(s["price"], 1))
+        for r in sr["resistance"]:
+            valid_set.add(round(r["price"], 1))
+        if ma20: valid_set.add(round(ma20, 1))
+        if ma50: valid_set.add(round(ma50, 1))
+        if bb_up: valid_set.add(round(bb_up, 1))
+        if bb_low: valid_set.add(round(bb_low, 1))
+        if td.get("tp_check", 0): valid_set.add(round(td["tp_check"], 1))
+        if td.get("sl_check", 0): valid_set.add(round(td["sl_check"], 1))
+        # Bien goc +-2% de chap nhan xap xi (chat hon de bat 82 khi R3=80)
+        VALID_TOL = 0.02
+        def _is_valid_price(v: float) -> bool:
+            # Qua nho -> RSI/volume/pct, khong phai gia
+            # Nguong: so phai > 65% cua gia hien tai moi coi la gia co phieu
+            if v < price * 0.65: return True
+            # Trong +-2% cua bat ky muc gia hop le nao
+            for vp in valid_set:
+                if vp > 0 and abs(v - vp) / vp <= VALID_TOL:
+                    return True
+            # Trong +-2% cua gia hien tai
+            return abs(v - price) / price <= VALID_TOL
 
-    # Enforce THEO DOI dominant → scenario_watch priority
+        for text_field in ["trigger", "watch_for", "condition"]:
+            raw_text = str(sc_w.get(text_field, "")).strip()
+            if not raw_text:
+                continue
+            # Loai so di truoc boi keyword chi bao (RSI, MACD, volume, x TB...)
+            # Match bat ky dong nao ma phan truoc so chua tu khoa chi bao
+            # Vi du: "RSI hien tai 52" -> before="RSI hien tai" -> co "RSI" -> skip
+            _INDICATOR_PREFIX = _re.compile(
+                r"(?:rsi|macd|ema|sma|ma\d*|bb|atr|volume|vol|tb\d*|adx|cci|stoch"
+                r"|hien\s+tai|gia\s+tri|chi\s+so|ngưỡng|mức|x\s*tb)",
+                _re.IGNORECASE,
+            )
+            # Tach text thanh tokens theo vi tri so
+            _cleaned = raw_text
+            ghost_prices = []
+            for m in _re.finditer(r"[\d,]+(?:\.\d+)?", raw_text):
+                try:
+                    v = float(m.group().replace(",", ""))
+                except Exception:
+                    continue
+                # Kiem tra context truoc so: neu la indicator prefix thi bo qua
+                before = raw_text[:m.start()].rstrip()
+                if _INDICATOR_PREFIX.search(before):  # co tu khoa chi bao truoc so
+                    continue
+                if not _is_valid_price(v):
+                    ghost_prices.append(round(v, 1))
+            if ghost_prices:
+                logger.warning(
+                    f"[WatchGuard] scenario_watch.{text_field} chua gia khong co trong S/R: "
+                    f"{ghost_prices} (gia={price:,.1f}) -> replace"
+                )
+                s1 = sr["support"][0]["price"]
+                r1 = sr["resistance"][0]["price"]
+                if text_field == "trigger":
+                    sc_w[text_field] = (
+                        f"Cho gia on dinh quanh {price:,.1f}-{r1:,.1f}; "
+                        f"volume > 1.3x TB20; RSI hien {rsi_val:.0f}"
+                    )
+                else:
+                    sc_w[text_field] = (
+                        f"Quan sat vung ho tro {s1:,.1f}-{price:,.1f} "
+                        f"va khang cu {r1:,.1f}; MA20={ma20:,.1f}"
+                    )
+                warnings.append(
+                    f"watch.{text_field}: gia ma {ghost_prices} -> thay bang du lieu thuc"
+                )
+        data["scenario_watch"] = sc_w
+
+    if warnings:
+        existing = data.get("rr_warning", "")
+        extra    = " | ".join(warnings)
+        data["rr_warning"] = (f"{existing} | {extra}" if existing else extra)[:300]
+
+    # Tang 3: Enforce THEO DOI dominant -> scenario_watch priority
     verdict = data.get("panel_verdict", "")
     if verdict == "THEO DOI":
-        sc_w = data.get("scenario_watch", {}) or {}
-        sc_b = data.get("scenario_buy",   {}) or {}
-        sc_s = data.get("scenario_sell",  {}) or {}
+        sc_b = data.get("scenario_buy",  {}) or {}
+        sc_s = data.get("scenario_sell", {}) or {}
         p_w  = int(sc_w.get("probability", 0))
         p_b  = int(sc_b.get("probability", 0))
         p_s  = int(sc_s.get("probability", 0))
         if p_w <= p_b or p_w <= p_s:
-            new_p_w           = max(55, round((p_w + p_b + p_s) * 0.60))
-            remaining         = 100 - new_p_w
-            new_p_b           = remaining // 2
-            new_p_s           = remaining - new_p_b
+            new_p_w   = max(55, round((p_w + p_b + p_s) * 0.60))
+            remaining = 100 - new_p_w
+            new_p_b   = remaining // 2
+            new_p_s   = remaining - new_p_b
             if sc_w: sc_w["probability"] = new_p_w
             if sc_b: sc_b["probability"] = new_p_b
             if sc_s: sc_s["probability"] = new_p_s
@@ -1395,7 +1467,7 @@ def _validate_prices_in_output(data: dict, td: dict) -> dict:
             data["scenario_buy"]   = sc_b
             data["scenario_sell"]  = sc_s
             logger.info(
-                f"[ScenarioFix] THEO DOI → watch={new_p_w}% buy={new_p_b}% sell={new_p_s}%"
+                f"[ScenarioFix] THEO DOI -> watch={new_p_w}% buy={new_p_b}% sell={new_p_s}%"
             )
 
     return data
