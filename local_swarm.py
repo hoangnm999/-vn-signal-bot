@@ -67,33 +67,51 @@ def _price_in_band(p: float, ref: float, band: float = PRICE_BAND_PCT) -> bool:
     return abs(p - ref) / ref <= band
 
 
+
+_DETAIL_BAND   = 0.08
+_IND_PREFIX_RE = re.compile(
+    r"(?:rsi|macd|cci|adx|atr|stoch|ema|sma|\\bma\\b|volume|vol|hist|"
+    r"signal|ratio|score|pct|percent|r:r|\\brr\\b|conf|bb|width|band|"
+    r"pe|pb|roe|eps|ev)\\s*[=:>\\s]?\\s*$",
+    re.IGNORECASE,
+)
+
 def _sanitize_engine_detail(detail: str, ref_price: float) -> str:
     """
-    Quét text engine detail, đánh dấu các số trông như giá cổ phiếu
-    nhưng nằm ngoài ±30% ref_price bằng [~xxx] để LLM không dùng nhầm.
-    Chỉ xử lý số >= ref_price * 0.30 (tránh nhầm với %, RSI, v.v.)
+    Hard filter ±8%: xóa mọi số là giá cổ phiếu nằm ngoài biên.
+    - Band ±8% (PRICE_BAND_PCT=30% quá rộng: HAH=56 → [39-73] lọt qua)
+    - Placeholder [GIÁ_ĐÃ_XÓA] không chứa số → LLM không đọc lại được
+    - Pre-clean [~xxx] từ cache sanitize cũ
+    - Threshold: val >= ref_price * 0.50 (RSI/MACD/volume đều < 0.50×price)
+    - Indicator keyword context: RSI=, P/E=, MACD= → giữ nguyên
     """
     if ref_price <= 0 or not detail:
         return detail
 
-    lo        = ref_price * (1 - PRICE_BAND_PCT)
-    hi        = ref_price * (1 + PRICE_BAND_PCT)
-    threshold = ref_price * 0.30
+    # Xóa [~xxx] từ lần sanitize cũ (±30%) — vẫn chứa số
+    import re as _re
+    detail = _re.sub(r"\[~[\d,\.]+\]", "[GIÁ_ĐÃ_XÓA]", detail)
 
-    def _replace(m: re.Match) -> str:
+    lo        = ref_price * (1 - _DETAIL_BAND)
+    hi        = ref_price * (1 + _DETAIL_BAND)
+    threshold = ref_price * 0.50
+
+    def _replace(m):
         raw = m.group(0)
         try:
             val = float(raw.replace(",", ""))
         except ValueError:
             return raw
         if val < threshold:
-            return raw           # quá nhỏ → không phải giá → giữ nguyên
+            return raw
+        before = detail[:m.start()].rstrip()
+        if _IND_PREFIX_RE.search(before):
+            return raw
         if lo <= val <= hi:
-            return raw           # trong biên → giữ nguyên
-        return f"[~{val:,.0f}]"  # ngoài biên → đánh dấu
+            return raw
+        return "[GIÁ_ĐÃ_XÓA]"
 
     return re.sub(r"[\d,]+(?:\.\d+)?", _replace, detail)
-
 
 def _safe_float(v, default: float = 0.0) -> float:
     try:
@@ -158,13 +176,13 @@ def extract_technical_data(symbol: str, meta: dict) -> dict:
         raw_details = vibe.get("details", {})
         if isinstance(raw_details, dict):
             for k, v in raw_details.items():
-                _raw_engine[k] = str(v)[:800]
+                _raw_engine[k] = str(v)[:350]
 
     # Từ verdict["context_details"] — MarketRegime, NewsSentiment, VNMacro, CommodityContext
     ctx_details = verdict.get("context_details", {})
     if isinstance(ctx_details, dict):
         for k, v in ctx_details.items():
-            _raw_engine[k] = str(v)[:800]
+            _raw_engine[k] = str(v)[:350]
 
     # Sanitize giá ngoài biên
     engine_details: dict[str, str] = {
@@ -681,30 +699,30 @@ def _get_skill_block(expert: dict, td: dict) -> str:
 
 
 _SKILL_SECTIONS = {
-    "TechnicalBasic":   "📊 KỸ THUẬT CƠ BẢN",
-    "Ichimoku":         "☁️  ICHIMOKU CLOUD",
-    "Candlestick":      "🕯️  MẪU NẾN",
-    "ElliottWave":      "〰️  SÓNG ELLIOTT",
-    "SMC":              "💡 SMART MONEY CONCEPTS",
-    "Chanlun":          "📐 CHANLUN",
-    "MultiFactor":      "🔢 ĐA NHÂN TỐ KỸ THUẬT",
-    "MarketRegime":     "🌐 CHẾ ĐỘ THỊ TRƯỜNG",
-    "VNMacro":          "🇻🇳 VĨ MÔ VIỆT NAM",
-    "CommodityContext": "🛢️  HÀNG HÓA & NGÀNH",
-    "NewsSentiment":    "📰 TIN TỨC & TÂM LÝ",
-    "Volatility":       "📉 BIẾN ĐỘNG & RỦI RO",
-    "FundamentalFilter":"💼 CƠ BẢN & ĐỊNH GIÁ",
-    "MLStrategy":       "🤖 ML SIGNAL",
-    "Seasonal":         "📅 MÙA VỤ & LỊCH SỬ",
-    "Harmonic":         "🎵 HARMONIC PATTERN",
+    "TechnicalBasic":    "📊 KỸ THUẬT CƠ BẢN",
+    "Ichimoku":          "☁️  ICHIMOKU CLOUD",
+    "Candlestick":       "🕯️  MẪU NẾN",
+    "ElliottWave":       "〰️  SÓNG ELLIOTT",
+    "SMC":               "💡 SMART MONEY CONCEPTS",
+    "Chanlun":           "📐 CHANLUN",
+    "MultiFactor":       "🔢 ĐA NHÂN TỐ KỸ THUẬT",
+    "MarketRegime":      "🌐 CHẾ ĐỘ THỊ TRƯỜNG",
+    "VNMacro":           "🇻🇳 VĨ MÔ VIỆT NAM",
+    "CommodityContext":  "🛢️  HÀNG HÓA & NGÀNH",
+    "NewsSentiment":     "📰 TIN TỨC & TÂM LÝ",
+    "Volatility":        "📉 BIẾN ĐỘNG & RỦI RO",
+    "FundamentalFilter": "💼 CƠ BẢN & ĐỊNH GIÁ",
+    "MLStrategy":        "🤖 ML SIGNAL",
+    "Seasonal":          "📅 MÙA VỤ & LỊCH SỬ",
+    "Harmonic":          "🎵 HARMONIC PATTERN",
 }
 
 _CROSS_REF = {
-    "tech_analyst":      ["SMC", "Harmonic", "MultiFactor"],
-    "smc_trader":        ["TechnicalBasic", "Ichimoku"],
-    "macro_strategist":  ["FundamentalFilter", "Volatility"],
-    "risk_manager":      ["SMC", "TechnicalBasic", "MarketRegime"],
-    "fundamental_filter":["MarketRegime", "TechnicalBasic", "MLStrategy"],
+    "tech_analyst":       ["SMC", "Harmonic", "MultiFactor"],
+    "smc_trader":         ["TechnicalBasic", "Ichimoku"],
+    "macro_strategist":   ["FundamentalFilter", "Volatility"],
+    "risk_manager":       ["SMC", "TechnicalBasic", "MarketRegime"],
+    "fundamental_filter": ["MarketRegime", "TechnicalBasic", "MLStrategy"],
 }
 
 _GUIDING_Q = {
@@ -719,7 +737,7 @@ _GUIDING_Q = {
         "1. Cấu trúc thị trường: HH/HL hay LH/LL? Có BOS hay ChoCH gần đây?",
         "2. FVG hoặc Order Block gần nhất ở đâu? Giá đã về test chưa?",
         "3. Buy-side/Sell-side liquidity đang nằm ở vùng nào?",
-        "4. Tổ chức đang accumulate hay distribute tại vùng giá hiện tại?",
+        "4. Tổ chức đang accumulate hay distribute?",
         "5. Còn điều gì trong dữ liệu mà bạn cho là quan trọng nhưng chưa được đề cập?",
     ],
     "macro_strategist": [
@@ -730,8 +748,8 @@ _GUIDING_Q = {
     ],
     "risk_manager": [
         "1. ATR và BB width nói gì về độ biến động hiện tại?",
-        "2. SL hợp lý nhất đặt ở đâu (S1 hay ATR×1.5)? Khoảng cách % bao nhiêu?",
-        "3. R:R thực tế có xứng đáng không? Entry-SL có ít nhất 0.5% không?",
+        "2. SL hợp lý nhất đặt ở đâu? Khoảng cách % bao nhiêu?",
+        "3. R:R thực tế có xứng đáng? Entry-SL có ít nhất 0.5% không?",
         "4. Điều gì có thể làm setup fail nhanh nhất?",
         "5. Còn điều gì trong dữ liệu mà bạn cho là quan trọng nhưng chưa được đề cập?",
     ],
@@ -748,88 +766,87 @@ def _build_intelligence_brief(expert: dict, td: dict) -> str:
     """
     Tạo BẢN TIN TÌNH BÁO cho từng chuyên gia.
 
+    DOUBLE-CHECK: _get_detail() chạy _sanitize_engine_detail() lần 2
+    trước khi đưa vào section — đảm bảo không có giá ngoài ±8% lọt qua
+    dù nguồn nào (cache cũ, vibe fallback, context_details).
+
     Cấu trúc mỗi section:
-      ▸ [LABEL]  → [SIGNAL]  (Nguồn: SkillName)
-        [Full detail — không cắt, đã filter giá ngoài biên]
-
-    Cuối brief:
-      ▸ THAM CHIẾU CHÉO: signal tóm tắt từ skills khác
-      ▸ CÂU HỎI DẪN DẮT: 4-5 câu hỏi bắt buộc + 1 câu hỏi mở
+      ▸ [LABEL]  →  [SIGNAL]  (Nguồn: SkillName)
+        [detail đã double-sanitize]
     """
-    PLACEHOLDER = "[Dữ liệu ngoài phạm vi, yêu cầu bỏ qua]"
-
-    def _sig_label(sk: str) -> str:
-        sig = td["signals"].get(sk)
-        if sig is None: return ""
-        if sig > 0:  return "🟢 BULLISH"
-        if sig < 0:  return "🔴 BEARISH"
-        return "⚪ NEUTRAL"
+    price = td["price"]
+    PLACEHOLDER = "[GIÁ_ĐÃ_XÓA]"
 
     def _get_detail(sk: str) -> str:
         raw = td["engine_details"].get(sk, "").strip()
         if len(raw) < 5:
             return ""
-        # Bỏ qua nếu quá nhiều placeholder (> 40% words)
-        ph = raw.count(PLACEHOLDER)
-        if ph / max(len(raw.split()), 1) > 0.40:
-            return ""
-        return raw   # full, không cắt ở đây
+        # DOUBLE-CHECK: chạy sanitize lần 2 với band ±8%
+        # Bắt những gì lần 1 bỏ sót (khác source, cache cũ...)
+        clean = _sanitize_engine_detail(raw, price)
+        # Kiểm tra mức độ ô nhiễm sau double-check
+        ph = clean.count(PLACEHOLDER)
+        if ph / max(len(clean.split()), 1) > 0.40:
+            return ""   # quá nhiều placeholder → detail vô dụng
+        return clean
+
+    def _sig_label(sk: str) -> str:
+        sig = td["signals"].get(sk)
+        if sig is None: return "⚫ N/A"
+        if sig > 0:     return "🟢 BULLISH"
+        if sig < 0:     return "🔴 BEARISH"
+        return "⚪ NEUTRAL"
 
     # ── Sections chính ─────────────────────────────────────────────
-    sections = []
-    no_data  = []
+    sections  = []
+    no_data   = []
     for sk in expert["skill_keys"]:
         detail  = _get_detail(sk)
         label   = _SKILL_SECTIONS.get(sk, sk)
         sig     = _sig_label(sk)
-        # Nguồn gốc ghi rõ để LLM có thể đối chiếu
-        src_tag = f"(Nguồn: {sk})"
         if detail:
             sections.append(
-                f"  ▸ {label}  →  {sig}  {src_tag}\n"
+                f"  ▸ {label}  →  {sig}  (Nguồn: {sk})\n"
                 f"    {detail}"
             )
         else:
-            no_data.append(f"{label}")
+            no_data.append(label)
 
-    # ── Tham chiếu chéo từ skills khác ─────────────────────────────
+    # ── Tham chiếu chéo ─────────────────────────────────────────────
     cross_lines = []
     for csk in _CROSS_REF.get(expert["id"], []):
         if csk in expert["skill_keys"]:
             continue
         sig = _sig_label(csk)
-        if not sig:
+        if "N/A" in sig:
             continue
         cdetail = _get_detail(csk)
         snippet = ""
         if cdetail:
             first = cdetail.split("\n")[0].strip()
-            snippet = f": {first[:120]}" if first else ""
+            snippet = f": {first[:100]}" if first else ""
         cross_lines.append(
             f"    {sig}  {_SKILL_SECTIONS.get(csk, csk)}{snippet}  (Nguồn: {csk})"
         )
 
-    # ── Câu hỏi dẫn dắt ────────────────────────────────────────────
-    questions = _GUIDING_Q.get(expert["id"], [
-        "1. Dữ liệu trên hàm ý gì về xu hướng?",
-        "2. Còn điều gì trong dữ liệu mà bạn cho là quan trọng nhưng chưa được đề cập?",
-    ])
-
-    # ── Assemble ────────────────────────────────────────────────────
+    # ── Assemble ─────────────────────────────────────────────────────
     parts = [
-        f"╔══ BẢN TIN TÌNH BÁO [{td['symbol']}] — {expert['role'].upper()} ══╗",
+        f"╔══ BẢN TIN TÌNH BÁO [{td['symbol']}] ══ {expert['role'].upper()} ══╗",
     ]
 
     if sections:
         parts.append("\n" + "\n\n".join(sections))
     else:
-        parts.append("  ⚠️ Không có dữ liệu từ skill liên quan — ghi 'không đủ dữ liệu'.")
+        parts.append("  ⚠️ Không có dữ liệu hợp lệ — ghi \'không đủ dữ liệu\'.")
 
     if no_data:
         parts.append(f"\n  ▸ KHÔNG CÓ DỮ LIỆU: {', '.join(no_data)}")
 
     if cross_lines:
-        parts.append("\n  ▸ THAM CHIẾU CHÉO (từ skills khác của hội đồng):\n" + "\n".join(cross_lines))
+        parts.append(
+            "\n  ▸ THAM CHIẾU CHÉO (từ skills khác):\n"
+            + "\n".join(cross_lines)
+        )
 
     if td.get("tp_check", 0) or td.get("sl_check", 0):
         parts.append(
@@ -839,11 +856,14 @@ def _build_intelligence_brief(expert: dict, td: dict) -> str:
             f"TP={td['tp_check']:,.0f}"
         )
 
+    questions = _GUIDING_Q.get(expert["id"], [
+        "1. Dữ liệu trên hàm ý gì về xu hướng?",
+        "2. Còn điều gì quan trọng chưa được đề cập?",
+    ])
     parts.append(
         "\n  ▸ CÂU HỎI DẪN DẮT (PHẢI trả lời đủ trong NARRATIVE):\n"
         + "\n".join(f"    {q}" for q in questions)
     )
-
     parts.append("╚══ HẾT BẢN TIN TÌNH BÁO ══╝")
     return "\n".join(parts)
 
@@ -858,9 +878,9 @@ def _build_round1_prompt(
     system = (
         f"Bạn là {expert['role']} trong Hội đồng Chuyên gia Phân tích Cổ phiếu VN.\n"
         f"{expert['focus']}\n\n"
-        "PHƯƠNG PHÁP: Bạn nhận được BẢN TIN TÌNH BÁO chứa dữ liệu từ 16 skills.\n"
-        "Phân tích DỰA TRÊN bản tin — không tự suy diễn số liệu ngoài bản tin.\n"
-        "Trả lời ĐỦ các CÂU HỎI DẪN DẮT cuối bản tin trong phần NARRATIVE.\n\n"
+        "PHƯƠNG PHÁP: Bạn nhận được BẢN TIN TÌNH BÁO chứa dữ liệu từ 16 skills\n"
+        "đã qua lọc kép ±8%. Phân tích DỰA TRÊN bản tin — không tự suy diễn số liệu\n"
+        "ngoài bản tin. Trả lời đủ CÂU HỎI DẪN DẮT trong NARRATIVE.\n\n"
         "═══ QUY TẮC BẮT BUỘC ═══\n"
         "1. ĐỌC KỸ SKILL DETAILS → dẫn chứng số liệu cụ thể (tên chỉ báo + giá trị).\n"
         "   VÍ DỤ TỐT: 'RSI=62 tiếp cận vùng quá mua, MACD hist=+0.0032 tăng 3 phiên'\n"
@@ -891,8 +911,8 @@ def _build_round1_prompt(
         f"Phân tích {td['symbol']} từ góc nhìn {expert['role']}.\n\n"
         f"{data_block}\n\n"
         f"{intel_brief}\n\n"
-        "Hãy phân tích DỰA TRÊN BẢN TIN TÌNH BÁO trên. "
-        "Trích dẫn tên skill và số liệu cụ thể khi lập luận. "
+        "Phân tích DỰA TRÊN BẢN TIN TÌNH BÁO trên. "
+        "Trích dẫn tên skill khi lập luận. "
         "Trả lời đủ CÂU HỎI DẪN DẮT trong NARRATIVE. "
         "Tính R:R từ ATR và S/R. R:R < 1.5 → BẮT BUỘC THEO DOI."
     )
