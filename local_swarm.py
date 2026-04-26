@@ -48,6 +48,43 @@ _DEFAULT_MODELS = {
     "ollama":     "qwen2.5:7b",
 }
 
+# Biên độ giá hợp lệ: mọi mức giá phải nằm trong ±30% so với giá hiện tại
+PRICE_BAND_PCT = 0.30
+
+
+def _price_in_band(p: float, ref: float, band: float = PRICE_BAND_PCT) -> bool:
+    """Kiểm tra p có nằm trong ±band% so với ref không."""
+    if ref <= 0:
+        return False
+    return abs(p - ref) / ref <= band
+
+
+def _sanitize_engine_detail(detail: str, ref_price: float) -> str:
+    """
+    Quét text engine detail, đánh dấu các số trông như giá cổ phiếu
+    nhưng nằm ngoài ±30% ref_price bằng [~xxx] để LLM không dùng nhầm.
+    Chỉ xử lý số >= ref_price*0.3 (tránh nhầm với %, RSI, v.v.)
+    """
+    if ref_price <= 0 or not detail:
+        return detail
+    lo        = ref_price * (1 - PRICE_BAND_PCT)
+    hi        = ref_price * (1 + PRICE_BAND_PCT)
+    threshold = ref_price * 0.30
+
+    def _replace(m: re.Match) -> str:
+        raw = m.group(0)
+        try:
+            val = float(raw.replace(",", ""))
+        except ValueError:
+            return raw
+        if val < threshold:
+            return raw          # quá nhỏ, không phải giá — giữ nguyên
+        if lo <= val <= hi:
+            return raw          # trong biên — giữ nguyên
+        return f"[~{val:,.0f}]"  # ngoài biên — đánh dấu
+
+    return re.sub(r"[\d,]+(?:\.\d+)?", _replace, detail)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TECHNICAL DATA EXTRACTION
@@ -65,17 +102,7 @@ def extract_technical_data(symbol: str, meta: dict) -> dict:
     news    = meta.get("news_data", {})
     comm    = meta.get("commodity_data", {})
 
-    # Lấy engine details từ vibe_result
-    engine_details: dict = {}
-    if isinstance(vibe, dict):
-        raw_details = vibe.get("details", {})
-        if isinstance(raw_details, dict):
-            engine_details = {k: str(v)[:250] for k, v in raw_details.items()}
-        ctx_details = verdict.get("context_details", {})
-        if isinstance(ctx_details, dict):
-            engine_details.update({k: str(v)[:250] for k, v in ctx_details.items()})
-
-    # Signals
+    # ── Signals ─────────────────────────────────────────────────────────────
     signals: dict = {}
     raw_sigs = verdict.get("signals", {})
     if isinstance(raw_sigs, dict):
@@ -85,6 +112,7 @@ def extract_technical_data(symbol: str, meta: dict) -> dict:
             except Exception:
                 pass
 
+    # ── Giá cơ sở — phải lấy trước để sanitize engine details ───────────────
     price   = float(ind.get("current_price", 0))
     sup_20d = float(ind.get("support_20d",    price * 0.95))
     res_20d = float(ind.get("resistance_20d", price * 1.05))
@@ -95,10 +123,37 @@ def extract_technical_data(symbol: str, meta: dict) -> dict:
     ma50    = float(ma50_v) if ma50_v else None
     atr     = price * 0.02
 
+    # ── Lấy engine details — sanitize ngay giá ngoài biên ±30% ──────────────
+    _raw_engine: dict = {}
+    if isinstance(vibe, dict):
+        raw_details = vibe.get("details", {})
+        if isinstance(raw_details, dict):
+            _raw_engine = {k: str(v)[:250] for k, v in raw_details.items()}
+        ctx_details = verdict.get("context_details", {})
+        if isinstance(ctx_details, dict):
+            _raw_engine.update({k: str(v)[:250] for k, v in ctx_details.items()})
+    # Sanitize: đánh dấu giá ngoài band trong text để LLM không dùng nhầm
+    engine_details: dict = {
+        k: _sanitize_engine_detail(v, price)
+        for k, v in _raw_engine.items()
+    }
+
     sr = _compute_sr_levels_v2(price, sup_20d, res_20d, bb_low, bb_up, ma20, ma50, atr)
 
-    ap             = verdict.get("action_plan", {})
-    news_headlines = news.get("headlines", [])[:8] if isinstance(news, dict) and news.get("success") else []
+    # ── Action plan từ /check — clamp về band hợp lệ ─────────────────────────
+    ap       = verdict.get("action_plan", {})
+    tp_raw   = float(ap.get("tp",        0))
+    sl_raw   = float(ap.get("sl",        0))
+    en_raw   = float(ap.get("entry_low", price))
+    # Chỉ dùng nếu trong biên, không thì về 0 (moderator tự tính)
+    tp_check = tp_raw if (tp_raw > 0 and _price_in_band(tp_raw, price)) else 0.0
+    sl_check = sl_raw if (sl_raw > 0 and _price_in_band(sl_raw, price)) else 0.0
+    en_check = en_raw if (en_raw > 0 and _price_in_band(en_raw, price)) else price
+
+    news_headlines = (
+        news.get("headlines", [])[:8]
+        if isinstance(news, dict) and news.get("success") else []
+    )
 
     return {
         "symbol":          symbol.upper(),
@@ -120,9 +175,9 @@ def extract_technical_data(symbol: str, meta: dict) -> dict:
         "support_20d":     sup_20d,
         "resistance_20d":  res_20d,
         "sr_levels":       sr,
-        "tp_check":        float(ap.get("tp", 0)),
-        "sl_check":        float(ap.get("sl", 0)),
-        "entry_check":     float(ap.get("entry_low", price)),
+        "tp_check":        tp_check,
+        "sl_check":        sl_check,
+        "entry_check":     en_check,
         "verdict_label":   verdict.get("verdict_label", "TRUNG LAP"),
         "confidence_pct":  float(verdict.get("confidence_pct", 50)),
         "bull_count":      int(verdict.get("bull_count", 0)),
@@ -531,6 +586,8 @@ def _get_skill_block(expert: dict, td: dict) -> str:
 def _build_round1_prompt(
     expert: dict, data_block: str, skill_block: str, td: dict
 ) -> tuple[str, str]:
+    price_lo = round(td["price"] * (1 - PRICE_BAND_PCT), 0)
+    price_hi = round(td["price"] * (1 + PRICE_BAND_PCT), 0)
     system = (
         f"Bạn là {expert['role']} trong Hội đồng Chuyên gia Phân tích Cổ phiếu VN.\n"
         f"{expert['focus']}\n\n"
@@ -541,7 +598,12 @@ def _build_round1_prompt(
         "2. STANCE=MUA/BAN → bắt buộc Entry, SL, TP, R:R cụ thể.\n"
         "3. R:R = (TP-Entry)/(Entry-SL). Nếu R:R < 1.5 → BẮT BUỘC đổi THEO DOI.\n"
         "4. SCORE từ -5 đến +5: âm=bearish, dương=bullish, 0=neutral.\n"
-        "5. Chỉ phân tích theo trường phái của mình.\n\n"
+        "5. Chỉ phân tích theo trường phái của mình.\n"
+        f"6. ⚠️ RÀNG BUỘC GIÁ CỨNG: Mọi mức giá bạn đề xuất (Entry, SL, TP, S/R)\n"
+        f"   PHẢI nằm trong biên độ [{price_lo:,.0f} – {price_hi:,.0f}] (±30% giá hiện tại).\n"
+        f"   CHỈ sử dụng dữ liệu được cung cấp. KHÔNG tự suy diễn giá.\n"
+        f"   Nếu thiếu dữ liệu → ghi rõ 'không đủ thông tin' thay vì đoán.\n"
+        f"   Số có dấu [~xxx] trong SKILL DETAILS = giá ngoài biên, KHÔNG được dùng.\n\n"
         "ĐỊNH DẠNG (bắt buộc, đúng thứ tự):\n"
         "STANCE: [MUA/BAN/THEO DOI]\n"
         "SCORE: [-5..+5]\n"
@@ -576,6 +638,8 @@ def _build_round2_prompt(
         kp = op.key_points[0][:100] if op.key_points else op.concern[:80]
         others.append(f"[{op.role}] {op.stance}({op.confidence}%, Score={op.score:+d}) — {kp}")
 
+    price_lo = round(td["price"] * (1 - PRICE_BAND_PCT), 0)
+    price_hi = round(td["price"] * (1 + PRICE_BAND_PCT), 0)
     system = (
         f"Bạn là {expert['role']} — VÒNG 2 PHẢN BIỆN.\n"
         f"{expert['focus']}\n\n"
@@ -584,7 +648,9 @@ def _build_round2_prompt(
         "2. PHẢN BIỆN trực tiếp ít nhất 1 expert đối lập — dẫn số liệu cụ thể.\n"
         "3. Ghi rõ: đồng ý với ai, điểm gì.\n"
         "4. Nếu Risk Manager chỉ ra R:R < 1.5 → BẮT BUỘC điều chỉnh.\n"
-        "5. Cập nhật SCORE nếu cần.\n\n"
+        "5. Cập nhật SCORE nếu cần.\n"
+        f"6. ⚠️ Mọi giá đề xuất PHẢI trong [{price_lo:,.0f} – {price_hi:,.0f}]. "
+        f"KHÔNG tự bịa giá. Số [~xxx] = giá ngoài biên, KHÔNG dùng.\n\n"
         "ĐỊNH DẠNG:\n"
         "STANCE: [MUA/BAN/THEO DOI]\n"
         "SCORE: [-5..+5]\n"
@@ -614,6 +680,8 @@ def _build_round3_prompt(
         f"[{op.role}] {op.stance}({op.confidence}%, Score={op.score:+d})"
         for op in r2_opinions if op.expert_id != expert["id"]
     ]
+    price_lo = round(td["price"] * (1 - PRICE_BAND_PCT), 0)
+    price_hi = round(td["price"] * (1 + PRICE_BAND_PCT), 0)
     system = (
         f"Bạn là {expert['role']} — VÒNG 3 KẾT LUẬN CUỐI.\n"
         f"{expert['focus']}\n\n"
@@ -621,7 +689,9 @@ def _build_round3_prompt(
         "1. Xác nhận stance cuối — không đổi trừ khi có lý do số liệu mạnh.\n"
         "2. Đề xuất kịch bản cụ thể nhất với Entry/SL/TP rõ ràng.\n"
         "3. Nêu 1 rủi ro quan trọng nhất mà các expert khác bỏ qua.\n"
-        "4. Viết KEY_TAKEAWAY 1-2 câu — dẫn số liệu.\n\n"
+        "4. Viết KEY_TAKEAWAY 1-2 câu — dẫn số liệu.\n"
+        f"5. ⚠️ Mọi giá PHẢI trong [{price_lo:,.0f} – {price_hi:,.0f}]. "
+        f"KHÔNG tự bịa. Số [~xxx] = ngoài biên, KHÔNG dùng.\n\n"
         "ĐỊNH DẠNG NGẮN GỌN:\n"
         "STANCE: [MUA/BAN/THEO DOI]\n"
         "SCORE: [-5..+5]\n"
@@ -680,6 +750,21 @@ def _build_moderator_prompt(
         f"R1={r1_p:,.0f} R2={sr['resistance'][1]['price']:,.0f} R3={sr['resistance'][2]['price']:,.0f}"
     )
 
+    # Nếu dominant là THEO DOI → scenario_watch là ưu tiên
+    watch_dominant = (watch_c >= buy_c and watch_c >= sell_c and watch_c > 0)
+    sc_watch_prob  = 60 if watch_dominant else 30
+    sc_buy_prob    = 15 if watch_dominant else 50
+    sc_sell_prob   = 15 if watch_dominant else 20
+    price_lo = round(price * (1 - PRICE_BAND_PCT), 0)
+    price_hi = round(price * (1 + PRICE_BAND_PCT), 0)
+
+    watch_rule = (
+        f"9. ⚠️ LOGIC STANCE: {watch_c}/{n_exp} experts THEO DOI → "
+        f"scenario_watch phải là ưu tiên (probability ~{sc_watch_prob}%).\n"
+        f"   scenario_buy/sell chỉ là dự phòng (prob ~{sc_buy_prob}% / {sc_sell_prob}%).\n"
+        if watch_dominant else ""
+    )
+
     system = (
         "Bạn là MODERATOR Hội đồng Chuyên gia Phân tích Cổ phiếu VN.\n"
         "Tổng hợp 3 vòng tranh luận → JSON THUẦN (không markdown, không cắt).\n\n"
@@ -690,7 +775,10 @@ def _build_moderator_prompt(
         "4. resistance_levels: R1 gần nhất trên giá, cách nhau >= 2.5%.\n"
         "5. main_risks và key_catalysts: PHẢI dẫn số liệu cụ thể.\n"
         "6. moderator_summary: TEXT THUẦN tiếng Việt 80-120 từ, KHÔNG JSON.\n"
-        f"7. final_score = {round(avg_score, 1)}\n\n"
+        f"7. final_score = {round(avg_score, 1)}\n"
+        f"8. ⚠️ RÀNG BUỘC GIÁ: Mọi entry/sl/tp/support/resistance PHẢI trong "
+        f"[{price_lo:,.0f} – {price_hi:,.0f}] (±30% giá {price:,.0f}). KHÔNG tự bịa giá.\n"
+        + watch_rule +
         "OUTPUT JSON THUẦN:\n"
         "{\n"
         '  "panel_verdict": "MUA|BAN|THEO DOI",\n'
@@ -698,15 +786,15 @@ def _build_moderator_prompt(
         f'  "final_score": {round(avg_score, 1)},\n'
         '  "rr_warning": "",\n'
         '  "consensus_level": "DONG THUAN|PHAN BIEN|CHIA RE",\n'
-        f'  "scenario_buy": {{"probability": 50, "entry": {round(price,0)}, '
+        f'  "scenario_buy": {{"probability": {sc_buy_prob}, "entry": {round(price,0)}, '
         f'"tp1": {round(tp_est,0)}, "tp2": {round(tp_est*1.04,0)}, '
         f'"sl": {round(sl_est,0)}, "rr": {rr_est}, '
         '"trigger": "MUA khi [giá]+[volume]+[indicator]", "catalyst": "[cụ thể]"}},\n'
-        f'  "scenario_sell": {{"probability": 20, "entry": 0, '
+        f'  "scenario_sell": {{"probability": {sc_sell_prob}, "entry": 0, '
         f'"tp": {round(sl_est*0.97,0)}, "sl": {round(r1_p*1.02,0)}, "rr": 2.0, '
         '"trigger": "BÁN khi [điều kiện]", "catalyst": "[cụ thể]"}},\n'
-        '  "scenario_watch": {"probability": 30, "trigger": "Chờ [điều kiện cụ thể]", '
-        '"watch_for": "[tín hiệu có số liệu]"},\n'
+        f'  "scenario_watch": {{"probability": {sc_watch_prob}, "trigger": "Chờ [điều kiện cụ thể]", '
+        '"watch_for": "[tín hiệu có số liệu]"}},\n'
         f'  "support_levels": [{{"price": {s1}, "reason": "[lý do kỹ thuật]", '
         f'"dist_pct": {round((s1-price)/price*100,1)}}}, '
         f'{{"price": {sr["support"][1]["price"]}, "reason": "[lý do]", "dist_pct": 0}}, '
@@ -863,6 +951,13 @@ def _parse_expert_response(expert: dict, raw: str, round_num: int) -> ExpertOpin
         elif l.startswith("- ") and len(key_points) < 5:
             key_points.append(l[2:].strip()[:120])
 
+    # Kiểm tra sơ bộ: nếu entry/sl/tp spread quá rộng (>3x) → LLM có thể sai mã
+    if entry > 0 and sl > 0 and tp > 0:
+        ratio_max = max(entry, sl, tp) / max(min(entry, sl, tp), 1)
+        if ratio_max > 3.0:
+            entry = sl = tp = 0.0
+            concern = concern or "Giá entry/sl/tp spread bất thường — có thể nhầm mã"
+
     # Validate R:R
     if entry > 0 and tp > 0 and sl > 0 and entry != sl:
         rr_calc = round(abs(tp - entry) / abs(entry - sl), 2)
@@ -936,6 +1031,7 @@ def _parse_moderator_json(raw: str, td: dict) -> dict:
     data, rr_warning = _validate_rr(data, td)
     data["rr_warning"] = rr_warning
     data = _fix_sr(data, td)
+    data = _validate_prices_in_output(data, td)  # kiểm tra giá ngoài biên
     return data
 
 
@@ -966,6 +1062,71 @@ def _validate_rr(data: dict, td: dict) -> tuple[dict, str]:
                 rr_warning = f"R:R={rr_calc:.1f} dưới ngưỡng tối ưu 2.0"
         data[sc_key] = sc
     return data, rr_warning
+
+
+def _validate_prices_in_output(data: dict, td: dict) -> dict:
+    """
+    Kiểm tra tính nhất quán: entry/sl/tp trong scenarios phải nằm trong ±30% giá.
+    Nếu không → reset về 0 và gắn rr_warning.
+    Cũng enforce scenario_watch priority nếu panel_verdict là THEO DOI.
+    """
+    price    = td["price"]
+    warnings = []
+
+    for sc_key in ["scenario_buy", "scenario_sell"]:
+        sc = data.get(sc_key, {})
+        if not sc:
+            continue
+        for field in ["entry", "sl", "tp1", "tp", "tp2"]:
+            val = float(sc.get(field, 0) or 0)
+            if val > 0 and not _price_in_band(val, price):
+                logger.warning(
+                    f"[PriceGuard] {sc_key}.{field}={val:,.0f} ngoài band "
+                    f"±{PRICE_BAND_PCT*100:.0f}% (giá={price:,.0f}) → reset 0"
+                )
+                sc[field] = 0
+                warnings.append(
+                    f"{sc_key}.{field}={val:,.0f} ngoài biên ±30%"
+                )
+        # Nếu entry đã bị reset → xóa luôn rr
+        if float(sc.get("entry", 0) or 0) == 0:
+            sc["entry"] = 0
+        data[sc_key] = sc
+
+    if warnings:
+        existing = data.get("rr_warning", "")
+        extra    = " | ".join(warnings)
+        data["rr_warning"] = (f"{existing} | {extra}" if existing else extra)[:200]
+
+    # Enforce: nếu panel_verdict là THEO DOI,
+    # scenario_watch phải có probability cao nhất
+    verdict = data.get("panel_verdict", "")
+    if verdict == "THEO DOI":
+        sc_w = data.get("scenario_watch", {})
+        sc_b = data.get("scenario_buy",   {})
+        sc_s = data.get("scenario_sell",  {})
+        p_w  = int(sc_w.get("probability", 0))
+        p_b  = int(sc_b.get("probability", 0))
+        p_s  = int(sc_s.get("probability", 0))
+        if p_w <= p_b or p_w <= p_s:
+            # Điều chỉnh: watch lấy phần lớn nhất
+            total     = max(p_w + p_b + p_s, 100)
+            new_p_w   = max(50, round(total * 0.60))
+            remaining = 100 - new_p_w
+            new_p_b   = remaining // 2
+            new_p_s   = remaining - new_p_b
+            if sc_w: sc_w["probability"] = new_p_w
+            if sc_b: sc_b["probability"] = new_p_b
+            if sc_s: sc_s["probability"] = new_p_s
+            data["scenario_watch"] = sc_w
+            data["scenario_buy"]   = sc_b
+            data["scenario_sell"]  = sc_s
+            logger.info(
+                f"[ScenarioFix] THEO DOI dominant → watch={new_p_w}% "
+                f"buy={new_p_b}% sell={new_p_s}%"
+            )
+
+    return data
 
 
 def _fix_sr(data: dict, td: dict) -> dict:
