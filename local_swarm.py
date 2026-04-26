@@ -67,18 +67,36 @@ def _price_in_band(p: float, ref: float, band: float = PRICE_BAND_PCT) -> bool:
     return abs(p - ref) / ref <= band
 
 
+# Band riêng cho engine detail — chặt hơn PRICE_BAND_PCT (30%)
+# Lý do: engine detail chứa giá lịch sử, giá mã khác có thể trong ±30%
+# nhưng vẫn gây nhiễu cho LLM (ví dụ: DVP=74, giá 55/63/88 trong ±30%)
+DETAIL_BAND_PCT = 0.10   # ±10% — chỉ giá sát hiện tại mới được truyền
+
+
 def _sanitize_engine_detail(detail: str, ref_price: float) -> str:
     """
-    Quét text engine detail, đánh dấu các số trông như giá cổ phiếu
-    nhưng nằm ngoài ±30% ref_price bằng [~xxx] để LLM không dùng nhầm.
-    Chỉ xử lý số >= ref_price * 0.30 (tránh nhầm với %, RSI, v.v.)
+    Quét text engine detail, xóa/thay thế các số trông như giá cổ phiếu
+    nhưng nằm ngoài ±10% ref_price.
+
+    Thay bằng [DL_KHONG_HOP_LE] — chuỗi không có số → LLM không thể
+    trích xuất giá từ đó, buộc phải ghi "không đủ dữ liệu".
+
+    Ngưỡng nhận diện giá: số >= ref_price * 0.50
+    (tránh nhầm RSI 50-70, MACD 0.003, volume ratio 1.5)
     """
     if ref_price <= 0 or not detail:
         return detail
 
-    lo        = ref_price * (1 - PRICE_BAND_PCT)
-    hi        = ref_price * (1 + PRICE_BAND_PCT)
-    threshold = ref_price * 0.30
+    lo        = ref_price * (1 - DETAIL_BAND_PCT)
+    hi        = ref_price * (1 + DETAIL_BAND_PCT)
+    threshold = ref_price * 0.50   # dưới ngưỡng này → chỉ báo, không phải giá
+
+    # Keyword chỉ báo — số ngay sau các từ này không phải giá cổ phiếu
+    _IND_PAT = re.compile(
+        r"(?:rsi|macd|cci|adx|atr|stoch|bb|ema|sma|ma|volume|vol|hist|"
+        r"signal|ratio|score|pct|percent|r:r|rr|tp|sl|conf)\s*[=:>\s]?\s*$",
+        re.IGNORECASE,
+    )
 
     def _replace(m: re.Match) -> str:
         raw = m.group(0)
@@ -87,10 +105,14 @@ def _sanitize_engine_detail(detail: str, ref_price: float) -> str:
         except ValueError:
             return raw
         if val < threshold:
-            return raw           # quá nhỏ → không phải giá → giữ nguyên
+            return raw                      # quá nhỏ → chỉ báo/%, giữ nguyên
+        # Kiểm tra context trước số — nếu là indicator keyword thì giữ nguyên
+        before = detail[:m.start()].rstrip()
+        if _IND_PAT.search(before):
+            return raw                      # RSI=62, MACD=0.003... → giữ nguyên
         if lo <= val <= hi:
-            return raw           # trong biên → giữ nguyên
-        return f"[~{val:,.0f}]"  # ngoài biên → đánh dấu
+            return raw                      # trong ±10% → hợp lệ
+        return "[DL_KHONG_HOP_LE]"         # ngoài biên → xóa số
 
     return re.sub(r"[\d,]+(?:\.\d+)?", _replace, detail)
 
@@ -662,9 +684,13 @@ def _build_data_block(td: dict) -> str:
 
 def _get_skill_block(expert: dict, td: dict) -> str:
     """
-    Trích skill details theo từng chuyên gia — đầy đủ, có label rõ ràng.
-    Nếu engine không có detail → ghi rõ 'không có dữ liệu'.
+    Trích skill details theo từng chuyên gia.
+    - Sau khi _sanitize_engine_detail chạy, detail có thể chứa [DL_KHONG_HOP_LE]
+    - Nếu detail chứa quá nhiều placeholder → thay bằng thông báo rõ ràng
+      thay vì truyền noise vào prompt LLM
+    - Nếu engine không có detail → ghi rõ để LLM không tự bịa
     """
+    price = td["price"]
     lines = []
     for sk in expert["skill_keys"]:
         detail = td["engine_details"].get(sk, "").strip()
@@ -672,10 +698,38 @@ def _get_skill_block(expert: dict, td: dict) -> str:
         sig_em = ""
         if signal is not None:
             sig_em = " [🟢 BUY]" if signal > 0 else " [🔴 SELL]" if signal < 0 else " [⚪ NEU]"
-        if detail and len(detail) > 10:
-            lines.append(f"  [{sk}]{sig_em}:\n    {detail[:280]}")
+
+        if not detail or len(detail) <= 10:
+            lines.append(
+                f"  [{sk}]{sig_em}: KHÔNG CÓ DỮ LIỆU — "
+                f"ghi 'không đủ dữ liệu {sk}', không tự suy diễn giá."
+            )
+            continue
+
+        # Đếm placeholder [DL_KHONG_HOP_LE] — nếu chiếm >40% token → detail vô dụng
+        placeholder_count = detail.count("[DL_KHONG_HOP_LE]")
+        # Ước tính số token bằng word count
+        word_count = max(len(detail.split()), 1)
+        contamination = placeholder_count / word_count
+
+        if contamination > 0.40:
+            # Phần lớn dữ liệu giá bị lọc → không truyền noise
+            lines.append(
+                f"  [{sk}]{sig_em}: DỮ LIỆU GIÁ KHÔNG HỢP LỆ (ngoài ±10% so với "
+                f"{price:,.0f}) — ghi 'không đủ dữ liệu {sk}', không tự suy diễn."
+            )
+        elif placeholder_count > 0:
+            # Một phần bị lọc — truyền detail nhưng nhắc rõ
+            clean = detail[:280]
+            lines.append(
+                f"  [{sk}]{sig_em}:\n"
+                f"    {clean}\n"
+                f"    ⚠️ Các ký hiệu [DL_KHONG_HOP_LE] = giá ngoài ±10% của "
+                f"{price:,.0f} — TUYỆT ĐỐI không dùng, không đoán lại con số."
+            )
         else:
-            lines.append(f"  [{sk}]{sig_em}: (không có detail từ engine này)")
+            lines.append(f"  [{sk}]{sig_em}:\n    {detail[:280]}")
+
     return "\n".join(lines)
 
 
@@ -697,9 +751,13 @@ def _build_round1_prompt(
         "3. R:R = (TP - Entry) / (Entry - SL). Nếu R:R < 1.5 → ĐỔI SANG THEO DOI.\n"
         "4. SCORE từ -5 đến +5 (âm=bearish, dương=bullish, 0=neutral).\n"
         "5. Chỉ phân tích theo trường phái của mình — không lấn sang trường phái khác.\n"
-        f"6. ⚠️ RÀNG BUỘC GIÁ CỨNG: Mọi giá đề xuất PHẢI trong [{price_lo:,.0f}–{price_hi:,.0f}].\n"
-        f"   Số có dấu [~xxx] trong Skill Details = giá ngoài biên, TUYỆT ĐỐI KHÔNG dùng.\n"
-        "7. KHÔNG tự suy diễn giá không có trong dữ liệu — nếu thiếu, ghi 'không đủ thông tin'.\n\n"
+        f"6. ⚠️ RÀNG BUỘC GIÁ CỨNG: Mọi Entry/SL/TP PHẢI trong [{price_lo:,.0f}–{price_hi:,.0f}].\n"
+        "   [DL_KHONG_HOP_LE] trong Skill Details = giá đã bị lọc, TUYỆT ĐỐI KHÔNG phục hồi hay đoán lại.\n"
+        "7. NGUỒN GIÁ DUY NHẤT: Chỉ dùng số từ mục DỮ LIỆU KỸ THUẬT và PRICE LOCK bên dưới.\n"
+        "   Nếu Skill Details không có giá hợp lệ → ghi 'không đủ dữ liệu', đặt Entry=0.\n"
+        "8. NHẤT QUÁN: Mọi phân tích phải kể cùng một câu chuyện về giá.\n"
+        f"   Ví dụ SAI: 'OB tại 63', 'kháng cự 88', 'Entry=55' khi giá hiện tại={price:,.0f}.\n"
+        f"   Ví dụ ĐÚNG: 'Entry={round(price,0):,.0f}, SL={round(price*0.95,0):,.0f}, TP={round(price*1.05,0):,.0f}'.\n\n"
         "═══ ĐỊNH DẠNG ĐẦU RA (theo đúng thứ tự) ═══\n"
         "STANCE: [MUA/BAN/THEO DOI]\n"
         "SCORE: [-5..+5]\n"
@@ -1321,145 +1379,47 @@ def _fix_entry_trigger(data: dict, td: dict) -> dict:
 
 def _validate_prices_in_output(data: dict, td: dict) -> dict:
     """
-    Lop bao ve cuoi -- 3 tang:
-
-    Tang 1: Validate numeric fields (entry/sl/tp) cua scenario_buy + scenario_sell
-            Band +-15% (chat hon PRICE_BAND_PCT=30%) -> reset ve 0 neu ngoai bien.
-
-    Tang 2: Validate scenario_watch -- scan text fields (trigger, watch_for)
-            tim so gia ngoai +-15% -> thay bang thong diep an toan.
-            Root cause: LLM tu bia gia vao watch_for ("quet dinh cu 85").
-
-    Tang 3: Enforce scenario_watch priority neu panel_verdict = THEO DOI.
+    Lớp bảo vệ cuối: kiểm tra entry/sl/tp/support/resistance trong scenarios
+    phải nằm trong ±30% giá. Nếu không → reset về 0 + log + gắn warning.
+    Cũng enforce scenario_watch priority nếu panel_verdict = THEO DOI.
     """
-    import re as _re
-    price         = td["price"]
-    SCENARIO_BAND = 0.15
-    lo15          = price * (1 - SCENARIO_BAND)
-    hi15          = price * (1 + SCENARIO_BAND)
+    price    = td["price"]
     warnings: list[str] = []
 
-    # Tang 1: Numeric fields scenario_buy / scenario_sell
     for sc_key in ["scenario_buy", "scenario_sell"]:
         sc = data.get(sc_key, {})
         if not sc:
             continue
         for field_name in ["entry", "sl", "tp1", "tp", "tp2"]:
             val = _safe_float(sc.get(field_name, 0))
-            if val <= 0:
-                continue
-            if not (lo15 <= val <= hi15):
+            if val > 0 and not _price_in_band(val, price):
                 logger.warning(
-                    f"[PriceGuard] {sc_key}.{field_name}={val:,.1f} "
-                    f"ngoai +-15% (gia={price:,.0f} band=[{lo15:,.0f}-{hi15:,.0f}]) -> reset 0"
+                    f"[PriceGuard] {sc_key}.{field_name}={val:,.0f} "
+                    f"ngoài band ±{PRICE_BAND_PCT*100:.0f}% (giá={price:,.0f}) → reset 0"
                 )
                 sc[field_name] = 0
-                warnings.append(f"{sc_key}.{field_name}={val:,.0f} ngoai +-15%")
+                warnings.append(f"{sc_key}.{field_name}={val:,.0f} ngoài biên ±30%")
         data[sc_key] = sc
 
-    # Tang 2: Text fields scenario_watch -- diet gia ma
-    # Strategy: xay dung tap so hop le tu S/R thuc te, bat ky so nao ngoai tap nay
-    # va khong phai RSI/volume/pct thi la "gia ma" -> replace
-    sc_w = data.get("scenario_watch", {}) or {}
-    if sc_w:
-        sr      = td["sr_levels"]
-        ma20    = td["ma20"]
-        ma50    = td["ma50"] or 0
-        bb_up   = td["bb_upper"]
-        bb_low  = td["bb_lower"]
-        rsi_val = td["rsi"]
-        # Tap cac muc gia hop le: S/R + MA + BB + gia hien tai +-5%
-        valid_set = set()
-        valid_set.add(round(price, 1))
-        for s in sr["support"]:
-            valid_set.add(round(s["price"], 1))
-        for r in sr["resistance"]:
-            valid_set.add(round(r["price"], 1))
-        if ma20: valid_set.add(round(ma20, 1))
-        if ma50: valid_set.add(round(ma50, 1))
-        if bb_up: valid_set.add(round(bb_up, 1))
-        if bb_low: valid_set.add(round(bb_low, 1))
-        if td.get("tp_check", 0): valid_set.add(round(td["tp_check"], 1))
-        if td.get("sl_check", 0): valid_set.add(round(td["sl_check"], 1))
-        # Bien goc +-2% de chap nhan xap xi (chat hon de bat 82 khi R3=80)
-        VALID_TOL = 0.02
-        def _is_valid_price(v: float) -> bool:
-            # Qua nho -> RSI/volume/pct, khong phai gia
-            # Nguong: so phai > 65% cua gia hien tai moi coi la gia co phieu
-            if v < price * 0.65: return True
-            # Trong +-2% cua bat ky muc gia hop le nao
-            for vp in valid_set:
-                if vp > 0 and abs(v - vp) / vp <= VALID_TOL:
-                    return True
-            # Trong +-2% cua gia hien tai
-            return abs(v - price) / price <= VALID_TOL
-
-        for text_field in ["trigger", "watch_for", "condition"]:
-            raw_text = str(sc_w.get(text_field, "")).strip()
-            if not raw_text:
-                continue
-            # Loai so di truoc boi keyword chi bao (RSI, MACD, volume, x TB...)
-            # Match bat ky dong nao ma phan truoc so chua tu khoa chi bao
-            # Vi du: "RSI hien tai 52" -> before="RSI hien tai" -> co "RSI" -> skip
-            _INDICATOR_PREFIX = _re.compile(
-                r"(?:rsi|macd|ema|sma|ma\d*|bb|atr|volume|vol|tb\d*|adx|cci|stoch"
-                r"|hien\s+tai|gia\s+tri|chi\s+so|ngưỡng|mức|x\s*tb)",
-                _re.IGNORECASE,
-            )
-            # Tach text thanh tokens theo vi tri so
-            _cleaned = raw_text
-            ghost_prices = []
-            for m in _re.finditer(r"[\d,]+(?:\.\d+)?", raw_text):
-                try:
-                    v = float(m.group().replace(",", ""))
-                except Exception:
-                    continue
-                # Kiem tra context truoc so: neu la indicator prefix thi bo qua
-                before = raw_text[:m.start()].rstrip()
-                if _INDICATOR_PREFIX.search(before):  # co tu khoa chi bao truoc so
-                    continue
-                if not _is_valid_price(v):
-                    ghost_prices.append(round(v, 1))
-            if ghost_prices:
-                logger.warning(
-                    f"[WatchGuard] scenario_watch.{text_field} chua gia khong co trong S/R: "
-                    f"{ghost_prices} (gia={price:,.1f}) -> replace"
-                )
-                s1 = sr["support"][0]["price"]
-                r1 = sr["resistance"][0]["price"]
-                if text_field == "trigger":
-                    sc_w[text_field] = (
-                        f"Cho gia on dinh quanh {price:,.1f}-{r1:,.1f}; "
-                        f"volume > 1.3x TB20; RSI hien {rsi_val:.0f}"
-                    )
-                else:
-                    sc_w[text_field] = (
-                        f"Quan sat vung ho tro {s1:,.1f}-{price:,.1f} "
-                        f"va khang cu {r1:,.1f}; MA20={ma20:,.1f}"
-                    )
-                warnings.append(
-                    f"watch.{text_field}: gia ma {ghost_prices} -> thay bang du lieu thuc"
-                )
-        data["scenario_watch"] = sc_w
-
     if warnings:
-        existing = data.get("rr_warning", "")
-        extra    = " | ".join(warnings)
-        data["rr_warning"] = (f"{existing} | {extra}" if existing else extra)[:300]
+        existing        = data.get("rr_warning", "")
+        extra           = " | ".join(warnings)
+        data["rr_warning"] = (f"{existing} | {extra}" if existing else extra)[:250]
 
-    # Tang 3: Enforce THEO DOI dominant -> scenario_watch priority
+    # Enforce THEO DOI dominant → scenario_watch priority
     verdict = data.get("panel_verdict", "")
     if verdict == "THEO DOI":
-        sc_b = data.get("scenario_buy",  {}) or {}
-        sc_s = data.get("scenario_sell", {}) or {}
+        sc_w = data.get("scenario_watch", {}) or {}
+        sc_b = data.get("scenario_buy",   {}) or {}
+        sc_s = data.get("scenario_sell",  {}) or {}
         p_w  = int(sc_w.get("probability", 0))
         p_b  = int(sc_b.get("probability", 0))
         p_s  = int(sc_s.get("probability", 0))
         if p_w <= p_b or p_w <= p_s:
-            new_p_w   = max(55, round((p_w + p_b + p_s) * 0.60))
-            remaining = 100 - new_p_w
-            new_p_b   = remaining // 2
-            new_p_s   = remaining - new_p_b
+            new_p_w           = max(55, round((p_w + p_b + p_s) * 0.60))
+            remaining         = 100 - new_p_w
+            new_p_b           = remaining // 2
+            new_p_s           = remaining - new_p_b
             if sc_w: sc_w["probability"] = new_p_w
             if sc_b: sc_b["probability"] = new_p_b
             if sc_s: sc_s["probability"] = new_p_s
@@ -1467,7 +1427,7 @@ def _validate_prices_in_output(data: dict, td: dict) -> dict:
             data["scenario_buy"]   = sc_b
             data["scenario_sell"]  = sc_s
             logger.info(
-                f"[ScenarioFix] THEO DOI -> watch={new_p_w}% buy={new_p_b}% sell={new_p_s}%"
+                f"[ScenarioFix] THEO DOI → watch={new_p_w}% buy={new_p_b}% sell={new_p_s}%"
             )
 
     return data
