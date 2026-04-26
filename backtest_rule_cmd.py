@@ -409,6 +409,12 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
 
     try:
         # ── Bước 1: Load context từ DB ────────────────────────────────────
+        _ENTRY_KEYS = ("entry", "entry_price", "entry_low",
+                       "entry_zone", "entry_high", "buy_zone")
+
+        def _has_entry(tp) -> bool:
+            return bool(tp and any(tp.get(k) for k in _ENTRY_KEYS))
+
         ctx = await asyncio.to_thread(load_auto_context, symbol)
 
         if not ctx["found"]:
@@ -418,6 +424,26 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
         source     = ctx["source"]
         trade_plan = ctx["trade_plan"]
         state_vec  = ctx["state_vector"]
+
+        # Nếu load_auto_context trả về /check (không có trade_plan)
+        # nhưng DB có thể còn /vibe data → thử load riêng /vibe
+        if not _has_entry(trade_plan if trade_plan else {}):
+            try:
+                vibe_ctx = await asyncio.to_thread(
+                    load_auto_context, symbol, preferred_source="vibe"
+                )
+                if vibe_ctx.get("found") and vibe_ctx.get("trade_plan"):
+                    trade_plan = vibe_ctx["trade_plan"]
+                    source     = vibe_ctx["source"]
+                    logger.info(
+                        f"[auto_ctx] {symbol}: switched to vibe source "
+                        f"(had trade_plan, prev source={ctx['source']})"  
+                    )
+            except TypeError:
+                # load_auto_context cũ không nhận preferred_source → bỏ qua
+                pass
+            except Exception as _lae:
+                logger.debug(f"[auto_ctx] vibe retry failed: {_lae}")
         verdict    = ctx["verdict"] or "N/A"
         created    = ctx["created_at"]
         age_str    = ""
@@ -430,7 +456,18 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
             age_str   = f"{age_hours:.0f} gio truoc"
 
         # ── Bước 2a: Có trade_plan → backtest ────────────────────────────
-        if trade_plan and trade_plan.get("entry"):
+        # /vibe lưu trade_plan với nhiều key khác nhau tùy version:
+        # "entry", "entry_price", "entry_zone", "entry_low", "entry_high"
+        # → check tất cả, không chỉ "entry"
+        if trade_plan and _has_entry(trade_plan):
+            # Normalize trade_plan: đảm bảo key "entry" luôn có
+            # để trade_plan_to_rules không bị lỗi
+            if not trade_plan.get("entry"):
+                for k in _ENTRY_KEYS[1:]:   # bỏ qua "entry" vì đã check
+                    if trade_plan.get(k):
+                        trade_plan = dict(trade_plan)  # copy, không mutate gốc
+                        trade_plan["entry"] = trade_plan[k]
+                        break
             entry_rule, exit_rule = trade_plan_to_rules(trade_plan)
             plan_summary          = format_trade_plan_summary(trade_plan)
 
