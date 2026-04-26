@@ -664,7 +664,11 @@ def _get_skill_block(expert: dict, td: dict) -> str:
     """
     Trích skill details theo từng chuyên gia — đầy đủ, có label rõ ràng.
     Nếu engine không có detail → ghi rõ 'không có dữ liệu'.
+    Nếu detail có nhiều giá bị đánh dấu [~xxx] → cảnh báo rõ để LLM không tự suy diễn.
     """
+    price    = td["price"]
+    price_lo = round(price * (1 - PRICE_BAND_PCT), 0)
+    price_hi = round(price * (1 + PRICE_BAND_PCT), 0)
     lines = []
     for sk in expert["skill_keys"]:
         detail = td["engine_details"].get(sk, "").strip()
@@ -673,9 +677,23 @@ def _get_skill_block(expert: dict, td: dict) -> str:
         if signal is not None:
             sig_em = " [🟢 BUY]" if signal > 0 else " [🔴 SELL]" if signal < 0 else " [⚪ NEU]"
         if detail and len(detail) > 10:
-            lines.append(f"  [{sk}]{sig_em}:\n    {detail[:280]}")
+            # Đếm số giá bị đánh dấu ngoài biên
+            out_of_band_count = len(re.findall(r"\[~[\d,]+\]", detail))
+            if out_of_band_count >= 2:
+                warn = (
+                    f"\n    ⚠️ CẢNH BÁO: {out_of_band_count} mức giá trong detail này "
+                    f"nằm NGOÀI biên hợp lệ [{price_lo:,.0f}–{price_hi:,.0f}] "
+                    f"(đánh dấu [~xxx]). KHÔNG dùng các số đó. "
+                    f"Nếu không còn dữ liệu hợp lệ, ghi 'không đủ dữ liệu {sk}'."
+                )
+                lines.append(f"  [{sk}]{sig_em}:\n    {detail[:280]}{warn}")
+            else:
+                lines.append(f"  [{sk}]{sig_em}:\n    {detail[:280]}")
         else:
-            lines.append(f"  [{sk}]{sig_em}: (không có detail từ engine này)")
+            lines.append(
+                f"  [{sk}]{sig_em}: "
+                f"(không có detail từ engine này — ghi 'không đủ dữ liệu {sk}')"
+            )
     return "\n".join(lines)
 
 
@@ -1119,6 +1137,42 @@ def _parse_expert_response(expert: dict, raw: str, round_num: int) -> ExpertOpin
         elif l.startswith("- ") and len(key_points) < 6:
             key_points.append(l[2:].strip()[:160])
 
+    # ── Fix 2: Entry/Trigger nhất quán ─────────────────────────────────────
+    # Nếu trigger nói "vượt X" / "breakout X" mà entry < X → entry = X, scale SL/TP
+    if entry > 0 and sl > 0 and tp > 0 and stance == "MUA":
+        trigger_text = " ".join(kp for kp in key_points if "Trigger:" in kp).lower()
+        trigger_price = 0.0
+        for pat in [
+            r"vượt\s+([\d,\.]+)",
+            r"breakout\s+([\d,\.]+)",
+            r"break\s+([\d,\.]+)",
+            r"qua\s+([\d,\.]+)",
+            r">\s*([\d,\.]+)",
+        ]:
+            m_t = re.search(pat, trigger_text)
+            if m_t:
+                try:
+                    trigger_price = float(m_t.group(1).replace(",", ""))
+                except Exception:
+                    pass
+                if trigger_price > 0:
+                    break
+
+        if trigger_price > 0 and entry < trigger_price:
+            old_entry = entry
+            delta_sl  = old_entry - sl
+            delta_tp  = tp - old_entry
+            entry     = trigger_price
+            sl        = max(entry - delta_sl, entry * 0.85)
+            tp        = entry + delta_tp
+            logger.info(
+                f"[EntryTriggerFix] {expert['id']} entry {old_entry:.0f}→{entry:.0f} "
+                f"(trigger={trigger_price:.0f}), sl={sl:.0f}, tp={tp:.0f}"
+            )
+            key_points.append(
+                f"[Auto-fix] Entry {old_entry:,.0f}→{entry:,.0f} theo trigger vượt {trigger_price:,.0f}"
+            )
+
     # Kiểm tra spread bất thường (giá nhầm mã)
     if entry > 0 and sl > 0 and tp > 0:
         ratio_max = max(entry, sl, tp) / max(min(entry, sl, tp), 1)
@@ -1534,10 +1588,12 @@ class SwarmOrchestrator:
 
         stances_final = [op.stance for op in r3]
         scores_final  = [op.score  for op in r3]
-        vote_bull     = stances_final.count("MUA")
-        vote_bear     = stances_final.count("BAN")
-        vote_neutral  = stances_final.count("THEO DOI")
-        n_exp         = max(len(r3), 1)
+        # Fix 3: Vote Split dựa trên score thực tế (score>0=Bull, <0=Bear, =0=Neutral)
+        # Tránh mâu thuẫn: risk_manager score=-1 nhưng ghi 0 Bear
+        vote_bull    = sum(1 for op in r3 if op.score > 0)
+        vote_bear    = sum(1 for op in r3 if op.score < 0)
+        vote_neutral = sum(1 for op in r3 if op.score == 0)
+        n_exp        = max(len(r3), 1)
 
         final_score = _safe_float(
             mod_data.get("final_score", sum(scores_final) / max(len(scores_final), 1))
@@ -1619,7 +1675,7 @@ class SwarmOrchestrator:
 
 _SEP  = "═" * 32
 _SEP2 = "─" * 32
-_LINE_WIDTH = 60   # giới hạn mỗi dòng cho Telegram mobile
+_LINE_WIDTH = 68   # giới hạn mỗi dòng cho Telegram mobile
 
 
 def _score_bar(score: float) -> str:
@@ -1633,10 +1689,14 @@ def _wrap(text: str, width: int = _LINE_WIDTH, indent: str = "") -> list[str]:
     """
     Wrap text thành các dòng không vượt quá width ký tự.
     Cắt tại dấu cách — không bao giờ cắt giữa từ.
+    Fix 4: join embedded newlines từ LLM trước khi wrap.
     """
     if not text:
         return []
-    text = text.strip()
+    # Xử lý embedded newlines: join thành 1 dòng phẳng trước khi wrap
+    text = " ".join(part.strip() for part in text.strip().split("\n") if part.strip())
+    if not text:
+        return []
     if len(text) <= width:
         return [indent + text]
 
@@ -1644,6 +1704,9 @@ def _wrap(text: str, width: int = _LINE_WIDTH, indent: str = "") -> list[str]:
     lines  = []
     cur    = ""
     for word in words:
+        # Bỏ qua word rỗng do nhiều dấu cách liên tiếp
+        if not word:
+            continue
         test = (cur + " " + word).strip()
         if len(test) <= width:
             cur = test
