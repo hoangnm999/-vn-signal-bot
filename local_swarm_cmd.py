@@ -248,91 +248,161 @@ async def lswarm_fast_cmd(update, context):
 
 def _run_fast_swarm(symbol: str, meta: dict, progress_cb, cancel_event) -> str:
     """
-    Fast swarm: chỉ 2 chuyên gia (tech + risk), 1 vòng, timeout cứng.
+    Fast swarm v3.0: chỉ 2 chuyên gia (tech_analyst + risk_manager), 1 vòng.
+    Dùng API v3.0: extract_technical_data() + LLMClient + _build_round1_prompt()
+    Không dùng SwarmOrchestrator 3 vòng → nhanh hơn ~3-4x.
     Trả về formatted text đơn giản.
     """
-    from local_swarm import SwarmInput, LLMClient, EXPERTS
+    # ── Import API v3.0 ────────────────────────────────────────────────────────
     from local_swarm import (
-        _build_context_block, _build_expert_prompt_round1,
-        _parse_expert_response, _build_moderator_prompt,
-        _parse_moderator_json, format_swarm_report,
-        SwarmReport, DebateRound
+        LLMClient,
+        EXPERTS,
+        extract_technical_data,
+        _get_skill_block,
+        _build_round1_prompt,
+        _parse_expert_response,
     )
-    from datetime import datetime, timedelta
 
     t0 = time.time()
-    inp = SwarmInput.from_analyze_result(symbol, meta)
-    ctx = _build_context_block(inp)
 
-    # Chỉ dùng 2 chuyên gia quan trọng nhất
-    fast_experts = [e for e in EXPERTS if e["id"] in ("tech_analyst", "risk_manager")]
+    # ── Bước 1: extract technical data từ meta ────────────────────────────────
+    progress_cb(f"📐 Chuẩn bị dữ liệu kỹ thuật {symbol}...")
+    _log_step("fast_swarm: extract_technical_data", symbol)
+    try:
+        td = extract_technical_data(symbol, meta)
+    except Exception as e:
+        _log_step(f"fast_swarm: extract_technical_data ERROR: {e}", symbol)
+        raise
+
+    # ── Bước 2: chỉ 2 chuyên gia ─────────────────────────────────────────────
+    fast_expert_ids = ("tech_analyst", "risk_manager")
+    fast_experts    = [e for e in EXPERTS if e["id"] in fast_expert_ids]
 
     llm = LLMClient()
     _log_step(f"fast_swarm: LLM provider={llm.provider}/{llm.model}", symbol)
 
-    r1_opinions = []
+    opinions = []   # list of dict với keys: expert_id, role, emoji, stance, confidence, reason
+
     for expert in fast_experts:
         if cancel_event.is_set():
+            _log_step("fast_swarm: cancelled before expert", symbol)
             break
-        progress_cb(f"  {expert['emoji']} {expert['role']} phân tích...")
-        t_llm = time.time()
-        _log_step(f"fast_swarm: calling LLM for {expert['id']}", symbol)
-        try:
-            sys_p, usr_p = _build_expert_prompt_round1(expert, ctx, inp)
-            raw = _llm_call_with_timeout(llm, sys_p, usr_p, 700, LLM_CALL_TIMEOUT, symbol, expert["id"])
-            op  = _parse_expert_response(expert, raw, 1)
-            r1_opinions.append(op)
-            elapsed_llm = round(time.time() - t_llm, 1)
-            _log_step(f"fast_swarm: {expert['id']} done in {elapsed_llm}s → {op.stance}", symbol)
-            progress_cb(f"  → {expert['emoji']} {op.stance}({op.confidence}%) [{elapsed_llm}s]")
-        except TimeoutError:
-            _log_step(f"fast_swarm: {expert['id']} LLM TIMEOUT", symbol)
-            progress_cb(f"  ⚠️ {expert['role']}: timeout LLM")
-            from local_swarm import ExpertOpinion
-            r1_opinions.append(ExpertOpinion(
-                expert_id=expert["id"], role=expert["role"],
-                stance="THEO DOI", confidence=40,
-                key_points=["LLM timeout"], concern="N/A", raw_text=""
-            ))
-        except Exception as e:
-            _log_step(f"fast_swarm: {expert['id']} error: {e}", symbol)
-            progress_cb(f"  ❌ {expert['role']}: {str(e)[:60]}")
-            from local_swarm import ExpertOpinion
-            r1_opinions.append(ExpertOpinion(
-                expert_id=expert["id"], role=expert["role"],
-                stance="THEO DOI", confidence=40,
-                key_points=[str(e)[:80]], concern="N/A", raw_text=""
-            ))
 
-    # Tổng hợp nhanh không cần moderator LLM
-    stances = [op.stance for op in r1_opinions]
+        eid  = expert["id"]
+        role = expert["role"]
+        em   = expert.get("emoji", "👤")
+        progress_cb(f"  {em} {role} phân tích...")
+        t_llm = time.time()
+        _log_step(f"fast_swarm: calling LLM for {eid}", symbol)
+
+        try:
+            # Build skill context block cho expert này
+            skill_block = _get_skill_block(expert, td)
+
+            # Build prompt vòng 1
+            sys_p, usr_p = _build_round1_prompt(expert, td, skill_block)
+
+            # Gọi LLM với timeout cứng
+            raw = _llm_call_with_timeout(
+                llm, sys_p, usr_p,
+                max_tokens=700,
+                timeout=LLM_CALL_TIMEOUT,
+                symbol=symbol,
+                expert_id=eid,
+            )
+
+            # Parse response
+            parsed = _parse_expert_response(expert, raw, round_num=1)
+            elapsed_llm = round(time.time() - t_llm, 1)
+
+            stance     = parsed.get("stance",     "THEO DOI")
+            confidence = parsed.get("confidence", 50)
+            key_points = parsed.get("key_points", [])
+            reason     = key_points[0] if key_points else parsed.get("concern", "Không rõ")
+
+            opinions.append({
+                "expert_id":  eid,
+                "role":       role,
+                "emoji":      em,
+                "stance":     stance,
+                "confidence": confidence,
+                "reason":     str(reason)[:100],
+            })
+
+            _log_step(f"fast_swarm: {eid} done in {elapsed_llm}s → {stance}({confidence}%)", symbol)
+            progress_cb(f"  → {em} {stance} ({confidence}%) [{elapsed_llm}s]")
+
+        except TimeoutError:
+            _log_step(f"fast_swarm: {eid} LLM TIMEOUT", symbol)
+            progress_cb(f"  ⚠️ {role}: LLM timeout")
+            opinions.append({
+                "expert_id":  eid,
+                "role":       role,
+                "emoji":      em,
+                "stance":     "THEO DOI",
+                "confidence": 40,
+                "reason":     "LLM timeout — không nhận được phản hồi",
+            })
+        except Exception as e:
+            _log_step(f"fast_swarm: {eid} error: {e}", symbol)
+            progress_cb(f"  ❌ {role}: {str(e)[:60]}")
+            opinions.append({
+                "expert_id":  eid,
+                "role":       role,
+                "emoji":      em,
+                "stance":     "THEO DOI",
+                "confidence": 40,
+                "reason":     str(e)[:100],
+            })
+
+    # ── Bước 3: tổng hợp nhanh (không dùng moderator LLM) ────────────────────
+    stances = [op["stance"] for op in opinions]
     buy_c   = stances.count("MUA")
     sell_c  = stances.count("BAN")
     watch_c = stances.count("THEO DOI")
-    verdict = "MUA" if buy_c > sell_c else ("BAN" if sell_c > buy_c else "THEO DOI")
 
-    elapsed = round(time.time() - t0, 1)
+    if buy_c > sell_c and buy_c > watch_c:
+        verdict = "MUA"
+    elif sell_c > buy_c and sell_c > watch_c:
+        verdict = "BAN"
+    else:
+        verdict = "THEO DOI"
 
+    avg_conf = int(sum(op["confidence"] for op in opinions) / len(opinions)) if opinions else 0
+    elapsed  = round(time.time() - t0, 1)
+
+    # ── Bước 4: format output ─────────────────────────────────────────────────
     lines = [
         f"⚡ FAST SWARM: {symbol}",
         "━" * 26,
-        f"Verdict  : {verdict}",
-        f"Vote     : 🟢{buy_c} ⚪{watch_c} 🔴{sell_c}",
+        f"Kết luận : {verdict}  (tb {avg_conf}%)",
+        f"Vote     : 🟢MUA={buy_c}  ⚪TD={watch_c}  🔴BAN={sell_c}",
         f"Thời gian: {elapsed}s",
         "",
         "CHUYÊN GIA:",
     ]
-    for op in r1_opinions:
-        em = next((e["emoji"] for e in EXPERTS if e["id"] == op.expert_id), "👤")
-        lines.append(f"{em} {op.role}: {op.stance} ({op.confidence}%)")
-        reason = op.key_points[0] if op.key_points else op.concern
-        lines.append(f"   └─ {reason[:80]}")
+
+    for op in opinions:
+        lines.append(f"{op['emoji']} {op['role']}: {op['stance']} ({op['confidence']}%)")
+        lines.append(f"   └─ {op['reason']}")
+
+    # Thêm context từ td nếu có
+    price = td.get("price", 0)
+    rsi   = td.get("rsi",   0)
+    if price:
+        lines += [
+            "",
+            f"Giá hiện tại: {price:,.0f}",
+        ]
+        if rsi:
+            lines.append(f"RSI         : {rsi:.1f}")
 
     lines += [
         "",
-        "⚠️ Fast mode — 2 chuyên gia, 1 vòng.",
-        f"Dùng /local_swarm {symbol} để phân tích đầy đủ.",
+        "⚠️ Fast mode — 2 chuyên gia, 1 vòng (không moderator).",
+        f"Phân tích đầy đủ: /local_swarm {symbol}",
     ]
+
     return "\n".join(lines)
 
 
