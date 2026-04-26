@@ -158,7 +158,7 @@ def extract_technical_data(symbol: str, meta: dict) -> dict:
         raw_details = vibe.get("details", {})
         if isinstance(raw_details, dict):
             for k, v in raw_details.items():
-                _raw_engine[k] = str(v)[:800]  # tăng lên 800 để brief có đủ data
+                _raw_engine[k] = str(v)[:800]
 
     # Từ verdict["context_details"] — MarketRegime, NewsSentiment, VNMacro, CommodityContext
     ctx_details = verdict.get("context_details", {})
@@ -680,186 +680,176 @@ def _get_skill_block(expert: dict, td: dict) -> str:
 
 
 
-# Mapping: skill → section label trong brief của từng chuyên gia
 _SKILL_SECTIONS = {
-    # TA
-    "TechnicalBasic":  "📊 KỸ THUẬT CƠ BẢN",
-    "Ichimoku":        "☁️ ICHIMOKU CLOUD",
-    "Candlestick":     "🕯️ MẪU NẾN",
-    "ElliottWave":     "〰️ SÓNG ELLIOTT",
-    # SMC
-    "SMC":             "💡 SMART MONEY CONCEPTS",
-    "Chanlun":         "📐 CHANLUN / PHÂN THẦN",
-    "MultiFactor":     "🔢 ĐA NHÂN TỐ KỸ THUẬT",
-    # Macro
-    "MarketRegime":    "🌐 CHẾ ĐỘ THỊ TRƯỜNG",
-    "VNMacro":         "🇻🇳 VĨ MÔ VIỆT NAM",
-    "CommodityContext":"🛢️ HÀNG HÓA & NGÀNH",
-    "NewsSentiment":   "📰 TIN TỨC & TÂM LÝ",
-    # Risk
-    "Volatility":      "📉 BIẾN ĐỘNG & RỦI RO",
-    # Fundamental
+    "TechnicalBasic":   "📊 KỸ THUẬT CƠ BẢN",
+    "Ichimoku":         "☁️  ICHIMOKU CLOUD",
+    "Candlestick":      "🕯️  MẪU NẾN",
+    "ElliottWave":      "〰️  SÓNG ELLIOTT",
+    "SMC":              "💡 SMART MONEY CONCEPTS",
+    "Chanlun":          "📐 CHANLUN",
+    "MultiFactor":      "🔢 ĐA NHÂN TỐ KỸ THUẬT",
+    "MarketRegime":     "🌐 CHẾ ĐỘ THỊ TRƯỜNG",
+    "VNMacro":          "🇻🇳 VĨ MÔ VIỆT NAM",
+    "CommodityContext": "🛢️  HÀNG HÓA & NGÀNH",
+    "NewsSentiment":    "📰 TIN TỨC & TÂM LÝ",
+    "Volatility":       "📉 BIẾN ĐỘNG & RỦI RO",
     "FundamentalFilter":"💼 CƠ BẢN & ĐỊNH GIÁ",
-    "MLStrategy":      "🤖 ML SIGNAL",
-    "Seasonal":        "📅 MÙA VỤ & LỊCH SỬ",
-    "Harmonic":        "🎵 HARMONIC PATTERN",
+    "MLStrategy":       "🤖 ML SIGNAL",
+    "Seasonal":         "📅 MÙA VỤ & LỊCH SỬ",
+    "Harmonic":         "🎵 HARMONIC PATTERN",
+}
+
+_CROSS_REF = {
+    "tech_analyst":      ["SMC", "Harmonic", "MultiFactor"],
+    "smc_trader":        ["TechnicalBasic", "Ichimoku"],
+    "macro_strategist":  ["FundamentalFilter", "Volatility"],
+    "risk_manager":      ["SMC", "TechnicalBasic", "MarketRegime"],
+    "fundamental_filter":["MarketRegime", "TechnicalBasic", "MLStrategy"],
+}
+
+_GUIDING_Q = {
+    "tech_analyst": [
+        "1. Xu hướng ngắn hạn (MA20/MA50) và Ichimoku đang đồng thuận hay mâu thuẫn?",
+        "2. RSI và MACD hist đang kể câu chuyện gì về đà tăng/giảm?",
+        "3. Mẫu nến + volume gần nhất xác nhận hay phủ định xu hướng?",
+        "4. Sóng Elliott đang ở đâu? Mục tiêu sóng tiếp theo là bao nhiêu?",
+        "5. Còn điều gì trong dữ liệu mà bạn cho là quan trọng nhưng chưa được đề cập?",
+    ],
+    "smc_trader": [
+        "1. Cấu trúc thị trường: HH/HL hay LH/LL? Có BOS hay ChoCH gần đây?",
+        "2. FVG hoặc Order Block gần nhất ở đâu? Giá đã về test chưa?",
+        "3. Buy-side/Sell-side liquidity đang nằm ở vùng nào?",
+        "4. Tổ chức đang accumulate hay distribute tại vùng giá hiện tại?",
+        "5. Còn điều gì trong dữ liệu mà bạn cho là quan trọng nhưng chưa được đề cập?",
+    ],
+    "macro_strategist": [
+        "1. Market regime hiện tại tạo gió xuôi hay ngược cho mã này?",
+        "2. Tin tức headline gần nhất tác động thế nào đến sentiment ngành?",
+        "3. Yếu tố vĩ mô nào (lãi suất, tỷ giá, hàng hóa) đang thống trị?",
+        "4. Còn điều gì trong dữ liệu mà bạn cho là quan trọng nhưng chưa được đề cập?",
+    ],
+    "risk_manager": [
+        "1. ATR và BB width nói gì về độ biến động hiện tại?",
+        "2. SL hợp lý nhất đặt ở đâu (S1 hay ATR×1.5)? Khoảng cách % bao nhiêu?",
+        "3. R:R thực tế có xứng đáng không? Entry-SL có ít nhất 0.5% không?",
+        "4. Điều gì có thể làm setup fail nhanh nhất?",
+        "5. Còn điều gì trong dữ liệu mà bạn cho là quan trọng nhưng chưa được đề cập?",
+    ],
+    "fundamental_filter": [
+        "1. Định giá hiện tại rẻ/đắt so với peers?",
+        "2. ML signal đang nghiêng về Bull/Bear vì factor nào?",
+        "3. Seasonality có ủng hộ vào lệnh lúc này không?",
+        "4. Còn điều gì trong dữ liệu mà bạn cho là quan trọng nhưng chưa được đề cập?",
+    ],
 }
 
 
 def _build_intelligence_brief(expert: dict, td: dict) -> str:
     """
-    Tạo "Báo cáo Tình báo" cho từng chuyên gia.
+    Tạo BẢN TIN TÌNH BÁO cho từng chuyên gia.
 
-    Thay vì dump thô engine detail, hàm này:
-    1. Đọc TOÀN BỘ detail (không cắt 280 ký tự) của các skill liên quan
-    2. Cấu trúc thành sections có nhãn rõ ràng
-    3. Thêm signal verdict của từng skill
-    4. Thêm "Câu hỏi dẫn dắt" cuối brief để LLM biết phải tìm gì
-    5. Thêm cross-reference: skill khác nói gì về context liên quan
+    Cấu trúc mỗi section:
+      ▸ [LABEL]  → [SIGNAL]  (Nguồn: SkillName)
+        [Full detail — không cắt, đã filter giá ngoài biên]
 
-    Kết quả: LLM nhận được "nhiên liệu" thực sự thay vì số thô.
+    Cuối brief:
+      ▸ THAM CHIẾU CHÉO: signal tóm tắt từ skills khác
+      ▸ CÂU HỎI DẪN DẮT: 4-5 câu hỏi bắt buộc + 1 câu hỏi mở
     """
-    price   = td["price"]
-    lo8     = price * 0.92
-    hi8     = price * 1.08
     PLACEHOLDER = "[Dữ liệu ngoài phạm vi, yêu cầu bỏ qua]"
 
-    def _get_detail(sk: str) -> str:
-        """Lấy full detail — không cắt — chỉ filter giá ngoài biên."""
-        raw = td["engine_details"].get(sk, "").strip()
-        if not raw or len(raw) < 5:
-            return ""
-        # Kiểm tra xem có bị sanitize nặng không
-        ph_ratio = raw.count(PLACEHOLDER) / max(len(raw.split()), 1)
-        if ph_ratio > 0.4:
-            return ""  # quá nhiều giá bị lọc → không dùng
-        return raw  # trả về FULL, không cắt ở đây
-
     def _sig_label(sk: str) -> str:
-        sig = td["signals"].get(sk, None)
+        sig = td["signals"].get(sk)
         if sig is None: return ""
-        if sig > 0:  return "  → 🟢 BULLISH SIGNAL"
-        if sig < 0:  return "  → 🔴 BEARISH SIGNAL"
-        return "  → ⚪ NEUTRAL"
+        if sig > 0:  return "🟢 BULLISH"
+        if sig < 0:  return "🔴 BEARISH"
+        return "⚪ NEUTRAL"
 
-    # ── Build sections cho skills của expert ──────────────────────────
+    def _get_detail(sk: str) -> str:
+        raw = td["engine_details"].get(sk, "").strip()
+        if len(raw) < 5:
+            return ""
+        # Bỏ qua nếu quá nhiều placeholder (> 40% words)
+        ph = raw.count(PLACEHOLDER)
+        if ph / max(len(raw.split()), 1) > 0.40:
+            return ""
+        return raw   # full, không cắt ở đây
+
+    # ── Sections chính ─────────────────────────────────────────────
     sections = []
-    empty_skills = []
-
+    no_data  = []
     for sk in expert["skill_keys"]:
         detail  = _get_detail(sk)
-        label   = _SKILL_SECTIONS.get(sk, f"[{sk}]")
-        sig_lbl = _sig_label(sk)
-
+        label   = _SKILL_SECTIONS.get(sk, sk)
+        sig     = _sig_label(sk)
+        # Nguồn gốc ghi rõ để LLM có thể đối chiếu
+        src_tag = f"(Nguồn: {sk})"
         if detail:
             sections.append(
-                f"\u25b8 {label}{sig_lbl}\n  {detail}"
+                f"  ▸ {label}  →  {sig}  {src_tag}\n"
+                f"    {detail}"
             )
         else:
-            empty_skills.append(f"{label} (khong co du lieu)")
+            no_data.append(f"{label}")
 
-    # ── Cross-reference: thêm signals từ skills KHÁC có liên quan ────
-    # Ví dụ: TA được biết signal của SMC để phản biện
-    cross_ref_map = {
-        "tech_analyst":     ["SMC", "Harmonic", "MultiFactor"],
-        "smc_trader":       ["TechnicalBasic", "ElliottWave", "Chanlun"],
-        "macro_strategist": ["FundamentalFilter", "Volatility"],
-        "risk_manager":     ["SMC", "TechnicalBasic", "MarketRegime"],
-        "fundamental_filter": ["MarketRegime", "TechnicalBasic", "MLStrategy"],
-    }
-    cross_skills = cross_ref_map.get(expert["id"], [])
-    cross_lines  = []
-    for csk in cross_skills:
-        if csk in expert["skill_keys"]: continue   # đã có trong sections chính
-        sig = td["signals"].get(csk, None)
-        if sig is None: continue
-        em = "🟢" if sig > 0 else "🔴" if sig < 0 else "⚪"
-        # Lấy 1 câu đầu từ detail nếu có
+    # ── Tham chiếu chéo từ skills khác ─────────────────────────────
+    cross_lines = []
+    for csk in _CROSS_REF.get(expert["id"], []):
+        if csk in expert["skill_keys"]:
+            continue
+        sig = _sig_label(csk)
+        if not sig:
+            continue
         cdetail = _get_detail(csk)
         snippet = ""
         if cdetail:
-            first_line = cdetail.split("\n")[0].strip()
-            snippet = f": {first_line[:100]}" if first_line else ""
+            first = cdetail.split("\n")[0].strip()
+            snippet = f": {first[:120]}" if first else ""
         cross_lines.append(
-            f"  {em} {_SKILL_SECTIONS.get(csk, csk)}{snippet}"
+            f"    {sig}  {_SKILL_SECTIONS.get(csk, csk)}{snippet}  (Nguồn: {csk})"
         )
 
-    # ── Action plan từ /check ─────────────────────────────────────────
-    tp_c  = td["tp_check"]
-    sl_c  = td["sl_check"]
-    en_c  = td["entry_check"]
-    plan_str = ""
-    if any(x > 0 for x in [tp_c, sl_c, en_c]):
-        plan_str = (
-            f"\n▸ ACTION PLAN TỪ /CHECK\n"
-            f"  Entry={en_c:,.0f}  SL={sl_c:,.0f}  TP={tp_c:,.0f}"
-        )
+    # ── Câu hỏi dẫn dắt ────────────────────────────────────────────
+    questions = _GUIDING_Q.get(expert["id"], [
+        "1. Dữ liệu trên hàm ý gì về xu hướng?",
+        "2. Còn điều gì trong dữ liệu mà bạn cho là quan trọng nhưng chưa được đề cập?",
+    ])
 
-    # ── Câu hỏi dẫn dắt theo từng expert ─────────────────────────────
-    guiding_questions = {
-        "tech_analyst": (
-            "\n▸ CÂU HỎI DẪN DẮT (phải trả lời trong NARRATIVE):\n"
-            "  1. Xu hướng ngắn hạn (MA20/MA50) và trung hạn (Ichimoku) đang đồng thuận hay mâu thuẫn?\n"
-            "  2. RSI và MACD hist đang kể câu chuyện gì về đà tăng/giảm?\n"
-            "  3. Mẫu nến gần nhất xác nhận hay phủ định xu hướng?\n"
-            "  4. Volume có xác nhận move giá không?"
-        ),
-        "smc_trader": (
-            "\n▸ CÂU HỎI DẪN DẮT (phải trả lời trong NARRATIVE):\n"
-            "  1. Cấu trúc thị trường: đang trong Higher High/Higher Low hay ngược lại?\n"
-            "  2. Có BOS hay ChoCH gần đây không? Ý nghĩa là gì?\n"
-            "  3. FVG hoặc Order Block gần nhất ở đâu? Giá đã về test chưa?\n"
-            "  4. Tổ chức đang accumulate hay distribute tại vùng giá hiện tại?"
-        ),
-        "macro_strategist": (
-            "\n▸ CÂU HỎI DẪN DẪN DẮT (phải trả lời trong NARRATIVE):\n"
-            "  1. Market regime hiện tại tạo 'gió xuôi' hay 'gió ngược' cho mã này?\n"
-            "  2. Tin tức headline gần nhất tác động thế nào đến sentiment ngành?\n"
-            "  3. Yếu tố vĩ mô nào (lãi suất, tỷ giá, hàng hóa) đang thống trị?"
-        ),
-        "risk_manager": (
-            "\n▸ CÂU HỎI DẪN DẮT (phải trả lời trong NARRATIVE):\n"
-            "  1. ATR và BB width nói gì về độ biến động hiện tại?\n"
-            "  2. SL hợp lý nhất đặt ở đâu (S1 hay ATR×1.5)? Khoảng cách % là bao nhiêu?\n"
-            "  3. R:R thực tế là bao nhiêu? Có xứng đáng không?\n"
-            "  4. Điều gì có thể làm setup fail nhanh nhất?"
-        ),
-        "fundamental_filter": (
-            "\n▸ CÂU HỎI DẪN DẮT (phải trả lời trong NARRATIVE):\n"
-            "  1. Định giá hiện tại rẻ/đắt so với peers?\n"
-            "  2. ML signal đang nghiêng về Bull/Bear vì factor nào?\n"
-            "  3. Seasonality có ủng hộ vào lệnh lúc này không?"
-        ),
-    }
-    guiding = guiding_questions.get(expert["id"], "")
-
-    # ── Assemble brief ────────────────────────────────────────────────
-    lines = [
-        f"╔══ BẢN TIN TÌNH BÁO: {td['symbol']} — {expert['role'].upper()} ══╗",
+    # ── Assemble ────────────────────────────────────────────────────
+    parts = [
+        f"╔══ BẢN TIN TÌNH BÁO [{td['symbol']}] — {expert['role'].upper()} ══╗",
     ]
 
     if sections:
-        lines.append("\n" + "\n\n".join(sections))
+        parts.append("\n" + "\n\n".join(sections))
     else:
-        lines.append("  ⚠️ Không có dữ liệu từ các skill liên quan.")
+        parts.append("  ⚠️ Không có dữ liệu từ skill liên quan — ghi 'không đủ dữ liệu'.")
 
-    if empty_skills:
-        lines.append(f"\n▸ SKILL KHÔNG CÓ DỮ LIỆU: {', '.join(empty_skills)}")
+    if no_data:
+        parts.append(f"\n  ▸ KHÔNG CÓ DỮ LIỆU: {', '.join(no_data)}")
 
     if cross_lines:
-        lines.append("\n▸ THAM CHIẾU CHÉO (từ skills khác):")
-        lines.extend(cross_lines)
+        parts.append("\n  ▸ THAM CHIẾU CHÉO (từ skills khác của hội đồng):\n" + "\n".join(cross_lines))
 
-    lines.append(plan_str)
-    lines.append(guiding)
-    lines.append(f"\n╚══ HẾT BẢN TIN TÌNH BÁO ══╝")
+    if td.get("tp_check", 0) or td.get("sl_check", 0):
+        parts.append(
+            f"\n  ▸ ACTION PLAN TỪ /CHECK\n"
+            f"    Entry={td['entry_check']:,.0f}  "
+            f"SL={td['sl_check']:,.0f}  "
+            f"TP={td['tp_check']:,.0f}"
+        )
 
-    return "\n".join(lines)
+    parts.append(
+        "\n  ▸ CÂU HỎI DẪN DẮT (PHẢI trả lời đủ trong NARRATIVE):\n"
+        + "\n".join(f"    {q}" for q in questions)
+    )
+
+    parts.append("╚══ HẾT BẢN TIN TÌNH BÁO ══╝")
+    return "\n".join(parts)
 
 def _build_round1_prompt(
     expert: dict, data_block: str, skill_block: str, td: dict
 ) -> tuple[str, str]:
-    # Tạo Intelligence Brief — thay thế skill_block
     intel_brief = _build_intelligence_brief(expert, td)
     price    = td["price"]
     price_lo = round(price * (1 - PRICE_BAND_PCT), 0)
@@ -868,10 +858,9 @@ def _build_round1_prompt(
     system = (
         f"Bạn là {expert['role']} trong Hội đồng Chuyên gia Phân tích Cổ phiếu VN.\n"
         f"{expert['focus']}\n\n"
-        "PHƯƠNG PHÁP LÀM VIỆC: Bạn sẽ nhận được một BẢN TIN TÌNH BÁO chứa toàn bộ\n"
-        "dữ liệu kỹ thuật từ 16 skills đã được xử lý và phân loại theo lĩnh vực của bạn.\n"
-        "Hãy phân tích DỰA TRÊN BẢN TIN ĐÓ — không cần và không được tự suy diễn\n"
-        "dữ liệu ngoài những gì được cung cấp trong bản tin.\n\n"
+        "PHƯƠNG PHÁP: Bạn nhận được BẢN TIN TÌNH BÁO chứa dữ liệu từ 16 skills.\n"
+        "Phân tích DỰA TRÊN bản tin — không tự suy diễn số liệu ngoài bản tin.\n"
+        "Trả lời ĐỦ các CÂU HỎI DẪN DẮT cuối bản tin trong phần NARRATIVE.\n\n"
         "═══ QUY TẮC BẮT BUỘC ═══\n"
         "1. ĐỌC KỸ SKILL DETAILS → dẫn chứng số liệu cụ thể (tên chỉ báo + giá trị).\n"
         "   VÍ DỤ TỐT: 'RSI=62 tiếp cận vùng quá mua, MACD hist=+0.0032 tăng 3 phiên'\n"
@@ -902,9 +891,9 @@ def _build_round1_prompt(
         f"Phân tích {td['symbol']} từ góc nhìn {expert['role']}.\n\n"
         f"{data_block}\n\n"
         f"{intel_brief}\n\n"
-        "Phân tích DỰA TRÊN BẢN TIN TÌNH BÁO ở trên. "
-        "Mỗi nhận định phải trích dẫn tên skill và số liệu cụ thể. "
-        "Trả lời đủ các CÂU HỎI DẪN DẮT trong bản tin. "
+        "Hãy phân tích DỰA TRÊN BẢN TIN TÌNH BÁO trên. "
+        "Trích dẫn tên skill và số liệu cụ thể khi lập luận. "
+        "Trả lời đủ CÂU HỎI DẪN DẮT trong NARRATIVE. "
         "Tính R:R từ ATR và S/R. R:R < 1.5 → BẮT BUỘC THEO DOI."
     )
     return system, user
