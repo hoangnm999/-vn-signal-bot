@@ -1256,46 +1256,72 @@ def _fix_entry_trigger(data: dict, td: dict) -> dict:
     mà entry < X → đặt entry = X, scale SL/TP giữ nguyên delta, tính lại R:R.
     Tương tự scenario_sell với "phá/breakdown/dưới X".
     """
-    _BUY_PATS  = [r"vượt\s+([\d,\.]+)", r"breakout\s+([\d,\.]+)",
-                  r"break\s+([\d,\.]+)", r"\bqua\s+([\d,\.]+)", r">\s*([\d,\.]+)"]
-    _SELL_PATS = [r"phá\s+([\d,\.]+)",  r"breakdown\s+([\d,\.]+)",
-                  r"dưới\s+([\d,\.]+)", r"<\s*([\d,\.]+)"]
+    # Pattern BUY: bắt số giá sau các từ khóa breakout — kể cả có từ trung gian
+    # "breakout trên 74.5", "vượt mức 75", "break qua 76.5", "giá > 75"
+    # Dùng [\w\s]{0,10} để cho phép tối đa 10 ký tự trung gian trước số
+    _BUY_PATS  = [
+        r"vượt(?:\s+\w+){0,4}\s+([\d,\.]+)",       # "vượt 75", "vượt mức kháng cự 75.5"
+        r"breakout(?:\s+\w+){0,2}\s+([\d,\.]+)",    # "breakout 75", "breakout trên 74.5"
+        r"\bbreak(?:\s+\w+){0,2}\s+([\d,\.]+)",     # "break qua 76"
+        r"\bqua\s+([\d,\.]+)",                       # "qua 75"
+        r"trên\s+([\d,\.]+)",                        # "trên 74.5"
+        r"above\s+([\d,\.]+)",                       # "above 75"
+        r"close\s*>\s*([\d,\.]+)",                   # "close > 75"
+        r"giá\s*>\s*([\d,\.]+)",                     # "giá > 75"
+    ]
+    _SELL_PATS = [
+        r"phá(?:\s+\w+){0,4}\s+([\d,\.]+)",         # "phá 70", "phá vỡ hỗ trợ 70"
+        r"breakdown(?:\s+\w+){0,2}\s+([\d,\.]+)",   # "breakdown 70"
+        r"dưới\s+([\d,\.]+)",                        # "dưới 70"
+        r"below\s+([\d,\.]+)",                       # "below 70"
+        r"close\s*<\s*([\d,\.]+)",                   # "close < 70"
+        r"giá\s*<\s*([\d,\.]+)",                     # "giá < 70"
+    ]
 
-    def _find_trigger_price(text: str, patterns: list) -> float:
+    def _find_trigger_price(text: str, patterns: list, ref_price: float) -> float:
+        """
+        Tìm giá trigger từ text. Trả về số hợp lệ gần ref_price nhất.
+        Lọc nhiễu: bỏ qua số quá nhỏ (volume ratio, RSI...) hoặc quá lớn.
+        """
+        candidates = []
         for pat in patterns:
-            m = re.search(pat, text.lower())
-            if m:
+            for m in re.finditer(pat, text.lower()):
                 try:
                     v = float(m.group(1).replace(",", ""))
-                    if v > 0:
-                        return v
+                    # Lọc: số phải trong ±40% ref_price để tránh nhầm volume/RSI
+                    if v > 0 and ref_price * 0.60 <= v <= ref_price * 1.40:
+                        candidates.append(v)
                 except Exception:
                     pass
-        return 0.0
+        if not candidates:
+            return 0.0
+        # Ưu tiên số gần ref_price nhất
+        return min(candidates, key=lambda x: abs(x - ref_price))
 
     def _rescale(sc: dict, new_entry: float) -> dict:
+        """Scale SL/TP giữ nguyên delta từ entry cũ, tính lại R:R."""
         old_entry = _safe_float(sc.get("entry", 0))
         sl        = _safe_float(sc.get("sl",    0))
         tp1       = _safe_float(sc.get("tp1",   sc.get("tp", 0)))
         tp2       = _safe_float(sc.get("tp2",   0))
         if old_entry <= 0:
-            sc["entry"] = round(new_entry, 0)
+            sc["entry"] = new_entry  # giữ decimal (74.5 không round thành 74)
             return sc
         delta_sl  = old_entry - sl  if sl  > 0 else 0
         delta_tp1 = tp1 - old_entry if tp1 > 0 else 0
         delta_tp2 = tp2 - old_entry if tp2 > 0 else 0
-        sc["entry"] = round(new_entry, 0)
-        if delta_sl  > 0: sc["sl"]  = round(new_entry - delta_sl,  0)
-        if delta_tp1 > 0: sc["tp1"] = round(new_entry + delta_tp1, 0)
-        if delta_tp2 > 0: sc["tp2"] = round(new_entry + delta_tp2, 0)
+        sc["entry"] = new_entry      # giữ nguyên decimal
+        if delta_sl  > 0: sc["sl"]  = round(new_entry - delta_sl,  1)
+        if delta_tp1 > 0: sc["tp1"] = round(new_entry + delta_tp1, 1)
+        if delta_tp2 > 0: sc["tp2"] = round(new_entry + delta_tp2, 1)
         # Tính lại R:R
         new_sl  = _safe_float(sc.get("sl",  0))
         new_tp1 = _safe_float(sc.get("tp1", sc.get("tp", 0)))
-        if new_sl > 0 and new_tp1 > 0 and abs(new_entry - new_sl) > 1:
+        if new_sl > 0 and new_tp1 > 0 and abs(new_entry - new_sl) > 0.5:
             sc["rr"] = round(abs(new_tp1 - new_entry) / abs(new_entry - new_sl), 2)
         logger.info(
-            f"[EntryTriggerFix] entry {old_entry:.0f}→{new_entry:.0f} "
-            f"sl={sc.get('sl',0):.0f} tp1={sc.get('tp1',0):.0f} rr={sc.get('rr',0):.2f}"
+            f"[EntryTriggerFix] entry {old_entry:.1f}→{new_entry:.1f} "
+            f"sl={sc.get('sl',0):.1f} tp1={sc.get('tp1',0):.1f} rr={sc.get('rr',0):.2f}"
         )
         return sc
 
@@ -1305,7 +1331,7 @@ def _fix_entry_trigger(data: dict, td: dict) -> dict:
     if sc_b:
         trigger  = str(sc_b.get("trigger", "")).strip()
         entry    = _safe_float(sc_b.get("entry", 0))
-        t_price  = _find_trigger_price(trigger, _BUY_PATS)
+        t_price  = _find_trigger_price(trigger, _BUY_PATS, price)
         if t_price > 0 and entry > 0 and entry < t_price and _price_in_band(t_price, price):
             data["scenario_buy"] = _rescale(sc_b, t_price)
 
@@ -1313,7 +1339,7 @@ def _fix_entry_trigger(data: dict, td: dict) -> dict:
     if sc_s:
         trigger  = str(sc_s.get("trigger", "")).strip()
         entry    = _safe_float(sc_s.get("entry", 0))
-        t_price  = _find_trigger_price(trigger, _SELL_PATS)
+        t_price  = _find_trigger_price(trigger, _SELL_PATS, price)
         if t_price > 0 and entry > 0 and entry > t_price and _price_in_band(t_price, price):
             data["scenario_sell"] = _rescale(sc_s, t_price)
 
