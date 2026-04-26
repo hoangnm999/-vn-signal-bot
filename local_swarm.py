@@ -664,11 +664,7 @@ def _get_skill_block(expert: dict, td: dict) -> str:
     """
     Trích skill details theo từng chuyên gia — đầy đủ, có label rõ ràng.
     Nếu engine không có detail → ghi rõ 'không có dữ liệu'.
-    Nếu detail có nhiều giá bị đánh dấu [~xxx] → cảnh báo rõ để LLM không tự suy diễn.
     """
-    price    = td["price"]
-    price_lo = round(price * (1 - PRICE_BAND_PCT), 0)
-    price_hi = round(price * (1 + PRICE_BAND_PCT), 0)
     lines = []
     for sk in expert["skill_keys"]:
         detail = td["engine_details"].get(sk, "").strip()
@@ -677,23 +673,45 @@ def _get_skill_block(expert: dict, td: dict) -> str:
         if signal is not None:
             sig_em = " [🟢 BUY]" if signal > 0 else " [🔴 SELL]" if signal < 0 else " [⚪ NEU]"
         if detail and len(detail) > 10:
-            # Đếm số giá bị đánh dấu ngoài biên
-            out_of_band_count = len(re.findall(r"\[~[\d,]+\]", detail))
-            if out_of_band_count >= 2:
-                warn = (
-                    f"\n    ⚠️ CẢNH BÁO: {out_of_band_count} mức giá trong detail này "
-                    f"nằm NGOÀI biên hợp lệ [{price_lo:,.0f}–{price_hi:,.0f}] "
-                    f"(đánh dấu [~xxx]). KHÔNG dùng các số đó. "
-                    f"Nếu không còn dữ liệu hợp lệ, ghi 'không đủ dữ liệu {sk}'."
-                )
-                lines.append(f"  [{sk}]{sig_em}:\n    {detail[:280]}{warn}")
-            else:
-                lines.append(f"  [{sk}]{sig_em}:\n    {detail[:280]}")
+            lines.append(f"  [{sk}]{sig_em}:\n    {detail[:280]}")
         else:
-            lines.append(
-                f"  [{sk}]{sig_em}: "
-                f"(không có detail từ engine này — ghi 'không đủ dữ liệu {sk}')"
-            )
+            lines.append(f"  [{sk}]{sig_em}: (không có detail từ engine này)")
+    return "\n".join(lines)
+
+
+def _build_price_anchor(td: dict) -> str:
+    """
+    Block neo giá cứng — liệt kê MỌI mức giá hợp lệ.
+    Đây là nguồn duy nhất LLM được phép lấy số giá.
+    """
+    price    = td["price"]
+    price_lo = round(price * (1 - PRICE_BAND_PCT), 0)
+    price_hi = round(price * (1 + PRICE_BAND_PCT), 0)
+    sr       = td["sr_levels"]
+
+    valid_prices = []
+    for s in sr["support"][:3]:
+        valid_prices.append(f"  Hỗ trợ  : {s['price']:,.0f}  ({s['dist_pct']:+.1f}%)  — {s['reason']}")
+    for r in sr["resistance"][:3]:
+        valid_prices.append(f"  Kháng cự: {r['price']:,.0f}  ({r['dist_pct']:+.1f}%)  — {r['reason']}")
+    if td["tp_check"] > 0:
+        valid_prices.append(f"  TP /check: {td['tp_check']:,.0f}")
+    if td["sl_check"] > 0:
+        valid_prices.append(f"  SL /check: {td['sl_check']:,.0f}")
+    if td["entry_check"] > 0 and td["entry_check"] != price:
+        valid_prices.append(f"  Entry /check: {td['entry_check']:,.0f}")
+
+    lines = [
+        f"╔══ NEO GIÁ CỨNG — {td['symbol']} ══╗",
+        f"  Giá hiện tại : {price:,.0f} VND",
+        f"  Biên hợp lệ  : [{price_lo:,.0f} – {price_hi:,.0f}]  (±{PRICE_BAND_PCT*100:.0f}%)",
+        f"  MA20={td['ma20']:,.0f}  |  BB_Upper={td['bb_upper']:,.0f}  |  BB_Lower={td['bb_lower']:,.0f}",
+        "  Mức giá kỹ thuật hợp lệ:",
+    ] + valid_prices + [
+        f"╚══ TUYỆT ĐỐI CHỈ DÙNG CÁC SỐ TRÊN ══╝",
+        f"  ❌ VÍ DỤ SAI: 'biên độ [52–96]' khi giá hiện tại={price:,.0f}",
+        f"  ✅ VÍ DỤ ĐÚNG: 'Entry={round(price*0.99,0):,.0f}, SL={sr['support'][0]['price']:,.0f}'",
+    ]
     return "\n".join(lines)
 
 
@@ -703,6 +721,7 @@ def _build_round1_prompt(
     price    = td["price"]
     price_lo = round(price * (1 - PRICE_BAND_PCT), 0)
     price_hi = round(price * (1 + PRICE_BAND_PCT), 0)
+    price_anchor = _build_price_anchor(td)
 
     system = (
         f"Bạn là {expert['role']} trong Hội đồng Chuyên gia Phân tích Cổ phiếu VN.\n"
@@ -717,7 +736,13 @@ def _build_round1_prompt(
         "5. Chỉ phân tích theo trường phái của mình — không lấn sang trường phái khác.\n"
         f"6. ⚠️ RÀNG BUỘC GIÁ CỨNG: Mọi giá đề xuất PHẢI trong [{price_lo:,.0f}–{price_hi:,.0f}].\n"
         f"   Số có dấu [~xxx] trong Skill Details = giá ngoài biên, TUYỆT ĐỐI KHÔNG dùng.\n"
-        "7. KHÔNG tự suy diễn giá không có trong dữ liệu — nếu thiếu, ghi 'không đủ thông tin'.\n\n"
+        "7. NGUỒN GIÁ DUY NHẤT: Chỉ sử dụng các mức giá được cung cấp trong "
+        "technical_data (NEO GIÁ CỨNG bên dưới). Nếu không có dữ liệu hợp lệ, "
+        "ghi 'không đủ dữ liệu'. "
+        f"TUYỆT ĐỐI không tự tạo ra mức giá như {round(price*0.70,0):,.0f} hay "
+        f"{round(price*1.30,0):,.0f} — đây là ví dụ giá NGOÀI BIÊN bị cấm.\n"
+        "8. Lập luận phải NHẤT QUÁN: nếu bạn dùng ATR/BB width → giá phải phù hợp "
+        "với ATR/BB đó. Không thể vừa nói 'BB width=3.5%' vừa đề xuất biên độ >30%.\n\n"
         "═══ ĐỊNH DẠNG ĐẦU RA (theo đúng thứ tự) ═══\n"
         "STANCE: [MUA/BAN/THEO DOI]\n"
         "SCORE: [-5..+5]\n"
@@ -736,9 +761,10 @@ def _build_round1_prompt(
     user = (
         f"Phân tích {td['symbol']} từ góc nhìn {expert['role']}.\n\n"
         f"{data_block}\n\n"
+        f"{price_anchor}\n\n"
         f"═══ SKILL DETAILS CHO {expert['role'].upper()} ═══\n"
         f"{skill_block}\n\n"
-        "Phân tích DỰA TRÊN SKILL DETAILS trên. "
+        "NHẮC LẠI: Chỉ dùng giá trong NEO GIÁ CỨNG ở trên. "
         "Mỗi điểm phải có số liệu cụ thể. "
         "Tính R:R thực tế từ ATR và S/R. R:R < 1.5 → BẮT BUỘC THEO DOI."
     )
@@ -773,7 +799,9 @@ def _build_round2_prompt(
         "3. Ghi rõ: đồng ý với ai (điểm gì cụ thể).\n"
         "4. Nếu Risk Manager chỉ ra R:R < 1.5 → BẮT BUỘC điều chỉnh stance.\n"
         "5. Cập nhật SCORE nếu quan điểm thay đổi.\n"
-        f"6. ⚠️ GIÁ PHẢI trong [{price_lo:,.0f}–{price_hi:,.0f}]. Số [~xxx] = ngoài biên, KHÔNG dùng.\n\n"
+        f"6. ⚠️ GIÁ PHẢI trong [{price_lo:,.0f}–{price_hi:,.0f}]. Số [~xxx] = ngoài biên, KHÔNG dùng.\n"
+        "7. NGUỒN GIÁ DUY NHẤT: chỉ dùng mức giá trong NEO GIÁ CỨNG ở user prompt. "
+        "Không tự bịa giá — nếu thiếu ghi 'không đủ dữ liệu'.\n\n"
         "═══ ĐỊNH DẠNG ═══\n"
         "STANCE: [MUA/BAN/THEO DOI]\n"
         "SCORE: [-5..+5]\n"
@@ -791,8 +819,9 @@ def _build_round2_prompt(
         f"Lý do: {own_r1.key_points[0] if own_r1.key_points else 'N/A'}\n\n"
         f"═══ Ý KIẾN VÒNG 1 CỦA CÁC EXPERTS KHÁC ═══\n"
         + "\n".join(others) +
-        f"\n\n═══ SKILL CỦA BẠN (tóm tắt) ═══\n{skill_block[:450]}\n\n"
-        "Cập nhật stance với dẫn chứng số liệu. "
+        f"\n\n{_build_price_anchor(td)}\n\n"
+        f"═══ SKILL CỦA BẠN (tóm tắt) ═══\n{skill_block[:450]}\n\n"
+        "Cập nhật stance với dẫn chứng số liệu. Chỉ dùng giá trong NEO GIÁ CỨNG. "
         "R:R < 1.5 → đổi THEO DOI. "
         "Phản biện ít nhất 1 expert đối lập."
     )
@@ -820,7 +849,9 @@ def _build_round3_prompt(
         "2. Đề xuất kịch bản cụ thể nhất: Entry/SL/TP rõ ràng.\n"
         "3. Nêu 1 rủi ro quan trọng mà experts khác CHƯA đề cập.\n"
         "4. Viết KEY_TAKEAWAY 1-2 câu — số liệu cụ thể, súc tích.\n"
-        f"5. ⚠️ Mọi giá PHẢI trong [{price_lo:,.0f}–{price_hi:,.0f}]. Số [~xxx] = KHÔNG dùng.\n\n"
+        f"5. ⚠️ Mọi giá PHẢI trong [{price_lo:,.0f}–{price_hi:,.0f}]. Số [~xxx] = KHÔNG dùng.\n"
+        "6. NGUỒN GIÁ DUY NHẤT: chỉ dùng mức giá trong NEO GIÁ CỨNG ở user prompt. "
+        "Không tự bịa giá — nếu thiếu ghi 'không đủ dữ liệu'.\n\n"
         "═══ ĐỊNH DẠNG NGẮN GỌN ═══\n"
         "STANCE: [MUA/BAN/THEO DOI]\n"
         "SCORE: [-5..+5]\n"
@@ -834,7 +865,8 @@ def _build_round3_prompt(
     user = (
         f"Vòng 2 của bạn: {own_r2.stance} (Score={own_r2.score:+d}, Conf={own_r2.confidence}%)\n"
         f"Experts vòng 2: {' | '.join(others)}\n\n"
-        "Xác nhận kịch bản cuối. "
+        f"{_build_price_anchor(td)}\n\n"
+        "Xác nhận kịch bản cuối. Chỉ dùng giá trong NEO GIÁ CỨNG. "
         "R:R = (TP-Entry)/(Entry-SL). "
         "R:R < 1.5 → THEO DOI."
     )
@@ -1136,42 +1168,6 @@ def _parse_expert_response(expert: dict, raw: str, round_num: int) -> ExpertOpin
 
         elif l.startswith("- ") and len(key_points) < 6:
             key_points.append(l[2:].strip()[:160])
-
-    # ── Fix 2: Entry/Trigger nhất quán ─────────────────────────────────────
-    # Nếu trigger nói "vượt X" / "breakout X" mà entry < X → entry = X, scale SL/TP
-    if entry > 0 and sl > 0 and tp > 0 and stance == "MUA":
-        trigger_text = " ".join(kp for kp in key_points if "Trigger:" in kp).lower()
-        trigger_price = 0.0
-        for pat in [
-            r"vượt\s+([\d,\.]+)",
-            r"breakout\s+([\d,\.]+)",
-            r"break\s+([\d,\.]+)",
-            r"qua\s+([\d,\.]+)",
-            r">\s*([\d,\.]+)",
-        ]:
-            m_t = re.search(pat, trigger_text)
-            if m_t:
-                try:
-                    trigger_price = float(m_t.group(1).replace(",", ""))
-                except Exception:
-                    pass
-                if trigger_price > 0:
-                    break
-
-        if trigger_price > 0 and entry < trigger_price:
-            old_entry = entry
-            delta_sl  = old_entry - sl
-            delta_tp  = tp - old_entry
-            entry     = trigger_price
-            sl        = max(entry - delta_sl, entry * 0.85)
-            tp        = entry + delta_tp
-            logger.info(
-                f"[EntryTriggerFix] {expert['id']} entry {old_entry:.0f}→{entry:.0f} "
-                f"(trigger={trigger_price:.0f}), sl={sl:.0f}, tp={tp:.0f}"
-            )
-            key_points.append(
-                f"[Auto-fix] Entry {old_entry:,.0f}→{entry:,.0f} theo trigger vượt {trigger_price:,.0f}"
-            )
 
     # Kiểm tra spread bất thường (giá nhầm mã)
     if entry > 0 and sl > 0 and tp > 0:
@@ -1588,12 +1584,12 @@ class SwarmOrchestrator:
 
         stances_final = [op.stance for op in r3]
         scores_final  = [op.score  for op in r3]
-        # Fix 3: Vote Split dựa trên score thực tế (score>0=Bull, <0=Bear, =0=Neutral)
-        # Tránh mâu thuẫn: risk_manager score=-1 nhưng ghi 0 Bear
-        vote_bull    = sum(1 for op in r3 if op.score > 0)
-        vote_bear    = sum(1 for op in r3 if op.score < 0)
-        vote_neutral = sum(1 for op in r3 if op.score == 0)
-        n_exp        = max(len(r3), 1)
+        # Vote Split dựa trên score thực tế: score>0=Bull, <0=Bear, =0=Neutral
+        # Tránh mâu thuẫn: expert có score=-1 nhưng stance=THEO DOI vẫn tính Bear
+        vote_bull     = sum(1 for op in r3 if op.score > 0)
+        vote_bear     = sum(1 for op in r3 if op.score < 0)
+        vote_neutral  = sum(1 for op in r3 if op.score == 0)
+        n_exp         = max(len(r3), 1)
 
         final_score = _safe_float(
             mod_data.get("final_score", sum(scores_final) / max(len(scores_final), 1))
@@ -1675,7 +1671,7 @@ class SwarmOrchestrator:
 
 _SEP  = "═" * 32
 _SEP2 = "─" * 32
-_LINE_WIDTH = 68   # giới hạn mỗi dòng cho Telegram mobile
+_LINE_WIDTH = 60   # giới hạn mỗi dòng cho Telegram mobile
 
 
 def _score_bar(score: float) -> str:
@@ -1689,14 +1685,10 @@ def _wrap(text: str, width: int = _LINE_WIDTH, indent: str = "") -> list[str]:
     """
     Wrap text thành các dòng không vượt quá width ký tự.
     Cắt tại dấu cách — không bao giờ cắt giữa từ.
-    Fix 4: join embedded newlines từ LLM trước khi wrap.
     """
     if not text:
         return []
-    # Xử lý embedded newlines: join thành 1 dòng phẳng trước khi wrap
-    text = " ".join(part.strip() for part in text.strip().split("\n") if part.strip())
-    if not text:
-        return []
+    text = text.strip()
     if len(text) <= width:
         return [indent + text]
 
@@ -1704,9 +1696,6 @@ def _wrap(text: str, width: int = _LINE_WIDTH, indent: str = "") -> list[str]:
     lines  = []
     cur    = ""
     for word in words:
-        # Bỏ qua word rỗng do nhiều dấu cách liên tiếp
-        if not word:
-            continue
         test = (cur + " " + word).strip()
         if len(test) <= width:
             cur = test
