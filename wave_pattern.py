@@ -49,14 +49,16 @@ logger = logging.getLogger(__name__)
 DATA_DIR          = pathlib.Path("data")
 WAVE_CACHE_SUFFIX = "_waves.json"
 CACHE_MAX_AGE_DAYS = 7        # rebuild nếu cache > 7 ngày
-ZIGZAG_MIN_PCT    = 5.0       # fallback nếu auto-tune thất bại (hạ từ 10→5)
+ZIGZAG_MIN_PCT    = 5.0       # fallback nếu auto-tune thất bại
+MAX_ZIGZAG_PCT    = 10.0      # giới hạn trên — sóng > 10% là super-cycle, không phải trading wave
 WAVE_TOP_PCT      = 30        # lấy top 30% sóng lớn nhất mỗi chiều
-TARGET_WAVES_MIN  = 10        # tối thiểu sóng mong muốn sau auto-tune (hạ từ 15→10)
+TARGET_WAVES_MIN  = 10        # tối thiểu sóng mong muốn sau auto-tune
 TARGET_WAVES_MAX  = 60        # tối đa — tránh noise
 MIN_WAVES         = 5         # tối thiểu sóng mỗi nhóm để phân tích
 WARN_WAVES        = 10        # cảnh báo mẫu thấp khi n_up hoặc n_down < ngưỡng này
+MIN_MEANINGFUL_SCORE = 0.25   # ngưỡng tối thiểu để verdict có ý nghĩa (nếu cả 2 < ngưỡng → KHONG RO)
 MIN_BARS_REQUIRED = 200       # tối thiểu bars lịch sử
-LOAD_DAYS         = 2000      # ~8 năm (tăng từ 1500 để có thêm mẫu sóng)
+LOAD_DAYS         = 2000      # ~8 năm
 
 # Labels thân thiện cho 15 dimensions
 DIM_LABEL = {
@@ -154,19 +156,24 @@ def _find_optimal_zigzag_pct(
         logger.debug(f"ZigZag tune {pct:.0f}%: {n_up}↑ {n_down}↓ → min={n_min}")
 
     # Chọn ngưỡng lớn nhất trong vùng [TARGET_WAVES_MIN, TARGET_WAVES_MAX]
+    # VÀ không vượt MAX_ZIGZAG_PCT (sóng > MAX% là super-cycle, không phải trading wave)
     for pct, n_min in results:  # đã sort desc → gặp cái đầu tiên đạt yêu cầu là tốt nhất
+        if pct > MAX_ZIGZAG_PCT:
+            continue  # bỏ qua ngưỡng quá lớn dù có đủ sóng
         if TARGET_WAVES_MIN <= n_min <= TARGET_WAVES_MAX:
             logger.info(f"ZigZag auto-tune: chon {pct:.0f}% → {n_min} waves/side")
             return pct
 
-    # Không có ngưỡng nào trong vùng lý tưởng
-    # → Chọn ngưỡng nhỏ nhất có sóng > TARGET_WAVES_MAX (nhiều sóng nhất có ý nghĩa)
+    # Không tìm được trong vùng lý tưởng dưới MAX_ZIGZAG_PCT
+    # → Chọn ngưỡng nhỏ nhất có sóng > TARGET_WAVES_MAX (vẫn dưới MAX_ZIGZAG_PCT)
     for pct, n_min in reversed(results):  # từ nhỏ → lớn
+        if pct > MAX_ZIGZAG_PCT:
+            continue
         if n_min > TARGET_WAVES_MAX:
             logger.info(f"ZigZag auto-tune (fallback many): {pct:.0f}% → {n_min} waves/side")
             return pct
 
-    # Fallback: chọn ngưỡng nhỏ nhất (nhiều sóng nhất), dù dưới TARGET_WAVES_MIN
+    # Fallback cuối: ngưỡng nhỏ nhất (nhiều sóng nhất), dù dưới TARGET_WAVES_MIN
     best_pct = min(candidates)
     best_n   = next((n for p, n in results if p == best_pct), 0)
     logger.warning(
@@ -414,17 +421,27 @@ def _zscore_membership(
     if not dist:
         return 0.0, []
 
-    total_score = 0.0
-    dim_zscores = []
+    total_score  = 0.0
+    max_possible = 0.0   # chỉ tính dims hợp lệ (không degenerate)
+    dim_zscores  = []
 
     for j, dim in enumerate(VECTOR_KEYS):
         if dim not in dist:
             continue
-        d     = dist[dim]
-        std   = d["std"] if d["std"] > 1e-6 else 0.01
-        z     = (float(current_vec[j]) - d["mean"]) / std
+        d   = dist[dim]
+        std = d["std"]
+
+        # Degenerate dimension: std≈0 nghĩa là tất cả mẫu bị clip tại 1 giá trị
+        # (thường gặp với momentum dims khi toàn bộ sóng bắt đầu từ vùng crash)
+        # → dimension này không có discriminating power → bỏ qua hoàn toàn
+        if std < 0.02:
+            dim_zscores.append((dim, float("nan")))
+            continue
+
+        z = (float(current_vec[j]) - d["mean"]) / std
         dim_zscores.append((dim, round(z, 2)))
 
+        max_possible += 1.5  # chỉ cộng max nếu dim hợp lệ
         if abs(z) <= 0.5:
             total_score += 1.5
         elif abs(z) <= 1.0:
@@ -434,11 +451,12 @@ def _zscore_membership(
         elif abs(z) > 2.0:
             total_score -= 0.5
 
-    max_score = len(VECTOR_KEYS) * 1.5
-    score = max(0.0, min(1.0, total_score / max_score))
+    if max_possible < 1e-6:
+        return 0.0, []
+    score = max(0.0, min(1.0, total_score / max_possible))
 
-    # Sort: |z| nhỏ nhất (điển hình nhất) lên đầu
-    dim_zscores.sort(key=lambda x: abs(x[1]))
+    # Sort: nan (degenerate) ra cuối, |z| nhỏ nhất lên đầu
+    dim_zscores.sort(key=lambda x: float("inf") if x[1] != x[1] else abs(x[1]))
 
     return round(score, 3), dim_zscores
 
@@ -740,7 +758,11 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
 
     # Verdict
     diff = score_up - score_down
-    if diff >= 0.08:
+    # Nếu cả 2 scores đều thấp → vector hiện tại là outlier so với cả 2 nhóm
+    # → không nên kết luận về chiều nào — đây là KHONG RO thực sự
+    if max(score_up, score_down) < MIN_MEANINGFUL_SCORE:
+        verdict = "KHONG RO"
+    elif diff >= 0.08:
         verdict = "SONG TANG"
     elif diff <= -0.08:
         verdict = "SONG GIAM"
@@ -946,26 +968,40 @@ def format_wave_report(result: dict) -> str:
     ]
 
     # ── Top 5 dimensions điển hình nhất với hiện tại ──────────────────────
-    # Hiển thị dims mà current_vec khớp nhất với sóng tăng (|z| nhỏ nhất)
+    # Filter: bỏ degenerate dims (z=nan), chỉ hiển thị dims hợp lệ
+    def _valid_dims(dim_z_list):
+        return [(d, z) for d, z in dim_z_list if z == z]  # z==z fails for nan
+
+    # Nếu cả 2 scores thấp → outlier situation → thông báo rõ
+    if max(score_up, score_down) < MIN_MEANINGFUL_SCORE:
+        lines += [
+            "⚠️  TRANG THAI HIEN TAI LA NGOAI LE (OUTLIER):",
+            "   Vector hien tai khong nam trong phan phoi cua ca 2 nhom.",
+            "   Day la trang thai chua tung xuat hien truoc song lon nao trong lich su.",
+            "",
+        ]
+
     if dim_z_up and verdict in ("SONG TANG", "KHONG RO"):
-        typical_up = [(dim, z) for dim, z in dim_z_up[:5]]
-        lines.append("DIMENSIONS DIEN HINH VOI SONG TANG (hien tai):")
-        for dim, z in typical_up:
-            lbl = DIM_LABEL.get(dim, dim)
-            j   = VECTOR_KEYS.index(dim) if dim in VECTOR_KEYS else -1
-            cur = f"{cur_vec[j]:+.2f}" if j >= 0 else "?"
-            lines.append(f"  {lbl:<18} hien tai={cur}  z={z:+.2f}")
-        lines.append("")
+        valid_up = _valid_dims(dim_z_up)[:5]
+        if valid_up:
+            lines.append("DIMENSIONS DIEN HINH VOI SONG TANG (hien tai):")
+            for dim, z in valid_up:
+                lbl = DIM_LABEL.get(dim, dim)
+                j   = VECTOR_KEYS.index(dim) if dim in VECTOR_KEYS else -1
+                cur = f"{cur_vec[j]:+.2f}" if j >= 0 else "?"
+                lines.append(f"  {lbl:<18} hien tai={cur}  z={z:+.2f}")
+            lines.append("")
 
     if dim_z_down and verdict in ("SONG GIAM", "KHONG RO"):
-        typical_down = [(dim, z) for dim, z in dim_z_down[:5]]
-        lines.append("DIMENSIONS DIEN HINH VOI SONG GIAM (hien tai):")
-        for dim, z in typical_down:
-            lbl = DIM_LABEL.get(dim, dim)
-            j   = VECTOR_KEYS.index(dim) if dim in VECTOR_KEYS else -1
-            cur = f"{cur_vec[j]:+.2f}" if j >= 0 else "?"
-            lines.append(f"  {lbl:<18} hien tai={cur}  z={z:+.2f}")
-        lines.append("")
+        valid_down = _valid_dims(dim_z_down)[:5]
+        if valid_down:
+            lines.append("DIMENSIONS DIEN HINH VOI SONG GIAM (hien tai):")
+            for dim, z in valid_down:
+                lbl = DIM_LABEL.get(dim, dim)
+                j   = VECTOR_KEYS.index(dim) if dim in VECTOR_KEYS else -1
+                cur = f"{cur_vec[j]:+.2f}" if j >= 0 else "?"
+                lines.append(f"  {lbl:<18} hien tai={cur}  z={z:+.2f}")
+            lines.append("")
 
     # ── Footer ────────────────────────────────────────────────────────────
     # Calibration note: dùng score và base_rate của verdict thực tế
