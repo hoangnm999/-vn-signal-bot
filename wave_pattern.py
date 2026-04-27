@@ -866,7 +866,8 @@ def format_wave_report(result: dict) -> str:
 
     # ── Đặc điểm sóng tăng ────────────────────────────────────────────────
     lines += [
-        f"DAU HIEN CHUNG CUA SONG TANG ({n_up} lan):",
+        f"TRANG THAI TAI DAY truoc song tang ({n_up} lan, ZigZag {zz_pct:.0f}%):",
+        f"  (Vector tai diem day chinh xac — ngay gia cham day roi tang >= {zz_pct:.0f}%)",
         "─" * 40,
         f"  {'Dimension':<18} {'Median':>7}  {'P25':>7}  {'P75':>7}",
         "  " + "-" * 38,
@@ -891,7 +892,8 @@ def format_wave_report(result: dict) -> str:
 
     # ── Đặc điểm sóng giảm ────────────────────────────────────────────────
     lines += [
-        f"DAU HIEN CHUNG CUA SONG GIAM ({n_down} lan):",
+        f"TRANG THAI TAI DINH truoc song giam ({n_down} lan, ZigZag {zz_pct:.0f}%):",
+        f"  (Vector tai diem dinh chinh xac — ngay gia cham dinh roi giam >= {zz_pct:.0f}%)",
         "─" * 40,
         f"  {'Dimension':<18} {'Median':>7}  {'P25':>7}  {'P75':>7}",
         "  " + "-" * 38,
@@ -915,9 +917,9 @@ def format_wave_report(result: dict) -> str:
     bar_up   = _score_bar(score_up)
     bar_down = _score_bar(score_down)
     verdict_em = (
-        "🟢 GIONG BOI CANH TRUOC SONG TANG"  if verdict == "SONG TANG"  else
-        "🔴 GIONG BOI CANH TRUOC SONG GIAM"  if verdict == "SONG GIAM"  else
-        "🟡 KHONG RO RANG"
+        "🟢 HIEN TAI GIONG TRANG THAI TAI DAY (truoc song tang)"  if verdict == "SONG TANG"  else
+        "🔴 HIEN TAI GIONG TRANG THAI TAI DINH (truoc song giam)" if verdict == "SONG GIAM"  else
+        "🟡 KHONG RO RANG (khong giong ro rang day hay dinh)"
     )
 
     # Reliability label — thay CI số (quá rộng với n nhỏ, không thực dụng)
@@ -969,7 +971,7 @@ def format_wave_report(result: dict) -> str:
     if dim_z_up and verdict in ("SONG TANG", "KHONG RO"):
         valid_up = _valid_dims(dim_z_up)[:5]
         if valid_up:
-            lines.append("DIMENSIONS DIEN HINH VOI SONG TANG (hien tai):")
+            lines.append("DIMS KHOP VOI TRANG THAI TAI DAY (hien tai ~ day lich su):")
             for dim, z in valid_up:
                 lbl = DIM_LABEL.get(dim, dim)
                 j   = VECTOR_KEYS.index(dim) if dim in VECTOR_KEYS else -1
@@ -980,7 +982,7 @@ def format_wave_report(result: dict) -> str:
     if dim_z_down and verdict in ("SONG GIAM", "KHONG RO"):
         valid_down = _valid_dims(dim_z_down)[:5]
         if valid_down:
-            lines.append("DIMENSIONS DIEN HINH VOI SONG GIAM (hien tai):")
+            lines.append("DIMS KHOP VOI TRANG THAI TAI DINH (hien tai ~ dinh lich su):")
             for dim, z in valid_down:
                 lbl = DIM_LABEL.get(dim, dim)
                 j   = VECTOR_KEYS.index(dim) if dim in VECTOR_KEYS else -1
