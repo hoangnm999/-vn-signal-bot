@@ -1082,6 +1082,18 @@ def format_wave_report(result: dict) -> str:
     ]
     if weak_note:
         lines.append(weak_note)
+
+    # Kỳ vọng biên độ/thời gian nếu verdict có chiều hướng rõ
+    if verdict == "SONG TANG":
+        lines.append(
+            f"   Neu xay ra: TB +{amp_u:.0f}% trong ~{dur_u:.0f} ngay "
+            f"(dua tren {n_up_tot} song tang lich su)"
+        )
+    elif verdict == "SONG GIAM":
+        lines.append(
+            f"   Neu xay ra: TB -{amp_d:.0f}% trong ~{dur_d:.0f} ngay "
+            f"(dua tren {n_down_tot} song giam lich su)"
+        )
     lines.append("")
 
     # ── Top 5 dimensions điển hình nhất với hiện tại ──────────────────────
