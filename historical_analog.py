@@ -545,6 +545,14 @@ def format_analog_report(
         std30 = float(np.std(vf30, ddof=1)) if n > 1 else 0.0
         rvr   = round(med30 / std30, 2) if std30 > 0 else 0.0
         ci    = f" [P25:{p25:+.1f}% P75:{p75:+.1f}%]" if p25 is not None else ""
+        # CHANGE 4: 3 chi so quan trong nhat — hien thi noi bat truoc
+        _mae_med_highlight = float(np.median(vmdd)) if vmdd else 0.0
+        _be_rr_highlight   = round((1 - wr) / wr, 1) if wr > 0 else 99.0
+        p3.append(
+            f"  >>> WR 30D: {wr:.0%}  |  MAE median: {_mae_med_highlight:+.1f}%"
+            f"  |  Break-even R:R: 1:{_be_rr_highlight}"
+        )
+        p3.append("  " + "-" * 36)
         p3 += [
             f"  WR 30D        : {len(wins)}/{len(vf30)} ({wr:.0%}) | Thua: {1-wr:.0%}",
             f"  Median LN 30D : {med30:+.2f}%{ci}",
@@ -628,12 +636,12 @@ def format_analog_report(
 
             p3d.append(f"  Entry  : {entry_price:,.1f} (gia hien tai)")
             p3d.append(f"  SL     : {sl_price:,.1f} (MAE median {mae_med_ap:+.1f}% + buffer -2%) [{sl_pct:+.1f}%]")
-            p3d.append(f"  TP1    : {tp1_price:,.1f} ({med30_ap:+.1f}% - P50) | R:R = 1:{rr1}")
+            p3d.append(f"  TP1    : {tp1_price:,.1f} ({med30_ap:+.1f}% - P50) | Risk:Reward = 1:{rr1}")
             if p75_ap is not None:
                 tp2_price = entry_price * (1 + p75_ap / 100)
                 rw2_abs   = abs(tp2_price - entry_price)
                 rr2 = round(rw2_abs / risk_abs, 1) if risk_abs > 0 else 0
-                p3d.append(f"  TP2    : {tp2_price:,.1f} ({p75_ap:+.1f}% - P75) | R:R = 1:{rr2}")
+                p3d.append(f"  TP2    : {tp2_price:,.1f} ({p75_ap:+.1f}% - P75) | Risk:Reward = 1:{rr2}")
 
             # CHANGE 3: R:R khuyen nghi toi thieu, co dieu chinh theo WR
             # WR cao -> nguong R:R co the thap hon (expectancy van duong)
@@ -664,8 +672,66 @@ def format_analog_report(
                 rr2_pct = round(p75_ap / risk_pct, 1) if risk_pct > 0 else 0
                 p3d.append(f"  TP2    : {p75_ap:+.1f}% tu entry (P75) | R:R = 1:{rr2_pct}")
         if mae_avg_ap < -10:
-            p3d.append(f"  ⚠️ MAE TB {mae_avg_ap:.1f}%: Chi vao lenh neu chap nhan rui ro sut giam manh")
+            p3d.append(f"  Rui ro: CAO (xem Canh bao ben duoi)")
         p3d.append("")
+
+    # ── CHANGE 2: Kết luận hành động — tổng kết 3 yếu tố ───────────
+    p3e = []
+    if vf30 and vmdd:
+        _wr_kl    = len([x for x in vf30 if x > 0]) / len(vf30)
+        _mae_kl   = float(np.mean(vmdd))
+        _be_kl    = round((1 - _wr_kl) / _wr_kl, 1) if _wr_kl > 0 else 99.0
+
+        # Xac suat thang
+        if _wr_kl >= 0.65:
+            _wr_txt = f"xac suat thang cao ({_wr_kl:.0%})"
+        elif _wr_kl >= 0.50:
+            _wr_txt = f"xac suat thang trung binh ({_wr_kl:.0%})"
+        else:
+            _wr_txt = f"xac suat thang thap ({_wr_kl:.0%})"
+
+        # R:R (dung gia tot nhat = TP2 neu co)
+        _rr_best = 0.0
+        if vf30 and vmdd and current_price > 0:
+            _sl_pct_kl = float(np.median(vmdd)) - 2.0
+            _sl_abs_kl = abs(current_price * _sl_pct_kl / 100)
+            _p75_kl    = float(np.percentile(vf30, 75)) if n >= 4 else float(np.median(vf30))
+            _tp_abs_kl = abs(current_price * _p75_kl / 100)
+            _rr_best   = round(_tp_abs_kl / _sl_abs_kl, 1) if _sl_abs_kl > 0 else 0.0
+
+        if _rr_best > 0:
+            if _rr_best >= 2.0:
+                _rr_txt = f"R:R tot (1:{_rr_best})"
+            elif _rr_best >= _be_kl:
+                _rr_txt = f"R:R chap nhan duoc (1:{_rr_best}, break-even 1:{_be_kl})"
+            else:
+                _rr_txt = f"R:R thap (1:{_rr_best} < break-even 1:{_be_kl})"
+        else:
+            _rr_txt = f"break-even R:R = 1:{_be_kl}"
+
+        # Rui ro sut giam
+        if _mae_kl < -20:
+            _mae_txt = f"rui ro sut giam rat manh ({_mae_kl:.1f}%)"
+        elif _mae_kl < -10:
+            _mae_txt = f"rui ro sut giam manh ({_mae_kl:.1f}%)"
+        else:
+            _mae_txt = f"rui ro sut giam vua ({_mae_kl:.1f}%)"
+
+        # Verdict tong hop
+        if _wr_kl >= 0.65 and _rr_best >= _be_kl:
+            _overall = "Co the xem xet vao lenh neu chap nhan duoc rui ro."
+        elif _wr_kl < 0.50 or (_rr_best > 0 and _rr_best < _be_kl):
+            _overall = "Can than — xac suat hoac R:R chua du dieu kien."
+        else:
+            _overall = "Theo doi them truoc khi quyet dinh."
+
+        p3e = [
+            "KET LUAN HANH DONG:",
+            "─" * 38,
+            f"  Co hoi {_wr_txt}, {_rr_txt}, {_mae_txt}.",
+            f"  => {_overall}",
+            "",
+        ]
 
     # ── Phần 4: Cảnh báo ─────────────────────────────────────────────
     warns = []
@@ -682,7 +748,7 @@ def format_analog_report(
     p4 = (["CANH BAO:", "─" * 38] + warns + [""]) if warns else []
 
     footer = ["Luu y: Phan tich chi mang tinh tham khao. QK khong dam bao TL."]
-    return ("\n".join(p1 + p2 + p3 + p3b + p3c + p3d + p4 + footer))[:max_chars]
+    return ("\n".join(p1 + p2 + p3 + p3b + p3c + p3d + p3e + p4 + footer))[:max_chars]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

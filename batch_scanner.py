@@ -291,8 +291,10 @@ def run_batch_scan(
           "partial":  bool,         # True nếu bị timeout
         }
     """
-    t_global = time.time()
+    t_global  = time.time()
     raw_results: dict[str, dict] = {}
+    total_syms  = len(symbols)
+    done_count  = 0   # đếm số mã đã hoàn thành (dùng trong closure)
 
     def _progress(msg: str):
         if progress_cb:
@@ -302,7 +304,7 @@ def run_batch_scan(
                 pass
         logger.info(f"[BatchScan] {msg}")
 
-    _progress(f"Bắt đầu scan {len(symbols)} mã với {MAX_WORKERS} workers...")
+    _progress(f"Bat dau scan {total_syms} ma voi {MAX_WORKERS} workers...")
 
     # Chạy song song
     partial = False
@@ -321,16 +323,19 @@ def run_batch_scan(
                     raw_results[sym] = res
                     elapsed = res.get("elapsed", 0)
                     gate    = res.get("gate", "?")
-                    _progress(f"  {sym}: {gate} ({elapsed:.0f}s)")
                 except FuturesTimeout:
                     raw_results[sym] = {"symbol": sym, "gate": "TIMEOUT",
-                                        "reason": "Vượt quá thời gian 10 phút"}
+                                        "reason": "Vuot qua thoi gian cho phep"}
                     partial = True
-                    _progress(f"  {sym}: TIMEOUT")
+                    gate, elapsed = "TIMEOUT", 0
                 except Exception as e:
                     raw_results[sym] = {"symbol": sym, "gate": "ERROR",
                                         "reason": str(e)[:100]}
-                    _progress(f"  {sym}: ERROR - {e}")
+                    gate, elapsed = "ERROR", 0
+
+                done_count += 1
+                _progress(f"  ({done_count}/{total_syms}) {sym}: {gate} ({elapsed:.0f}s)")
+
         except Exception as _outer_timeout:
             # as_completed() hết thời gian — đánh dấu các mã chưa có kết quả
             partial = True
@@ -338,8 +343,8 @@ def run_batch_scan(
                 if sym not in raw_results:
                     raw_results[sym] = {"symbol": sym, "gate": "TIMEOUT",
                                         "reason": f"Scan timeout ({SCAN_TIMEOUT_SECS}s)"}
-                    _progress(f"  {sym}: TIMEOUT (global)")
-            _progress(f"Global timeout — {len(symbols) - len(raw_results) + len([s for s in symbols if s not in raw_results])} ma bi bo qua")
+                    done_count += 1
+                    _progress(f"  ({done_count}/{total_syms}) {sym}: TIMEOUT (global)")
 
     # Tập hợp stats để tính z-score
     all_stats = []
