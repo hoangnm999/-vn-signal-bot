@@ -49,8 +49,10 @@ logger = logging.getLogger(__name__)
 DATA_DIR          = pathlib.Path("data")
 WAVE_CACHE_SUFFIX = "_waves.json"
 CACHE_MAX_AGE_DAYS = 7        # rebuild nếu cache > 7 ngày
-ZIGZAG_MIN_PCT    = 10.0      # % — bước tối thiểu để tính đỉnh/đáy ZigZag
+ZIGZAG_MIN_PCT    = 10.0      # fallback nếu auto-tune thất bại
 WAVE_TOP_PCT      = 30        # lấy top 30% sóng lớn nhất mỗi chiều
+TARGET_WAVES_MIN  = 15        # tối thiểu sóng mong muốn sau auto-tune
+TARGET_WAVES_MAX  = 60        # tối đa — tránh noise
 MIN_WAVES         = 5         # tối thiểu sóng mỗi nhóm để phân tích
 MIN_BARS_REQUIRED = 200       # tối thiểu bars lịch sử
 LOAD_DAYS         = 1500      # ~6 năm
@@ -76,39 +78,91 @@ DIM_LABEL = {
 
 # Mô tả ngắn khi dimension cao/thấp — dùng trong summary
 DIM_HIGH = {
-    "rsi_norm":        "RSI trung tinh/thap",
-    "macd_hist_norm":  "MACD Hist duong",
-    "bb_position":     "gia giua BB",
+    # Giá trị dương (+1) → ý nghĩa kỹ thuật
+    "rsi_norm":        "RSI cao (overbought ~70+)",
+    "macd_hist_norm":  "MACD Hist duong manh",
+    "bb_position":     "gia sat BB upper",
     "volume_spike":    "volume tang dot bien",
-    "trend_slope":     "SMA20 cat len SMA50",
+    "trend_slope":     "SMA20 tren SMA50 (uptrend)",
     "price_vs_sma20":  "gia tren SMA20",
     "price_vs_sma50":  "gia tren SMA50",
-    "atr_ratio":       "bien dong cao",
-    "stoch_k_norm":    "Stoch K tang",
-    "ema_cross":       "EMA12 vuot EMA26",
-    "momentum_5d":     "tang 5 phien gan",
+    "atr_ratio":       "bien dong cao (ATR lon)",
+    "stoch_k_norm":    "Stoch K cao (overbought)",
+    "ema_cross":       "EMA12 tren EMA26",
+    "momentum_5d":     "tang manh 5 phien gan",
     "momentum_20d":    "xu huong tang 20D",
-    "high_low_pos":    "gia phan hoi tu day",
+    "high_low_pos":    "gia gan dinh 20 phien",
     "vol_trend":       "vol ngan han tang",
-    "candle_body":     "than nen day",
+    "candle_body":     "than nen day (quyet doan)",
 }
 DIM_LOW = {
-    "rsi_norm":        "RSI cao (overbought)",
-    "macd_hist_norm":  "MACD Hist am/cham day",
-    "bb_position":     "gia sat BB upper",
+    # Giá trị âm (-1) → ý nghĩa kỹ thuật
+    "rsi_norm":        "RSI thap (oversold ~30-)",
+    "macd_hist_norm":  "MACD Hist am (cham day)",
+    "bb_position":     "gia sat BB lower",
     "volume_spike":    "volume suy yeu",
-    "trend_slope":     "SMA20 duoi SMA50",
+    "trend_slope":     "SMA20 duoi SMA50 (downtrend)",
     "price_vs_sma20":  "gia duoi SMA20",
     "price_vs_sma50":  "gia duoi SMA50",
-    "atr_ratio":       "bien dong thap",
-    "stoch_k_norm":    "Stoch K giam",
+    "atr_ratio":       "bien dong thap (tich luy)",
+    "stoch_k_norm":    "Stoch K thap (oversold)",
     "ema_cross":       "EMA12 duoi EMA26",
-    "momentum_5d":     "giam 5 phien gan",
+    "momentum_5d":     "giam manh 5 phien gan",
     "momentum_20d":    "xu huong giam 20D",
-    "high_low_pos":    "gia o vung giua",
+    "high_low_pos":    "gia gan day 20 phien",
     "vol_trend":       "vol on dinh/giam",
     "candle_body":     "than nen nho (do du)",
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BƯỚC 0 — AUTO-TUNE ZIGZAG THRESHOLD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _find_optimal_zigzag_pct(
+    close: np.ndarray,
+    candidates: tuple = (3.0, 5.0, 7.0, 10.0, 12.0, 15.0),
+) -> float:
+    """
+    Tự động tìm ngưỡng ZigZag phù hợp nhất cho mã.
+
+    Logic:
+    - Thử các ngưỡng từ nhỏ → lớn
+    - Chọn ngưỡng lớn nhất mà vẫn cho >= TARGET_WAVES_MIN sóng mỗi chiều
+    - Không bao giờ vượt TARGET_WAVES_MAX (quá nhiều = noise)
+    - Fallback về ZIGZAG_MIN_PCT nếu không tìm được
+
+    Ví dụ STB: 3%→80 sóng (quá nhiều), 5%→38 sóng (OK), 7%→22 sóng (OK),
+               10%→6 sóng (quá ít) → chọn 7%
+    """
+    best_pct  = ZIGZAG_MIN_PCT
+    best_n    = 0
+
+    for pct in candidates:
+        pivots = _zigzag(close, min_pct=pct)
+        # Đếm sóng tăng (BOT→TOP) và sóng giảm (TOP→BOT) trước khi filter top30%
+        n_up = sum(
+            1 for i in range(len(pivots) - 1)
+            if pivots[i][2] == "BOT" and pivots[i+1][2] == "TOP"
+        )
+        n_down = sum(
+            1 for i in range(len(pivots) - 1)
+            if pivots[i][2] == "TOP" and pivots[i+1][2] == "BOT"
+        )
+        n_min = min(n_up, n_down)
+
+        if n_min >= TARGET_WAVES_MIN and n_min <= TARGET_WAVES_MAX:
+            # Ưu tiên ngưỡng lớn hơn (ít sóng hơn nhưng có ý nghĩa hơn)
+            if pct > best_pct or best_n < TARGET_WAVES_MIN:
+                best_pct = pct
+                best_n   = n_min
+        elif n_min > TARGET_WAVES_MAX and best_n < TARGET_WAVES_MIN:
+            # Chưa tìm được ngưỡng tốt, ghi nhận tạm
+            best_pct = pct
+            best_n   = n_min
+
+    logger.info(f"ZigZag auto-tune: {best_pct:.0f}% → ~{best_n} waves/side")
+    return best_pct
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -470,8 +524,9 @@ def build_wave_cache(symbol: str, force: bool = False) -> tuple[bool, str]:
     n_bars = len(df)
     close  = df["close"].values.astype(float)
 
-    # ZigZag
-    pivots = _zigzag(close, min_pct=ZIGZAG_MIN_PCT)
+    # Auto-tune ZigZag threshold — tìm ngưỡng cho 15-60 sóng mỗi chiều
+    optimal_pct = _find_optimal_zigzag_pct(close)
+    pivots = _zigzag(close, min_pct=optimal_pct)
     if len(pivots) < 6:
         return False, f"Khong du pivots ({len(pivots)}) — lich su qua ngan"
 
@@ -514,7 +569,7 @@ def build_wave_cache(symbol: str, force: bool = False) -> tuple[bool, str]:
         "amp_down_mean":round(amp_down_mean, 1),
         "dur_up_mean":  round(dur_up_mean, 1),
         "dur_down_mean":round(dur_down_mean, 1),
-        "zigzag_pct":  ZIGZAG_MIN_PCT,
+        "zigzag_pct":  optimal_pct,
         "wave_top_pct":WAVE_TOP_PCT,
         "dist_up":     dist_up,
         "dist_down":   dist_down,
@@ -819,12 +874,28 @@ def format_wave_report(result: dict) -> str:
         lines.append("")
 
     # ── Footer ────────────────────────────────────────────────────────────
+    # Calibration note: dùng score và base_rate của verdict thực tế
+    if verdict == "SONG TANG":
+        _cal_score = score_up
+        _cal_label = "song tang"
+        _cal_base  = base_rate_up
+    elif verdict == "SONG GIAM":
+        _cal_score = score_down
+        _cal_label = "song giam"
+        _cal_base  = base_rate_down
+    else:
+        # KHONG RO — dùng score cao hơn
+        if score_up >= score_down:
+            _cal_score = score_up;  _cal_label = "song tang"; _cal_base = base_rate_up
+        else:
+            _cal_score = score_down; _cal_label = "song giam"; _cal_base = base_rate_down
+
     lines += [
         "─" * 40,
         "GIAI THICH SCORE:",
-        f"  Score {score_up:.0%} (song tang) co nghia: hien tai nam TRONG",
-        "  phan phoi dien hinh cua song tang — KHONG phai xac suat tang",
-        f"  la {score_up:.0%}. Xac suat nen thuc te chi la {base_rate_up:.1f}%.",
+        f"  Score {_cal_score:.0%} ({_cal_label}) co nghia: hien tai nam TRONG",
+        f"  phan phoi dien hinh cua {_cal_label} — KHONG phai xac suat",
+        f"  la {_cal_score:.0%}. Xac suat nen thuc te chi la {_cal_base:.1f}%.",
         "─" * 40,
         "⚠️  CANH BAO: Phan tich chi mang tinh tham khao.",
         "   Qua khu khong dam bao tuong lai.",
