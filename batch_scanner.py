@@ -310,23 +310,36 @@ def run_batch_scan(
         futures = {pool.submit(_scan_one_symbol, sym): sym for sym in symbols}
         deadline = t_global + SCAN_TIMEOUT_SECS
 
-        for future in as_completed(futures, timeout=SCAN_TIMEOUT_SECS):
-            sym = futures[future]
-            try:
-                res = future.result(timeout=max(1, deadline - time.time()))
-                raw_results[sym] = res
-                elapsed = res.get("elapsed", 0)
-                gate    = res.get("gate", "?")
-                _progress(f"  {sym}: {gate} ({elapsed:.0f}s)")
-            except FuturesTimeout:
-                raw_results[sym] = {"symbol": sym, "gate": "TIMEOUT",
-                                    "reason": "Vượt quá thời gian 10 phút"}
-                partial = True
-                _progress(f"  {sym}: TIMEOUT")
-            except Exception as e:
-                raw_results[sym] = {"symbol": sym, "gate": "ERROR",
-                                    "reason": str(e)[:100]}
-                _progress(f"  {sym}: ERROR - {e}")
+        # BUG FIX: as_completed() raise TimeoutError ra ngoài vòng for khi
+        # hết SCAN_TIMEOUT_SECS — crash toàn bộ run_batch_scan thay vì
+        # bỏ qua futures chưa xong. Dùng try/except bọc iterator để catch.
+        try:
+            for future in as_completed(futures, timeout=SCAN_TIMEOUT_SECS):
+                sym = futures[future]
+                try:
+                    res = future.result(timeout=max(1, deadline - time.time()))
+                    raw_results[sym] = res
+                    elapsed = res.get("elapsed", 0)
+                    gate    = res.get("gate", "?")
+                    _progress(f"  {sym}: {gate} ({elapsed:.0f}s)")
+                except FuturesTimeout:
+                    raw_results[sym] = {"symbol": sym, "gate": "TIMEOUT",
+                                        "reason": "Vượt quá thời gian 10 phút"}
+                    partial = True
+                    _progress(f"  {sym}: TIMEOUT")
+                except Exception as e:
+                    raw_results[sym] = {"symbol": sym, "gate": "ERROR",
+                                        "reason": str(e)[:100]}
+                    _progress(f"  {sym}: ERROR - {e}")
+        except Exception as _outer_timeout:
+            # as_completed() hết thời gian — đánh dấu các mã chưa có kết quả
+            partial = True
+            for sym in symbols:
+                if sym not in raw_results:
+                    raw_results[sym] = {"symbol": sym, "gate": "TIMEOUT",
+                                        "reason": f"Scan timeout ({SCAN_TIMEOUT_SECS}s)"}
+                    _progress(f"  {sym}: TIMEOUT (global)")
+            _progress(f"Global timeout — {len(symbols) - len(raw_results) + len([s for s in symbols if s not in raw_results])} ma bi bo qua")
 
     # Tập hợp stats để tính z-score
     all_stats = []
