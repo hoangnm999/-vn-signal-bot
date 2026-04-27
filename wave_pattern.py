@@ -1282,21 +1282,28 @@ def _fmt_subtype_section(lines: list[str], result: dict, verdict: str) -> None:
                 )
                 out.append(f"  {'[Hien tai]':<20}  {cur_row}")
 
-            # Kết luận
-            if closest and closest in subtypes_data:
-                em_c  = SUBTYPE_EMOJI.get(closest, "")
-                lbl_c = SUBTYPE_LABEL.get(closest, closest)
-                desc  = CLOSEST_DESC.get(closest, "")
+            # Kết luận — luôn hiển thị nếu có ít nhất 1 subtype
+            # closest có thể không nằm trong subtypes_data nếu chỉ có 1 bên đủ mẫu
+            # → fallback: lấy subtype có total_dist nhỏ nhất trong subtypes_data
+            closest_display = closest if closest in subtypes_data else (
+                min(subtypes_data, key=lambda s: subtypes_data[s]["total_dist"])
+                if subtypes_data else None
+            )
+            if closest_display:
+                em_c   = SUBTYPE_EMOJI.get(closest_display, "")
+                lbl_c  = SUBTYPE_LABEL.get(closest_display, closest_display)
+                desc   = CLOSEST_DESC.get(closest_display, "")
+                # margin < 0.15: 2 loại khá gần nhau → note thêm
                 margin_str = (
-                    f" (khoang cach: {margin:.3f})"
-                    if margin < 0.05 else ""  # chỉ note khi gần nhau
+                    f" (margin={margin:.3f} — rat gan)"
+                    if 0 < margin < 0.15 else ""
                 )
                 out.append("")
                 out.append(f"  → Hien tai gan nhat voi: {em_c} {lbl_c}{margin_str}")
                 if desc:
                     out.append(f"     {desc}")
-                if margin < 0.05:
-                    out.append("     ⚠️  Hai loai rat gan nhau — khong ket luan ro rang.")
+                if 0 < margin < 0.15:
+                    out.append("     ⚠️  Hai loai kha gan nhau — ket luan chi mang tinh tham khao.")
 
         out.append("")
         return out
