@@ -10,6 +10,13 @@ from analyzer import (analyze_stock_full, scan_watchlist,
                       get_price_data, get_market_data, get_news_data)
 from db import init_db, save_signal, run_evaluation_cron, get_report, get_history
 
+# ── Logging setup TRƯỚC tất cả optional imports để tránh NameError ──────────
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
 # ── Auto Context modules ────────────────────────────────────────────────────
 try:
     from auto_context import (
@@ -67,12 +74,6 @@ try:
     _VIBE_CLIENT = True
 except ImportError:
     _VIBE_CLIENT = False
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
@@ -1360,14 +1361,22 @@ def main():
     async def post_init(application):
         asyncio.create_task(_start_cron())
         if _BATCH_SCANNER:
+            # Fix: đọc ALLOWED_CHAT_IDS (tên env var chuẩn theo _allowed_ids())
+            # Fallback: ALLOWED_IDS (tên cũ) và CHAT_ID (user chính)
+            _raw_ids = (
+                os.environ.get("ALLOWED_CHAT_IDS", "") or
+                os.environ.get("ALLOWED_IDS", "") or
+                os.environ.get("CHAT_ID", "")
+            )
             _scan_ids = [
-                int(x.strip()) for x in
-                os.environ.get("ALLOWED_IDS","").split(",")
+                int(x.strip()) for x in _raw_ids.split(",")
                 if x.strip().lstrip("-").isdigit()
             ]
             if _scan_ids:
                 asyncio.create_task(_start_scan_cron(application.bot, _scan_ids))
                 logger.info(f"ScanCron: {len(_scan_ids)} chat_ids, 08:00 daily")
+            else:
+                logger.warning("ScanCron: khong co chat_id nao — set ALLOWED_CHAT_IDS de nhan bao cao sang")
         if _ALERT_AVAILABLE:
             asyncio.create_task(_start_alert_cron(application))
 

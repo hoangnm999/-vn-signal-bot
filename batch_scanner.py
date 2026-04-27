@@ -108,34 +108,39 @@ def _scan_one_symbol(symbol: str) -> dict:
         # ── 2. Kiểm tra /check gần nhất ──────────────────────────────────
         try:
             from db import get_conn
-            with get_conn() as conn:
-                row = conn.execute(
-                    "SELECT created_at FROM signals "
-                    "WHERE symbol=? ORDER BY created_at DESC LIMIT 1",
-                    (symbol,)
-                ).fetchone()
-                if row and row[0]:
-                    created = row[0]
-                    if isinstance(created, str):
-                        created = datetime.fromisoformat(created)
-                    if created.tzinfo is None:
-                        created = created.replace(tzinfo=timezone.utc)
-                    check_age_hours = (
-                        datetime.now(timezone.utc) - created
-                    ).total_seconds() / 3600
+            conn = get_conn()
+            cur  = conn.cursor()
+            cur.execute(
+                "SELECT created_at FROM signals "
+                "WHERE symbol=%s ORDER BY created_at DESC LIMIT 1",
+                (symbol,)
+            )
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            if row and row[0]:
+                created = row[0]
+                if isinstance(created, str):
+                    created = datetime.fromisoformat(created)
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                check_age_hours = (
+                    datetime.now(timezone.utc) - created
+                ).total_seconds() / 3600
         except Exception as _de:
             logger.debug(f"[{symbol}] db check fail: {_de}")
 
-        # ── 3. Nếu /check quá cũ (> 48h) → chạy lại ─────────────────────
+        # ── 3. Nếu /check quá cũ (> 48h) → bỏ qua trong batch scan ────────
+        # Không tự trigger analyze_stock_full() trong batch vì:
+        # - 50 mã × 30-60s/mã = vượt timeout
+        # - Gây rate limit API khi chạy song song
+        # → Chỉ log warning, để user tự chạy /check_all hoặc /check <MA>
         from guardrails import MAX_CHECK_AGE_HOURS
         if check_age_hours is None or check_age_hours > MAX_CHECK_AGE_HOURS:
-            try:
-                logger.info(f"[{symbol}] /check cũ ({check_age_hours:.0f}h → refresh)" if check_age_hours is not None else f"[{symbol}] /check chưa có → chạy mới")
-                from analyzer import analyze_stock_full
-                analyze_stock_full(symbol)
-                check_age_hours = 0.1   # vừa refresh
-            except Exception as _ae:
-                logger.warning(f"[{symbol}] analyze fail: {_ae}")
+            if check_age_hours is None:
+                logger.info(f"[{symbol}] /check chua co — can chay /check {symbol} truoc")
+            else:
+                logger.info(f"[{symbol}] /check cu ({check_age_hours:.0f}h > {MAX_CHECK_AGE_HOURS}h) — nen refresh")
 
         # ── 4. Kiểm tra cache vector ──────────────────────────────────────
         try:
@@ -181,24 +186,27 @@ def _scan_one_symbol(symbol: str) -> dict:
             try:
                 import json as _json
                 from db import get_conn
-                with get_conn() as conn:
-                    # Thử column "state_vector" trước, sau đó "state_vec"
-                    for col in ("state_vector", "state_vec", "vector_json"):
-                        try:
-                            row = conn.execute(
-                                f"SELECT {col} FROM signals "
-                                f"WHERE symbol=? AND {col} IS NOT NULL "
-                                f"ORDER BY created_at DESC LIMIT 1",
-                                (symbol,)
-                            ).fetchone()
-                            if row and row[0]:
-                                sv = row[0]
-                                state_vec = _json.loads(sv) if isinstance(sv, str) else sv
-                                sv_source = f"db.{col}"
-                                logger.info(f"[{symbol}] state_vec from {sv_source}")
-                                break
-                        except Exception:
-                            continue
+                conn = get_conn()
+                cur  = conn.cursor()
+                for col in ("state_vector", "state_vec", "vector_json"):
+                    try:
+                        cur.execute(
+                            f"SELECT {col} FROM signals "
+                            f"WHERE symbol=%s AND {col} IS NOT NULL "
+                            f"ORDER BY created_at DESC LIMIT 1",
+                            (symbol,)
+                        )
+                        row = cur.fetchone()
+                        if row and row[0]:
+                            sv = row[0]
+                            state_vec = _json.loads(sv) if isinstance(sv, str) else sv
+                            sv_source = f"db.{col}"
+                            logger.info(f"[{symbol}] state_vec from {sv_source}")
+                            break
+                    except Exception:
+                        continue
+                cur.close()
+                conn.close()
             except Exception as _dbe:
                 logger.warning(f"[{symbol}] db state_vec fail: {_dbe}")
 
@@ -429,12 +437,26 @@ def run_batch_scan(
     _progress(f"Scan xong: {len(ranked)} mã vào rank, {len(excluded)} excluded, "
               f"{len(rejected)} reject | {elapsed}s")
 
+    # Market regime check — tính ở đây 1 lần, không lặp lại trong formatter
+    market_warn = None
+    try:
+        from vn_loader import load_vn_ohlcv
+        from guardrails import check_market_regime
+        df_vni = load_vn_ohlcv("VNINDEX", days=10, min_bars=5)
+        if df_vni is not None and len(df_vni) >= 6:
+            close_5d = df_vni["close"].values
+            chg_5d   = (close_5d[-1] - close_5d[-6]) / close_5d[-6] * 100
+            market_warn = check_market_regime(chg_5d)
+    except Exception as _mre:
+        logger.debug(f"market_regime check fail: {_mre}")
+
     return {
-        "ranked":   ranked,
-        "excluded": excluded,
-        "rejected": rejected,
-        "errors":   errors,
-        "elapsed":  elapsed,
+        "ranked":       ranked,
+        "excluded":     excluded,
+        "rejected":     rejected,
+        "errors":       errors,
+        "elapsed":      elapsed,
+        "market_warn":  market_warn,
         "partial":  partial,
     }
 
@@ -492,7 +514,7 @@ def _format_overview_table(
         if not items:
             return
         lines.append(title)
-        lines.append(f"  {'Ma':<6} {'Score':>5}  {'WR':>5}  {'MAE med':>8}")
+        lines.append(f"  {'Ma':<6} {'Score':>5}  {'WR':>5}  {'MAE 90D':>8}")
         lines.append("  " + "-" * 32)
         for x in items:
             exc_note = " [RR cao]" if show_excluded else ""
@@ -505,7 +527,7 @@ def _format_overview_table(
     _render_group("UU TIEN (Score >= 5.0):", grp_priority)
     _render_group("TIEM NANG (4.0 - 4.9):", grp_potential)
     _render_group("THAM KHAO (< 4.0):", grp_ref)
-    _render_group("RUI RO RO CAO (Excluded):", grp_excluded, show_excluded=True)
+    _render_group("RUI RO CAO (Excluded):", grp_excluded, show_excluded=True)
 
     # Mã không có kết quả
     non_timeout_rej = [r for r in rejected if "timeout" not in r.get("reason","").lower()]
@@ -536,28 +558,18 @@ def format_scan_report(scan_result: dict) -> list[str]:
     Hien thi TOAN BO watchlist phan nhom theo score — khong an khi khong co ma >= 5.0.
     """
     from guardrails import (
-        format_full_report, check_no_opportunity, check_market_regime,
+        format_full_report, check_no_opportunity,
         SCORE_OPPORTUNITY_MIN,
     )
 
-    ranked   = scan_result["ranked"]
-    excluded = scan_result["excluded"]
-    rejected = scan_result["rejected"]
-    errors   = scan_result["errors"]
-    partial  = scan_result["partial"]
-    elapsed  = scan_result["elapsed"]
-
-    # Layer 5: Market regime check
-    market_warn = None
-    try:
-        from vn_loader import load_vn_ohlcv
-        df_vni = load_vn_ohlcv("VNINDEX", days=10, min_bars=5)
-        if df_vni is not None and len(df_vni) >= 6:
-            close_5d = df_vni["close"].values
-            chg_5d   = (close_5d[-1] - close_5d[-6]) / close_5d[-6] * 100
-            market_warn = check_market_regime(chg_5d)
-    except Exception:
-        pass
+    ranked      = scan_result["ranked"]
+    excluded    = scan_result["excluded"]
+    rejected    = scan_result["rejected"]
+    errors      = scan_result["errors"]
+    partial     = scan_result["partial"]
+    elapsed     = scan_result["elapsed"]
+    # Market warn đã được tính trong run_batch_scan — không fetch lại ở đây
+    market_warn = scan_result.get("market_warn")
 
     scan_date  = datetime.now().strftime("%d/%m/%Y %H:%M")
     no_opp     = check_no_opportunity(ranked)

@@ -98,7 +98,8 @@ def _parse_args(args: list[str]) -> tuple[str, str, str, int] | str:
         return "error:empty"
 
     symbol = args[0].upper().strip()
-    if not symbol.isalnum() or len(symbol) > 10:
+    import re as _re
+    if not _re.match(r'^[A-Z0-9]{2,10}$', symbol):
         return f"error:symbol:{symbol}"
 
     if len(args) < 3:
@@ -732,7 +733,8 @@ async def backtest_rule_cmd(update, context):
 
     # Validate symbol
     symbol_raw = args[0].upper().strip()
-    if not symbol_raw.isalnum() or len(symbol_raw) > 10:
+    import re as _re2
+    if not _re2.match(r'^[A-Z0-9]{2,10}$', symbol_raw):
         await update.message.reply_text(f"Ma '{symbol_raw}' khong hop le (2-10 chu/so)."); return
     symbol = symbol_raw
 
@@ -883,4 +885,5 @@ async def backtest_rule_cmd(update, context):
                 except Exception:
                     pass
 
-    await _bg()
+    # Chạy background — không await để bot tiếp tục nhận lệnh khác trong khi backtest chạy
+    asyncio.create_task(_bg())

@@ -499,6 +499,9 @@ def format_analog_report(
     vmgd = _vals("max_gain_day"); vdv = _vals("daily_volatility")
     n    = len(vf30)
 
+    # Số analogs bị drop do chưa có đủ 30 ngày dữ liệu tương lai
+    n_dropped_fwd30 = ind_n - n
+
     # ── Phần 1: Tóm tắt ──────────────────────────────────────────────
     p1 = [
         f"PHAN TICH TUONG DONG: {symbol}",
@@ -511,6 +514,8 @@ def format_analog_report(
         p1.append(f"  * Giam khoang cach loc: {MIN_SAMPLE_DISTANCE_DAYS}D->{min_dist}D")
     if ind_n < MIN_SAMPLE_WARNING:
         p1.append(f"  ⚠️ Mau nho ({ind_n} doc lap), do tin cay thap.")
+    if n_dropped_fwd30 > 0:
+        p1.append(f"  ⚠️ {n_dropped_fwd30}/{ind_n} mau chua co du 30 ngay tuong lai — WR/Expectancy tinh tren {n} mau.")
     p1.append("")
 
     # ── Phần 2: Tóm tắt hành trình giá ──────────────────────────────

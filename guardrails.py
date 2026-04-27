@@ -128,8 +128,8 @@ def compute_base_stats(analogs: list) -> dict:
     p75 = float(np.percentile(f30s, 75)) if n >= 4 else None
 
     # Recency: % mẫu trong 12 tháng gần nhất
-    from datetime import datetime, timedelta
-    cutoff_12m    = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+    from datetime import date, timedelta
+    cutoff_12m    = (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
     n_recent      = sum(1 for a in analogs if a.get("date", "") >= cutoff_12m)
     recency_ratio = n_recent / len(analogs) if analogs else 0
 
