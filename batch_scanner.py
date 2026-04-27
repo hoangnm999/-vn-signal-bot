@@ -423,10 +423,97 @@ def run_batch_scan(
 # TELEGRAM OUTPUT FORMATTER
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _format_overview_table(
+    ranked:   list[dict],
+    excluded: list[dict],
+    rejected: list[dict],
+    errors:   list[str],
+    partial:  bool,
+) -> str:
+    """
+    Tạo bảng tổng quan TẤT CẢ mã, phân nhóm theo score.
+    Dùng monospace-friendly format cho Telegram plain text.
+    """
+    # Gom tất cả mã có score vào 1 list để sort
+    all_scored = []
+    for r in ranked:
+        s = r.get("stats", {})
+        all_scored.append({
+            "symbol":   r["symbol"],
+            "score":    r["score"],
+            "wr":       s.get("win_rate", 0),
+            "mae_med":  s.get("median_mdd", 0),   # median_mdd = MAE median trong guardrails
+            "tier":     r["risk_tier"],
+            "group":    "ranked",
+        })
+    for r in excluded:
+        s = r.get("stats", {})
+        all_scored.append({
+            "symbol":   r["symbol"],
+            "score":    r["score"],
+            "wr":       s.get("win_rate", 0),
+            "mae_med":  s.get("median_mdd", 0),
+            "tier":     "EXCLUDED",
+            "group":    "excluded",
+        })
+
+    # Sort theo score giảm dần
+    all_scored.sort(key=lambda x: x["score"], reverse=True)
+
+    # Phân nhóm
+    grp_priority  = [x for x in all_scored if x["score"] >= 5.0 and x["group"] == "ranked"]
+    grp_potential = [x for x in all_scored if 4.0 <= x["score"] < 5.0 and x["group"] == "ranked"]
+    grp_ref       = [x for x in all_scored if x["score"] < 4.0 and x["group"] == "ranked"]
+    grp_excluded  = [x for x in all_scored if x["group"] == "excluded"]
+
+    lines = []
+
+    def _render_group(title: str, items: list, show_excluded: bool = False):
+        if not items:
+            return
+        lines.append(title)
+        lines.append(f"  {'Ma':<6} {'Score':>5}  {'WR':>5}  {'MAE med':>8}")
+        lines.append("  " + "-" * 32)
+        for x in items:
+            exc_note = " [RR cao]" if show_excluded else ""
+            lines.append(
+                f"  {x['symbol']:<6} {x['score']:>5.1f}  "
+                f"{x['wr']:>4.0%}  {x['mae_med']:>+7.1f}%{exc_note}"
+            )
+        lines.append("")
+
+    _render_group("UU TIEN (Score >= 5.0):", grp_priority)
+    _render_group("TIEM NANG (4.0 - 4.9):", grp_potential)
+    _render_group("THAM KHAO (< 4.0):", grp_ref)
+    _render_group("RUI RO RO CAO (Excluded):", grp_excluded, show_excluded=True)
+
+    # Mã không có kết quả
+    non_timeout_rej = [r for r in rejected if "timeout" not in r.get("reason","").lower()]
+    timeout_rej     = [r for r in rejected if "timeout" in r.get("reason","").lower()]
+    timeout_errs    = [e.split(":")[0] for e in errors if "timeout" in e.lower()]
+
+    if non_timeout_rej:
+        lines.append(f"KHONG DU DIEU KIEN ({len(non_timeout_rej)} ma):")
+        for r in non_timeout_rej[:10]:
+            reason = r.get("reason","?")[:55]
+            lines.append(f"  {r['symbol']:<6} {reason}")
+        if len(non_timeout_rej) > 10:
+            lines.append(f"  ... va {len(non_timeout_rej)-10} ma khac")
+        lines.append("")
+
+    all_timeouts = [r["symbol"] for r in timeout_rej] + timeout_errs
+    if all_timeouts:
+        lines.append(f"TIMEOUT ({len(all_timeouts)} ma): {', '.join(all_timeouts)}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+
 def format_scan_report(scan_result: dict) -> list[str]:
     """
-    Format kết quả scan thành list messages (tự chia nếu > 4000 ký tự).
-    Returns list[str] để gửi nhiều message nếu cần.
+    Format ket qua scan thanh list messages (tu chia neu > 4000 ky tu).
+    Hien thi TOAN BO watchlist phan nhom theo score — khong an khi khong co ma >= 5.0.
     """
     from guardrails import (
         format_full_report, check_no_opportunity, check_market_regime,
@@ -452,73 +539,67 @@ def format_scan_report(scan_result: dict) -> list[str]:
     except Exception:
         pass
 
-    scan_date = datetime.now().strftime("%d/%m/%Y %H:%M")
+    scan_date  = datetime.now().strftime("%d/%m/%Y %H:%M")
+    no_opp     = check_no_opportunity(ranked)
+    total_scan = len(ranked) + len(excluded) + len(rejected) + len(errors)
 
-    # Kiểm tra no-opportunity
-    if check_no_opportunity(ranked):
-        no_opp_msg = (
-            f"🔍 SCAN WATCHLIST ({scan_date})\n"
-            f"Thời gian: {elapsed:.0f}s\n\n"
+    # ── Header ────────────────────────────────────────────────────────
+    hdr = []
+    hdr.append("SCAN WATCHLIST (" + scan_date + ")")
+    suffix = " | [KET QUA CHUA DAY DU]" if partial else ""
+    hdr.append("Tong: " + str(total_scan) + " ma | " + str(int(elapsed)) + "s" + suffix)
+    hdr.append("=" * 38)
+    if market_warn:
+        hdr.append("CANH BAO: " + market_warn)
+        hdr.append("")
+    if no_opp:
+        hdr.append("Khong co ma nao dat nguong Score > " + str(SCORE_OPPORTUNITY_MIN) + "/10 hom nay.")
+        hdr.append("Danh sach day du ben duoi de tham khao:")
+        hdr.append("")
+    header = "\n".join(hdr)
+
+    # ── Bang tong quan ────────────────────────────────────────────────
+    overview = _format_overview_table(ranked, excluded, rejected, errors, partial)
+
+    # ── Detail top 5 uu tien (chi khi co ma >= 5.0) ──────────────────
+    detail = ""
+    top5 = [r for r in ranked if r["score"] >= 5.0][:5]
+    if top5:
+        full_rep = format_full_report(
+            ranked         = ranked,
+            excluded       = [],
+            market_warning = None,
+            scan_date      = scan_date,
         )
-        if market_warn:
-            no_opp_msg += f"⚠️ {market_warn}\n\n"
-        no_opp_msg += (
-            f"Không tìm thấy cơ hội nào đủ tin cậy hôm nay "
-            f"(ngưỡng Score > {SCORE_OPPORTUNITY_MIN}/10).\n"
-            f"Hãy kiên nhẫn chờ đợi."
-        )
-        return [no_opp_msg]
+        detail = "\n" + full_rep
 
-    # Main report
-    main_report = format_full_report(
-        ranked         = ranked,
-        excluded       = excluded,
-        market_warning = market_warn,
-        scan_date      = scan_date,
-    )
+    # ── Footer ────────────────────────────────────────────────────────
+    footer = "\n* Score la chi so tham khao, khong phai khuyen nghi mua/ban."
 
-    # Footer: rejected + errors + timing
-    footer_lines = [f"\n⏱️ Thời gian scan: {elapsed:.0f}s"]
-    if partial:
-        # Liệt kê rõ mã nào bị timeout
-        timeout_syms = [r["symbol"] for r in rejected if "timeout" in r.get("reason","").lower()]
-        timeout_syms += [e.split(":")[0] for e in errors if "timeout" in e.lower()]
-        if timeout_syms:
-            syms_str = ", ".join(timeout_syms)
-            footer_lines.append(
-                f"⚠️ Ket qua chua day du — {len(timeout_syms)} ma bi timeout:"
-            )
-            footer_lines.append(f"  {syms_str}")
-        else:
-            footer_lines.append("⚠️ Ket qua chua day du — mot so ma bi timeout.")
-    if rejected:
-        non_timeout = [r for r in rejected if "timeout" not in r.get("reason","").lower()]
-        if non_timeout:
-            footer_lines.append(f"⏭️ Bi loai ({len(non_timeout)} ma):")
-            for r in non_timeout[:6]:
-                reason = r.get("reason", "unknown")[:60]
-                footer_lines.append(f"  • {r['symbol']}: {reason}")
-            if len(non_timeout) > 6:
-                footer_lines.append(f"  ... va {len(non_timeout)-6} ma khac")
-    if errors:
-        non_timeout_errs = [e for e in errors if "timeout" not in e.lower()]
-        if non_timeout_errs:
-            footer_lines.append(f"❌ Loi: {'; '.join(non_timeout_errs[:3])}")
+    full = header + "\n" + overview + detail + footer
 
-    full = main_report + "\n".join(footer_lines)
-
-    # Tự chia messages nếu > 4000 ký tự
+    # ── Tu chia messages neu > 4000 ky tu ────────────────────────────
     MAX_LEN = 4000
     if len(full) <= MAX_LEN:
         return [full]
 
-    # Chia: main report + footer riêng
-    msgs = []
-    if len(main_report) <= MAX_LEN:
-        msgs.append(main_report)
+    msgs  = []
+    part1 = header + "\n" + overview + footer
+    if len(part1) <= MAX_LEN:
+        msgs.append(part1)
     else:
-        # Chia theo từng mã (split by "\n\n#")
-        parts = main_report.split("\n\n")
+        buf = header + "\n"
+        for line in (overview + footer).split("\n"):
+            if len(buf) + len(line) + 1 > MAX_LEN:
+                msgs.append(buf.strip())
+                buf = line + "\n"
+            else:
+                buf += line + "\n"
+        if buf.strip():
+            msgs.append(buf.strip())
+
+    if detail.strip():
+        parts = detail.split("\n\n")
         buf   = ""
         for part in parts:
             if len(buf) + len(part) + 2 > MAX_LEN:
@@ -529,13 +610,6 @@ def format_scan_report(scan_result: dict) -> list[str]:
                 buf = (buf + "\n\n" + part).strip() if buf else part
         if buf:
             msgs.append(buf.strip())
-
-    footer_str = "\n".join(footer_lines)
-    if footer_str.strip():
-        if msgs and len(msgs[-1]) + len(footer_str) <= MAX_LEN:
-            msgs[-1] += footer_str
-        else:
-            msgs.append(footer_str)
 
     return msgs if msgs else [full[:MAX_LEN]]
 
