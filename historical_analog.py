@@ -346,6 +346,7 @@ def _calc_price_journey(cache_df, from_date: str, from_close: float,
         "fwd_30": None, "fwd_60": None, "fwd_90": None,
         "max_gain": None, "max_gain_day": None,
         "max_drawdown": None, "max_dd_day": None,
+        "max_drawdown_30d": None,   # MAE trong 30D đầu — nhất quán với TP1/TP2
         "daily_volatility": None, "conclusion": "CHUA RO",
     }
     if from_close <= 0:
@@ -371,6 +372,13 @@ def _calc_price_journey(cache_df, from_date: str, from_close: float,
     md_idx = int(np.argmin(dd))
     result["max_drawdown"] = round(float(dd[md_idx]), 2)
     result["max_dd_day"]   = int(md_idx + 1)
+
+    # MAE trong 30D đầu — dùng cho SL (nhất quán khung thời gian với TP1/TP2)
+    pct_30 = pct[:30] if len(pct) >= 30 else pct
+    if len(pct_30) > 0:
+        peak_30 = np.maximum.accumulate(pct_30)
+        dd_30   = pct_30 - peak_30
+        result["max_drawdown_30d"] = round(float(dd_30.min()), 2)
 
     if len(closes) > 1:
         result["daily_volatility"] = round(
@@ -486,6 +494,7 @@ def format_analog_report(
     def _vals(key): return [a[key] for a in analogs if a.get(key) is not None]
     vf30 = _vals("fwd_30"); vf60 = _vals("fwd_60"); vf90 = _vals("fwd_90")
     vmg  = _vals("max_gain"); vmdd = _vals("max_drawdown")
+    vmdd30 = _vals("max_drawdown_30d")   # MAE trong 30D — dung cho SL
     vmgd = _vals("max_gain_day"); vdv = _vals("daily_volatility")
     n    = len(vf30)
 
@@ -546,10 +555,13 @@ def format_analog_report(
         rvr   = round(med30 / std30, 2) if std30 > 0 else 0.0
         ci    = f" [P25:{p25:+.1f}% P75:{p75:+.1f}%]" if p25 is not None else ""
         # CHANGE 4: 3 chi so quan trong nhat — hien thi noi bat truoc
-        _mae_med_highlight = float(np.median(vmdd)) if vmdd else 0.0
-        _be_rr_highlight   = round((1 - wr) / wr, 1) if wr > 0 else 99.0
+        # Banner: uu tien MAE median 30D (nhat quan voi TP1/TP2)
+        _mae_med_30_hl  = float(np.median(vmdd30)) if vmdd30 else None
+        _mae_med_hl     = _mae_med_30_hl if _mae_med_30_hl is not None else (float(np.median(vmdd)) if vmdd else 0.0)
+        _mae_label_hl   = "MAE med 30D" if _mae_med_30_hl is not None else "MAE median"
+        _be_rr_highlight = round((1 - wr) / wr, 1) if wr > 0 else 99.0
         p3.append(
-            f"  >>> WR 30D: {wr:.0%}  |  MAE median: {_mae_med_highlight:+.1f}%"
+            f"  >>> WR 30D: {wr:.0%}  |  {_mae_label_hl}: {_mae_med_hl:+.1f}%"
             f"  |  Break-even R:R: 1:{_be_rr_highlight}"
         )
         p3.append("  " + "-" * 36)
@@ -566,8 +578,13 @@ def format_analog_report(
     if vf60: p3.append(f"  Median LN 60D : {float(np.median(vf60)):+.2f}%")
     if vf90: p3.append(f"  Median LN 90D : {float(np.median(vf90)):+.2f}%")
     if vmdd:
-        mae_med = float(np.median(vmdd))
-        p3.append(f"  MAE TB (MDD)  : {float(np.mean(vmdd)):+.2f}% | Median: {mae_med:+.2f}%")
+        mae_med_90 = float(np.median(vmdd))
+        mae_med_30 = float(np.median(vmdd30)) if vmdd30 else None
+        if mae_med_30 is not None:
+            p3.append(f"  MAE median 30D: {mae_med_30:+.2f}%  (co so tinh SL)")
+            p3.append(f"  MAE median 90D: {mae_med_90:+.2f}% | TB: {float(np.mean(vmdd)):+.2f}%")
+        else:
+            p3.append(f"  MAE TB (MDD)  : {float(np.mean(vmdd)):+.2f}% | Median: {mae_med_90:+.2f}%")
     if vmg:  p3.append(f"  MFE TB (Peak) : {float(np.mean(vmg)):+.2f}%")
     if vdv:  p3.append(f"  Bien dong TB  : {float(np.mean(vdv)):.1f}%/ngay")
     p3.append(f"  Thoi gian TU  : {_best_holding(analogs)}")
@@ -611,7 +628,9 @@ def format_analog_report(
     if vf30 and vmdd and vmg:
         med30_ap  = float(np.median(vf30))
         p75_ap    = float(np.percentile(vf30, 75)) if n >= 4 else None
-        mae_med_ap  = float(np.median(vmdd))           # MAE median dung cho SL
+        # SL dung MAE median 30D (nhat quan voi TP1/TP2 cung la 30D)
+        # Fallback ve MAE median 90D neu khong co du lieu 30D
+        mae_med_ap  = float(np.median(vmdd30)) if vmdd30 else float(np.median(vmdd))
         mae_avg_ap  = float(np.mean(vmdd))
         # entry_price = gia hien tai THUC TE truyen vao tu caller
         # KHONG dung analog["close"] vi do la gia lich su (co the sai hoan toan)
@@ -635,7 +654,8 @@ def format_analog_report(
             rr1 = round(rw1_abs / risk_abs, 1) if risk_abs > 0 else 0
 
             p3d.append(f"  Entry  : {entry_price:,.1f} (gia hien tai)")
-            p3d.append(f"  SL     : {sl_price:,.1f} (MAE median {mae_med_ap:+.1f}% + buffer -2%) [{sl_pct:+.1f}%]")
+            sl_src = "30D" if vmdd30 else "90D"
+            p3d.append(f"  SL     : {sl_price:,.1f} (MAE median {sl_src} {mae_med_ap:+.1f}% + buffer -2%) [{sl_pct:+.1f}%]")
             p3d.append(f"  TP1    : {tp1_price:,.1f} ({med30_ap:+.1f}% - P50) | Risk:Reward = 1:{rr1}")
             if p75_ap is not None:
                 tp2_price = entry_price * (1 + p75_ap / 100)
@@ -671,7 +691,7 @@ def format_analog_report(
             if p75_ap is not None:
                 rr2_pct = round(p75_ap / risk_pct, 1) if risk_pct > 0 else 0
                 p3d.append(f"  TP2    : {p75_ap:+.1f}% tu entry (P75) | R:R = 1:{rr2_pct}")
-        if mae_avg_ap < -10:
+        if mae_med_ap < -15:  # Dung MAE median 30D, nguong 15%
             p3d.append(f"  Rui ro: CAO (xem Canh bao ben duoi)")
         p3d.append("")
 
@@ -693,7 +713,7 @@ def format_analog_report(
         # R:R (dung gia tot nhat = TP2 neu co)
         _rr_best = 0.0
         if vf30 and vmdd and current_price > 0:
-            _sl_pct_kl = float(np.median(vmdd)) - 2.0
+            _sl_pct_kl = (float(np.median(vmdd30)) if vmdd30 else float(np.median(vmdd))) - 2.0
             _sl_abs_kl = abs(current_price * _sl_pct_kl / 100)
             _p75_kl    = float(np.percentile(vf30, 75)) if n >= 4 else float(np.median(vf30))
             _tp_abs_kl = abs(current_price * _p75_kl / 100)
