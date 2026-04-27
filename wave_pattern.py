@@ -49,13 +49,14 @@ logger = logging.getLogger(__name__)
 DATA_DIR          = pathlib.Path("data")
 WAVE_CACHE_SUFFIX = "_waves.json"
 CACHE_MAX_AGE_DAYS = 7        # rebuild nếu cache > 7 ngày
-ZIGZAG_MIN_PCT    = 10.0      # fallback nếu auto-tune thất bại
+ZIGZAG_MIN_PCT    = 5.0       # fallback nếu auto-tune thất bại (hạ từ 10→5)
 WAVE_TOP_PCT      = 30        # lấy top 30% sóng lớn nhất mỗi chiều
-TARGET_WAVES_MIN  = 15        # tối thiểu sóng mong muốn sau auto-tune
+TARGET_WAVES_MIN  = 10        # tối thiểu sóng mong muốn sau auto-tune (hạ từ 15→10)
 TARGET_WAVES_MAX  = 60        # tối đa — tránh noise
 MIN_WAVES         = 5         # tối thiểu sóng mỗi nhóm để phân tích
+WARN_WAVES        = 10        # cảnh báo mẫu thấp khi n_up hoặc n_down < ngưỡng này
 MIN_BARS_REQUIRED = 200       # tối thiểu bars lịch sử
-LOAD_DAYS         = 1500      # ~6 năm
+LOAD_DAYS         = 2000      # ~8 năm (tăng từ 1500 để có thêm mẫu sóng)
 
 # Labels thân thiện cho 15 dimensions
 DIM_LABEL = {
@@ -785,6 +786,15 @@ def format_wave_report(result: dict) -> str:
         f"Song giam: {n_down} mau vec ({n_down_tot} song, TB -{amp_d:.1f}%, ~{dur_d:.0f} ngay)",
         "",
     ]
+
+    # ── Cảnh báo mẫu thấp ─────────────────────────────────────────────────
+    if n_up < WARN_WAVES or n_down < WARN_WAVES:
+        lines += [
+            f"⚠️  MAU THAP: {min(n_up, n_down)} song — ket qua mang tinh tham khao yeu.",
+            f"   (Khuyen nghi >= {WARN_WAVES} mau moi chieu de co y nghia thong ke)",
+            f"   Thu: /wave {sym} --rebuild de load them lich su.",
+            "",
+        ]
 
     # ── Base rate — đặt ngay sau header để user thấy trước khi đọc score ──
     base_rate_up   = result.get("base_rate_up",   0.0)
