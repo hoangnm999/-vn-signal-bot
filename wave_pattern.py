@@ -51,13 +51,19 @@ WAVE_CACHE_SUFFIX = "_waves.json"
 CACHE_MAX_AGE_DAYS = 7        # rebuild nếu cache > 7 ngày
 ZIGZAG_MIN_PCT    = 5.0       # fallback nếu auto-tune thất bại
 MAX_ZIGZAG_PCT    = 10.0      # giới hạn trên — sóng > 10% là super-cycle
-TARGET_WAVES_MIN  = 15        # tối thiểu sóng mong muốn sau auto-tune (tăng lại vì không còn filter top30%)
+TARGET_WAVES_MIN  = 15        # tối thiểu sóng mong muốn sau auto-tune
 TARGET_WAVES_MAX  = 80        # tối đa — tránh noise
 MIN_WAVES         = 5         # tối thiểu sóng mỗi nhóm để phân tích
 WARN_WAVES        = 15        # cảnh báo mẫu thấp
-MIN_MEANINGFUL_SCORE = 0.25   # ngưỡng tối thiểu để verdict có ý nghĩa
+MIN_MEANINGFUL_SCORE = 0.25   # threshold weak signal note
 MIN_BARS_REQUIRED = 200       # tối thiểu bars lịch sử
 LOAD_DAYS         = 2000      # ~8 năm
+
+# Negative sampling — phân biệt đáy/đỉnh thực vs oversold/overbought thường
+OVERSOLD_THRESH    = -0.60    # stoch_k_norm < -0.60 để qualify false bottom (G2)
+OVERBOUGHT_THRESH  = +0.60    # stoch_k_norm > +0.60 để qualify false top (G4)
+PIVOT_EXCL_WINDOW  = 15       # exclude ±15 ngày quanh pivot thực (BOT/TOP)
+NEG_SAMPLE_RATIO   = 3        # lấy tối đa NEG_SAMPLE_RATIO × n_positive negatives
 
 # Labels thân thiện cho 15 dimensions
 DIM_LABEL = {
@@ -347,6 +353,83 @@ def _compute_wave_vectors(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BƯỚC 3B — NEGATIVE SAMPLING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_negative_samples(
+    df:           pd.DataFrame,
+    pivot_indices: list[int],
+    mode:          str,            # "bottom" hoặc "top"
+    n_positive:    int,
+    rng_seed:      int = 42,
+) -> list[np.ndarray]:
+    """
+    Xây dựng G2 (false bottoms) hoặc G4 (false tops) — negative samples.
+
+    Logic:
+    - G2 (false bottom): ngày stoch_k_norm < OVERSOLD_THRESH
+      NHƯNG không phải pivot thực, VÀ không trong ±PIVOT_EXCL_WINDOW ngày của pivot thực
+    - G4 (false top): tương tự với overbought
+
+    Tại sao cần exclude window:
+    - Ngày gần đáy thực thường cũng rất oversold → nếu để vào G2 sẽ làm G1 vs G2
+      gần giống nhau → không phân biệt được gì mới
+
+    Returns:
+        list of np.ndarray — tối đa NEG_SAMPLE_RATIO × n_positive vectors
+        (đã random sample nếu quá nhiều)
+    """
+    if "stoch_k_norm" not in VECTOR_KEYS:
+        return []
+
+    stoch_idx = VECTOR_KEYS.index("stoch_k_norm")
+    n_bars    = len(df)
+    thresh    = OVERSOLD_THRESH if mode == "bottom" else OVERBOUGHT_THRESH
+
+    # Tập hợp index cần exclude (±window quanh mỗi pivot thực)
+    excluded: set[int] = set()
+    for pi in pivot_indices:
+        for d in range(-PIVOT_EXCL_WINDOW, PIVOT_EXCL_WINDOW + 1):
+            excluded.add(pi + d)
+
+    # Tìm tất cả ngày thỏa điều kiện oversold/overbought và không bị exclude
+    # Tính vector 1 lần duy nhất, lưu cả (idx, arr) để dùng lại
+    candidates: list[tuple[int, np.ndarray]] = []
+    for i in range(60, n_bars):
+        if i in excluded:
+            continue
+        vec = compute_state_vector_for_date(df, i)
+        if vec is None:
+            continue
+        arr = vec.get("_array")
+        if arr is None or len(arr) != VECTOR_DIM:
+            continue
+        sk = float(arr[stoch_idx])
+        qualify = (sk < thresh) if mode == "bottom" else (sk > thresh)
+        if qualify:
+            candidates.append((i, arr.astype(np.float32)))
+
+    if not candidates:
+        logger.warning(f"Negative sampling ({mode}): 0 candidates found")
+        return []
+
+    # Random sample tối đa NEG_SAMPLE_RATIO × n_positive
+    max_neg = n_positive * NEG_SAMPLE_RATIO
+    rng = np.random.default_rng(rng_seed)
+    if len(candidates) > max_neg:
+        sampled_idx = rng.choice(len(candidates), size=max_neg, replace=False)
+        candidates  = [candidates[i] for i in sampled_idx]
+
+    vectors: list[np.ndarray] = [arr for _, arr in candidates]
+
+    logger.info(
+        f"Negative sampling ({mode}): {len(candidates)} sampled "
+        f"(max={max_neg}, thresh={thresh:+.2f})"
+    )
+    return vectors
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # BƯỚC 4 — PHÂN PHỐI VÀ Z-SCORE MEMBERSHIP
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -558,7 +641,7 @@ def build_wave_cache(symbol: str, force: bool = False) -> tuple[bool, str]:
     if len(waves_down) < MIN_WAVES:
         return False, f"Chi co {len(waves_down)} song giam (can >= {MIN_WAVES})"
 
-    # Compute vectors tại điểm bắt đầu
+    # Compute vectors tại điểm bắt đầu (G1 và G3 — positive samples)
     vecs_up   = _compute_wave_vectors(df, waves_up)
     vecs_down = _compute_wave_vectors(df, waves_down)
 
@@ -567,9 +650,27 @@ def build_wave_cache(symbol: str, force: bool = False) -> tuple[bool, str]:
     if len(vecs_down) < MIN_WAVES:
         return False, f"Chi tinh duoc {len(vecs_down)} vector song giam"
 
-    # Tính phân phối
-    dist_up   = _group_distribution(vecs_up)
-    dist_down = _group_distribution(vecs_down)
+    # Negative sampling (G2 và G4) — cần toàn bộ df để scan
+    bot_indices = [w["start_idx"] for w in waves_up]
+    top_indices = [w["start_idx"] for w in waves_down]
+
+    vecs_false_bottom = _build_negative_samples(
+        df, pivot_indices=bot_indices, mode="bottom", n_positive=len(vecs_up)
+    )
+    vecs_false_top = _build_negative_samples(
+        df, pivot_indices=top_indices, mode="top",    n_positive=len(vecs_down)
+    )
+
+    logger.info(
+        f"{symbol}: G1={len(vecs_up)} true_bot, G2={len(vecs_false_bottom)} false_bot | "
+        f"G3={len(vecs_down)} true_top, G4={len(vecs_false_top)} false_top"
+    )
+
+    # Tính phân phối cho cả 4 nhóm
+    dist_up           = _group_distribution(vecs_up)
+    dist_down         = _group_distribution(vecs_down)
+    dist_false_bottom = _group_distribution(vecs_false_bottom) if vecs_false_bottom else {}
+    dist_false_top    = _group_distribution(vecs_false_top)    if vecs_false_top    else {}
 
     # Tính stats cho waves
     amp_up_mean   = float(np.mean([w["amplitude"] for w in waves_up]))
@@ -592,6 +693,10 @@ def build_wave_cache(symbol: str, force: bool = False) -> tuple[bool, str]:
         "zigzag_pct":  optimal_pct,
         "dist_up":     dist_up,
         "dist_down":   dist_down,
+        "dist_false_bottom": dist_false_bottom,   # G2: oversold thường (không tạo đáy)
+        "dist_false_top":    dist_false_top,       # G4: overbought thường (không tạo đỉnh)
+        "n_false_bottom": len(vecs_false_bottom),
+        "n_false_top":    len(vecs_false_top),
         # Lưu vectors để so sánh sau nếu cần
         "vecs_up":     [v.tolist() for v in vecs_up],
         "vecs_down":   [v.tolist() for v in vecs_down],
@@ -699,6 +804,10 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
         "avg_interval_up": 0.0, "avg_interval_down": 0.0,
         "top_dims": [], "dist_up": {}, "dist_down": {},
         "current_vec": [], "dim_z_up": [], "dim_z_down": [],
+        "score_discrim_bottom": 0.0,   # G1 vs G2: đáy thực vs oversold thường
+        "score_discrim_top":    0.0,   # G3 vs G4: đỉnh thực vs overbought thường
+        "n_false_bottom": 0,
+        "n_false_top":    0,
     }
 
     # Build/load cache
@@ -714,6 +823,8 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
 
     dist_up   = cache["dist_up"]
     dist_down = cache["dist_down"]
+    dist_false_bottom = cache.get("dist_false_bottom", {})
+    dist_false_top    = cache.get("dist_false_top",    {})
 
     # Vector hiện tại
     try:
@@ -728,9 +839,17 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
         result_base["error"] = f"Load du lieu hien tai that bai: {e}"
         return result_base
 
-    # Z-score membership
+    # Z-score membership — G1 và G3 (positive, như cũ)
     score_up,   dim_z_up   = _zscore_membership(cur_arr, dist_up)
     score_down, dim_z_down = _zscore_membership(cur_arr, dist_down)
+
+    # Discriminative score — G1 vs G2, G3 vs G4
+    # score_discrim_bottom > 0: hôm nay giống đáy thực hơn oversold thường
+    # score_discrim_top    > 0: hôm nay giống đỉnh thực hơn overbought thường
+    score_false_bottom, _ = _zscore_membership(cur_arr, dist_false_bottom) if dist_false_bottom else (0.0, [])
+    score_false_top,    _ = _zscore_membership(cur_arr, dist_false_top)    if dist_false_top    else (0.0, [])
+    score_discrim_bottom = round(score_up   - score_false_bottom, 3)
+    score_discrim_top    = round(score_down - score_false_top,    3)
 
     # Verdict — chỉ dựa trên diff, không gate bằng MIN_MEANINGFUL_SCORE
     # MIN_MEANINGFUL_SCORE gây false KHONG RO khi hiện tại ở trạng thái trung lập
@@ -770,6 +889,12 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
         "zigzag_pct":       cache.get("zigzag_pct", ZIGZAG_MIN_PCT),
         "score_up":         score_up,
         "score_down":       score_down,
+        "score_discrim_bottom": score_discrim_bottom,
+        "score_discrim_top":    score_discrim_top,
+        "score_false_bottom_raw": score_false_bottom,  # G2 score raw
+        "score_false_top_raw":    score_false_top,      # G4 score raw
+        "n_false_bottom":   cache.get("n_false_bottom", 0),
+        "n_false_top":      cache.get("n_false_top",    0),
         "verdict":          verdict,
         "confidence":       round(abs(diff), 3),
         "top_dims":         top_dims,
@@ -965,6 +1090,52 @@ def format_wave_report(result: dict) -> str:
             "ℹ️  TRANG THAI TRUNG LAP:",
             "   Hien tai khong giong ro rang boi canh truoc song tang hay giam.",
             "   Thuong gap khi thi truong dang tich luy hoac chua chon huong.",
+            "",
+        ]
+
+    # ── Discriminative Score — trọng tâm của Approach A ──────────────────
+    score_discrim_bottom = result.get("score_discrim_bottom", None)
+    score_discrim_top    = result.get("score_discrim_top",    None)
+    n_fb = result.get("n_false_bottom", 0)
+    n_ft = result.get("n_false_top",    0)
+
+    if score_discrim_bottom is not None and n_fb > 0:
+        lines += ["DO PHAN BIET (Approach A — tach day/dinh that vs oversold/overbought thuong):",
+                  "─" * 40]
+
+        def _discrim_bar(v: float) -> str:
+            # Hiển thị scale [-0.5, +0.5] → 10 ký tự, 0 ở giữa
+            filled = round((v + 0.5) * 10)
+            filled = max(0, min(10, filled))
+            mid    = 5
+            if filled >= mid:
+                bar = "─" * mid + "█" * (filled - mid) + "░" * (10 - filled)
+            else:
+                bar = "░" * filled + "█" * (mid - filled) + "─" * (10 - mid)
+            return f"[{bar}]"
+
+        def _discrim_label(v: float, mode: str) -> str:
+            if mode == "bottom":
+                if v >= 0.15:  return "✅ Co dac diem DAY THAT (cao hon oversold thuong)"
+                if v >= 0.05:  return "🟡 Hoi giong day that hon oversold thuong"
+                if v >= -0.05: return "⚪ Khong phan biet duoc"
+                return            "🔴 Giong oversold thuong hon day that"
+            else:
+                if v >= 0.15:  return "✅ Co dac diem DINH THAT (cao hon overbought thuong)"
+                if v >= 0.05:  return "🟡 Hoi giong dinh that hon overbought thuong"
+                if v >= -0.05: return "⚪ Khong phan biet duoc"
+                return            "🔴 Giong overbought thuong hon dinh that"
+
+        lines += [
+            f"  Day that (G1={n_up}) vs Oversold thuong (G2={n_fb}):",
+            f"    Score dat day: {score_up:.1%} | Score oversold thuong: {result.get('score_false_bottom_raw', score_up - score_discrim_bottom):.1%}",
+            f"    Do phan biet : {_discrim_bar(score_discrim_bottom)} {score_discrim_bottom:+.1%}",
+            f"    {_discrim_label(score_discrim_bottom, 'bottom')}",
+            "",
+            f"  Dinh that (G3={n_down}) vs Overbought thuong (G4={n_ft}):",
+            f"    Score dat dinh: {score_down:.1%} | Score overbought thuong: {result.get('score_false_top_raw', score_down - score_discrim_top):.1%}",
+            f"    Do phan biet : {_discrim_bar(score_discrim_top)} {score_discrim_top:+.1%}",
+            f"    {_discrim_label(score_discrim_top, 'top')}",
             "",
         ]
 
