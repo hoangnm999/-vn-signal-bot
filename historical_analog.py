@@ -305,6 +305,7 @@ def find_similar(
             "max_gain_day":     j["max_gain_day"],
             "max_drawdown":     j["max_drawdown"],
             "max_dd_day":       j["max_dd_day"],
+            "max_drawdown_30d": j.get("max_drawdown_30d"),   # MAE trong 30D — cơ sở tính SL
             "daily_volatility": j["daily_volatility"],
             "conclusion":       j["conclusion"],
             "recovery_days":    j.get("recovery_days"),
@@ -374,11 +375,11 @@ def _calc_price_journey(cache_df, from_date: str, from_close: float,
     result["max_dd_day"]   = int(md_idx + 1)
 
     # MAE trong 30D đầu — dùng cho SL (nhất quán khung thời gian với TP1/TP2)
+    # Tính từ entry price (min của pct trong 30D), không dùng running peak
+    # Đây là MAE chuẩn: mức xuống tệ nhất so với điểm vào lệnh
     pct_30 = pct[:30] if len(pct) >= 30 else pct
     if len(pct_30) > 0:
-        peak_30 = np.maximum.accumulate(pct_30)
-        dd_30   = pct_30 - peak_30
-        result["max_drawdown_30d"] = round(float(dd_30.min()), 2)
+        result["max_drawdown_30d"] = round(float(pct_30.min()), 2)
 
     if len(closes) > 1:
         result["daily_volatility"] = round(
@@ -699,7 +700,9 @@ def format_analog_report(
     p3e = []
     if vf30 and vmdd:
         _wr_kl    = len([x for x in vf30 if x > 0]) / len(vf30)
-        _mae_kl   = float(np.mean(vmdd))
+        # Dùng MAE median 30D cho kết luận (nhất quán khung thời gian với TP/SL)
+        _mae_kl   = float(np.median(vmdd30)) if vmdd30 else float(np.mean(vmdd))
+        _mae_kl_label = "30D" if vmdd30 else "90D TB"
         _be_kl    = round((1 - _wr_kl) / _wr_kl, 1) if _wr_kl > 0 else 99.0
 
         # Xac suat thang
@@ -731,11 +734,11 @@ def format_analog_report(
 
         # Rui ro sut giam
         if _mae_kl < -20:
-            _mae_txt = f"rui ro sut giam rat manh ({_mae_kl:.1f}%)"
+            _mae_txt = f"rui ro sut giam rat manh (MAE {_mae_kl_label} {_mae_kl:.1f}%)"
         elif _mae_kl < -10:
-            _mae_txt = f"rui ro sut giam manh ({_mae_kl:.1f}%)"
+            _mae_txt = f"rui ro sut giam manh (MAE {_mae_kl_label} {_mae_kl:.1f}%)"
         else:
-            _mae_txt = f"rui ro sut giam vua ({_mae_kl:.1f}%)"
+            _mae_txt = f"rui ro sut giam vua (MAE {_mae_kl_label} {_mae_kl:.1f}%)"
 
         # Verdict tong hop
         if _wr_kl >= 0.65 and _rr_best >= _be_kl:
@@ -755,8 +758,16 @@ def format_analog_report(
 
     # ── Phần 4: Cảnh báo ─────────────────────────────────────────────
     warns = []
-    if vmdd and float(np.mean(vmdd)) < -5:
-        warns.append(f"⚠️ MAE TB {float(np.mean(vmdd)):.1f}%: nhip giam manh truoc khi tang.")
+    # Ưu tiên MAE median 30D cho cảnh báo (nhất quán với SL/TP dùng khung 30D)
+    _mae_warn = float(np.median(vmdd30)) if vmdd30 else (float(np.mean(vmdd)) if vmdd else None)
+    _mae_warn_label = "MAE median 30D" if vmdd30 else "MAE TB 90D"
+    if _mae_warn is not None and _mae_warn < -15:
+        warns.append(
+            f"⚠️ {_mae_warn_label} {_mae_warn:.1f}%: rui ro sut giam manh trong 30D dau — "
+            f"can dat SL chat, chap nhan bi rung lac."
+        )
+    elif _mae_warn is not None and _mae_warn < -5:
+        warns.append(f"⚠️ {_mae_warn_label} {_mae_warn:.1f}%: nhip giam dang ke truoc khi tang.")
     if avg_sim < 0.85:
         warns.append("⚠️ Do TD TB < 85%, ket qua chi mang tinh tham khao.")
     if ind_n < 5:
