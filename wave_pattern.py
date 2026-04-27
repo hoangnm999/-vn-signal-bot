@@ -851,10 +851,13 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
     score_discrim_bottom = round(score_up   - score_false_bottom, 3)
     score_discrim_top    = round(score_down - score_false_top,    3)
 
-    # Verdict — chỉ dựa trên diff, không gate bằng MIN_MEANINGFUL_SCORE
-    # MIN_MEANINGFUL_SCORE gây false KHONG RO khi hiện tại ở trạng thái trung lập
+    # Verdict
     diff = score_up - score_down
-    if diff >= 0.08:
+    # Khi cả 2 scores thấp → trung lập, không nên kết luận chiều
+    # Tránh contradiction: vừa SONG GIAM vừa nói "trung lập"
+    if max(score_up, score_down) < MIN_MEANINGFUL_SCORE:
+        verdict = "KHONG RO"
+    elif diff >= 0.08:
         verdict = "SONG TANG"
     elif diff <= -0.08:
         verdict = "SONG GIAM"
@@ -1059,11 +1062,13 @@ def format_wave_report(result: dict) -> str:
 
     reliability = _reliability(n_min_side, confidence)
 
-    # Weak signal note khi cả 2 scores thấp = trạng thái trung lập, không phải outlier
+    # Weak signal note — chỉ hiển thị khi verdict là SONG TANG/GIAM nhưng score thấp
+    # Khi verdict đã là KHONG RO (do trung lập), không cần thêm note này
     max_score = max(score_up, score_down)
     weak_note = (
-        "  ⚡ Tin hieu yeu — thi truong dang trung lap / cho huong."
-        if max_score < MIN_MEANINGFUL_SCORE else ""
+        "  ⚡ Tin hieu yeu — score thap, can them xac nhan."
+        if max_score < MIN_MEANINGFUL_SCORE and verdict != "KHONG RO"
+        else ""
     )
 
     lines += [
@@ -1104,37 +1109,46 @@ def format_wave_report(result: dict) -> str:
                   "─" * 40]
 
         def _discrim_bar(v: float) -> str:
-            # Hiển thị scale [-0.5, +0.5] → 10 ký tự, 0 ở giữa
-            filled = round((v + 0.5) * 10)
-            filled = max(0, min(10, filled))
-            mid    = 5
-            if filled >= mid:
-                bar = "─" * mid + "█" * (filled - mid) + "░" * (10 - filled)
+            # Bar đơn giản: 0 ở giữa, dương → phải (xanh), âm → trái (đỏ)
+            # Scale: mỗi ô = 5%, range [-25%, +25%] → 10 ô
+            steps = round(v / 0.05)           # +5% mỗi bước
+            steps = max(-5, min(5, steps))    # clamp [-5, +5]
+            mid   = "│"
+            if steps >= 0:
+                right = "█" * steps + "░" * (5 - steps)
+                left  = " " * 5
+                bar   = f"[{left}{mid}{right}]"
             else:
-                bar = "░" * filled + "█" * (mid - filled) + "─" * (10 - mid)
-            return f"[{bar}]"
+                left  = "░" * (-steps) + " " * (5 + steps)
+                right = " " * 5
+                bar   = f"[{left}{mid}{right}]"
+            return bar  # dương = xanh bên phải, âm = đỏ bên trái
 
         def _discrim_label(v: float, mode: str) -> str:
             if mode == "bottom":
-                if v >= 0.15:  return "✅ Co dac diem DAY THAT (cao hon oversold thuong)"
+                if v >= 0.15:  return "✅ Co dac diem DAY THAT ro rang (cao hon oversold thuong)"
                 if v >= 0.05:  return "🟡 Hoi giong day that hon oversold thuong"
                 if v >= -0.05: return "⚪ Khong phan biet duoc"
-                return            "🔴 Giong oversold thuong hon day that"
+                if v >= -0.15: return "🔴 Giong oversold thuong hon day that"
+                return            "🔴🔴 Rat giong oversold thuong — KHONG co dac diem capitulation"
             else:
-                if v >= 0.15:  return "✅ Co dac diem DINH THAT (cao hon overbought thuong)"
+                if v >= 0.15:  return "✅ Co dac diem DINH THAT ro rang (cao hon overbought thuong)"
                 if v >= 0.05:  return "🟡 Hoi giong dinh that hon overbought thuong"
                 if v >= -0.05: return "⚪ Khong phan biet duoc"
-                return            "🔴 Giong overbought thuong hon dinh that"
+                if v >= -0.15: return "🔴 Giong overbought thuong hon dinh that"
+                return            "🔴🔴 Rat giong overbought thuong — KHONG co dac diem exhaustion"
 
+        sfb = result.get("score_false_bottom_raw", 0.0)
+        sft = result.get("score_false_top_raw",    0.0)
         lines += [
-            f"  Day that (G1={n_up}) vs Oversold thuong (G2={n_fb}):",
-            f"    Score dat day: {score_up:.1%} | Score oversold thuong: {result.get('score_false_bottom_raw', score_up - score_discrim_bottom):.1%}",
-            f"    Do phan biet : {_discrim_bar(score_discrim_bottom)} {score_discrim_bottom:+.1%}",
+            f"  [Bot] Day that (G1={n_up}) vs Oversold thuong (G2={n_fb}):",
+            f"         G1 score: {score_up:.1%}  |  G2 score: {sfb:.1%}",
+            f"    Phan biet: {_discrim_bar(score_discrim_bottom)}  {score_discrim_bottom:+.1%}",
             f"    {_discrim_label(score_discrim_bottom, 'bottom')}",
             "",
-            f"  Dinh that (G3={n_down}) vs Overbought thuong (G4={n_ft}):",
-            f"    Score dat dinh: {score_down:.1%} | Score overbought thuong: {result.get('score_false_top_raw', score_down - score_discrim_top):.1%}",
-            f"    Do phan biet : {_discrim_bar(score_discrim_top)} {score_discrim_top:+.1%}",
+            f"  [Top] Dinh that (G3={n_down}) vs Overbought thuong (G4={n_ft}):",
+            f"         G3 score: {score_down:.1%}  |  G4 score: {sft:.1%}",
+            f"    Phan biet: {_discrim_bar(score_discrim_top)}  {score_discrim_top:+.1%}",
             f"    {_discrim_label(score_discrim_top, 'top')}",
             "",
         ]
