@@ -65,6 +65,13 @@ except ImportError:
     logger.warning("batch_scanner.py chua co — /scan_watchlist bi tat")
 
 try:
+    from wave_pattern import wave_cmd
+    _WAVE_PATTERN = True
+except ImportError:
+    _WAVE_PATTERN = False
+    logger.warning("wave_pattern.py chua co — /wave bi tat")
+
+try:
     from vibe_client import (
         is_available as vibe_available,
         start_swarm, poll_swarm, format_swarm_result,
@@ -228,7 +235,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/deepscan            — Phan tich sau 16 engines toan watchlist\n\n"
         "━━━ BACKTEST ━━━\n"
         "/backtest_rule <MA>  — Backtest tu dong (Auto Context)\n"
-        "/backtest_rule <MA> \"entry_rule\" \"exit_rule\"  — Manual\n\n"
+        "/backtest_rule <MA> \"entry_rule\" \"exit_rule\"  — Manual\n"
+        "/wave <MA>           — Phan tich song lich su (Wave Pattern)\n\n"
         "━━━ CANH BAO GIA ━━━\n"
         "/alert <MA> <gia> [above|below] — Dat canh bao\n"
         "/alerts              — Xem canh bao dang hoat dong\n"
@@ -289,6 +297,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/backtest_rule <MA> \"entry\" \"exit\"\n"
         "  Manual DSL: rsi<30 and close>sma20\n"
         "  Exits: trailing_stop(5%) | take_profit(10%) | stop_loss(5%)\n\n"
+        "/wave <MA> [--rebuild]\n"
+        "  Phan tich song lich su: tim dau hieu truoc song tang/giam\n"
+        "  So sanh trang thai hien tai voi 2 nhom\n"
+        "  --rebuild: build lai cache (mac dinh dung cache <= 7 ngay)\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🔔 CANH BAO GIA\n"
         "/alert <MA> <gia> [above|below]\n"
@@ -1348,6 +1360,8 @@ def main():
         app.add_handler(CommandHandler("backtest_rule", backtest_rule_cmd))
     if _BATCH_SCANNER:
         app.add_handler(CommandHandler("scan_watchlist", scan_watchlist_cmd))
+    if _WAVE_PATTERN:
+        app.add_handler(CommandHandler("wave", wave_cmd))
     if _LOCAL_SWARM:
         app.add_handler(CommandHandler("local_swarm",  local_swarm_cmd))
         app.add_handler(CommandHandler("cancel",       cancel_swarm_cmd))

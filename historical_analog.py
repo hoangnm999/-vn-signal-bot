@@ -294,7 +294,7 @@ def find_similar(
         row       = search_df.iloc[idx]
         close_val = float(row.get("close", 0))
         j         = _calc_price_journey(cache_df, date_str, close_val)
-        # Lấy vector values từ row CSV — dùng cho _format_context_split
+        # Lấy vector values từ row CSV — dùng cho _format_big_wave
         vec_vals  = {k: float(row[k]) for k in VECTOR_KEYS if k in row and pd.notna(row[k])}
         results.append({
             "date":             date_str,
@@ -468,56 +468,85 @@ def _best_holding(analogs: list) -> str:
     return f"{recommended}D (median dinh: {median_hold:.0f}D{wr_90_str})"
 
 
-def _format_context_split(analogs: list, cache_df=None) -> list[str]:
+def _format_big_wave(analogs: list) -> list[str]:
     """
-    Phân tích bối cảnh Success vs Failure dựa trên state vector tại ngày analog.
+    Big Wave Analysis — Đặc điểm Sóng Lớn (top 30% fwd_90).
 
     Thiết kế:
-    - Chia analogs thành 2 nhóm theo fwd_30 > 0 (Success) vs <= 0 (Failure)
-    - Với mỗi nhóm: tính mean + range [min, max] của 15 dimensions
-    - Highlight các dimension có sự phân kỳ rõ ràng giữa 2 nhóm
-    - KHÔNG tạo rule cứng — chỉ mô tả phân phối
-
-    Dùng vector đã lưu trong cache CSV (cache_df) hoặc từ analog dict trực tiếp
-    nếu analog có field vector (key trong VECTOR_KEYS).
+    - Lấy tất cả analogs có fwd_90 không None → tính ngưỡng p70 (top 30%)
+    - Nhóm "Sóng Lớn" = analogs có fwd_90 >= p70
+    - So sánh phân phối vector của Sóng Lớn vs phần còn lại
+    - Highlight top 3-5 dimension phân kỳ rõ nhất
+    - Hiển thị range [min, max] thay vì con số dứt khoát
+    - Tối thiểu 3 mẫu Sóng Lớn mới hiển thị
     """
-    MIN_GROUP = 5   # tối thiểu mỗi nhóm để phân tích có ý nghĩa
+    MIN_BIG_WAVE = 3   # tối thiểu mẫu Sóng Lớn
+    DIVERGE_THRESH = 0.18   # thấp hơn 0.20 vì so sánh với "phần còn lại" rộng hơn
 
-    # Lọc chỉ analogs có đủ fwd_30 và state vector
-    success, failure = [], []
+    # ── Bước 1: Lọc analogs có fwd_90 và vector ──────────────────────────
+    pool = []
     for a in analogs:
-        fwd = a.get("fwd_30")
-        if fwd is None:
+        fwd90 = a.get("fwd_90")
+        if fwd90 is None:
             continue
         vec = {k: a.get(k) for k in VECTOR_KEYS if a.get(k) is not None}
-        if len(vec) < 10:   # thiếu quá nhiều dimension → bỏ qua
+        if len(vec) < 10:
             continue
-        entry = {"fwd_30": fwd, "vec": vec, "date": a.get("date", "?")}
-        if fwd > 0:
-            success.append(entry)
-        else:
-            failure.append(entry)
+        pool.append({"fwd_90": fwd90, "vec": vec, "date": a.get("date", "?")})
 
-    ns, nf = len(success), len(failure)
-    total  = ns + nf
+    if len(pool) < MIN_BIG_WAVE + 2:   # cần đủ cả 2 nhóm
+        return []
 
-    # Không đủ MIN_GROUP mẫu ở ít nhất 1 nhóm → thông báo rõ, không ẩn im
-    if ns < MIN_GROUP or nf < MIN_GROUP:
-        missing = []
-        if ns < MIN_GROUP:
-            missing.append(f"thanh cong: {ns}/{MIN_GROUP}")
-        if nf < MIN_GROUP:
-            missing.append(f"that bai: {nf}/{MIN_GROUP}")
-        return [
-            "",
-            "═" * 38,
-            "BOI CANH LICH SU: THANH CONG vs THAT BAI",
-            "═" * 38,
-            f"Khong du mau de phan tich boi canh ({', '.join(missing)}, can >= {MIN_GROUP}/nhom).",
-            "─" * 38,
-        ]
+    # ── Bước 2: Tính ngưỡng p70 → top 30% = Sóng Lớn ────────────────────
+    fwd90_vals = np.array([e["fwd_90"] for e in pool])
+    p70 = float(np.percentile(fwd90_vals, 70))
 
-    # ── Labels thân thiện cho 15 dimensions ──────────────────────────────
+    big_wave = [e for e in pool if e["fwd_90"] >= p70]
+    rest     = [e for e in pool if e["fwd_90"] <  p70]
+
+    nb, nr = len(big_wave), len(rest)
+    if nb < MIN_BIG_WAVE:
+        return []
+
+    # ── Bước 3: Tính stats cho 2 nhóm ────────────────────────────────────
+    def _stats(entries: list) -> dict:
+        out = {}
+        for dim in VECTOR_KEYS:
+            vals = [e["vec"][dim] for e in entries if dim in e["vec"]]
+            if not vals:
+                continue
+            arr = np.array(vals, dtype=float)
+            out[dim] = {
+                "mean": float(np.mean(arr)),
+                "min":  float(np.min(arr)),
+                "max":  float(np.max(arr)),
+                "std":  float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0,
+            }
+        return out
+
+    bw_stats   = _stats(big_wave)
+    rest_stats = _stats(rest)
+
+    # ── Bước 4: Tìm dimension phân kỳ ────────────────────────────────────
+    divergent = []
+    for dim in VECTOR_KEYS:
+        if dim not in bw_stats or dim not in rest_stats:
+            continue
+        mb   = bw_stats[dim]["mean"]
+        mr   = rest_stats[dim]["mean"]
+        diff = mb - mr
+        noise = 0.5 * (bw_stats[dim]["std"] + rest_stats[dim]["std"])
+        if abs(diff) >= DIVERGE_THRESH and abs(diff) > noise:
+            divergent.append((
+                dim, diff, mb, mr,
+                bw_stats[dim]["min"],  bw_stats[dim]["max"],
+                rest_stats[dim]["min"], rest_stats[dim]["max"],
+            ))
+
+    divergent.sort(key=lambda x: -abs(x[1]))
+    top_div = divergent[:5]
+
+    # ── Bước 5: Labels ───────────────────────────────────────────────────
     _DIM_LABEL = {
         "rsi_norm":        "RSI",
         "macd_hist_norm":  "MACD Hist",
@@ -535,154 +564,94 @@ def _format_context_split(analogs: list, cache_df=None) -> list[str]:
         "vol_trend":       "Volume Trend",
         "candle_body":     "Than nen",
     }
+    _HIGH_MEANING = {
+        "rsi_norm":        "RSI trung tinh-thap",
+        "macd_hist_norm":  "MACD Hist duong manh",
+        "bb_position":     "gia giua BB",
+        "volume_spike":    "volume dot bien tang",
+        "trend_slope":     "SMA20 cat len SMA50",
+        "price_vs_sma20":  "gia tren SMA20",
+        "price_vs_sma50":  "gia tren SMA50",
+        "atr_ratio":       "bien dong cao (ATR lon)",
+        "stoch_k_norm":    "Stoch K tang",
+        "ema_cross":       "EMA12 vuot EMA26",
+        "momentum_5d":     "tang gia 5 phien gan",
+        "momentum_20d":    "xu huong tang 20 phien",
+        "high_low_pos":    "gia phan hoi tu day",
+        "vol_trend":       "vol ngan han tang manh",
+        "candle_body":     "than nen day (quyet doan)",
+    }
+    _LOW_MEANING = {
+        "rsi_norm":        "RSI cao (overbought)",
+        "macd_hist_norm":  "MACD Hist am/yeu",
+        "bb_position":     "gia sat BB upper/lower",
+        "volume_spike":    "volume binh thuong",
+        "trend_slope":     "SMA20 duoi SMA50",
+        "price_vs_sma20":  "gia duoi SMA20",
+        "price_vs_sma50":  "gia duoi SMA50",
+        "atr_ratio":       "bien dong thap (tich luy)",
+        "stoch_k_norm":    "Stoch K giam",
+        "ema_cross":       "EMA12 duoi EMA26",
+        "momentum_5d":     "gia phang/giam ngan han",
+        "momentum_20d":    "xu huong giam 20 phien",
+        "high_low_pos":    "gia o vung giua",
+        "vol_trend":       "vol on dinh/giam",
+        "candle_body":     "than nen nho (do du)",
+    }
 
-    # ── Tính stats cho từng nhóm ──────────────────────────────────────────
-    def _group_stats(entries: list) -> dict[str, dict]:
-        """Trả về {dim: {mean, min, max, std}} cho một nhóm."""
-        stats = {}
-        for dim in VECTOR_KEYS:
-            vals = [e["vec"][dim] for e in entries if dim in e["vec"]]
-            if not vals:
-                continue
-            arr = np.array(vals, dtype=float)
-            stats[dim] = {
-                "mean": float(np.mean(arr)),
-                "min":  float(np.min(arr)),
-                "max":  float(np.max(arr)),
-                "std":  float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0,
-                "n":    len(arr),
-            }
-        return stats
+    # ── Bước 6: Format ────────────────────────────────────────────────────
+    bw_fwd90_mean = float(np.mean([e["fwd_90"] for e in big_wave]))
+    rt_fwd90_mean = float(np.mean([e["fwd_90"] for e in rest]))
 
-    s_stats = _group_stats(success)
-    f_stats = _group_stats(failure)
-
-    # ── Tìm các dimension phân kỳ đáng chú ý ────────────────────────────
-    # Tiêu chí phân kỳ: |mean_S - mean_F| > 0.20 (trên thang [-1,1] hoặc [0,1])
-    # Và khoảng cách đó > 0.5 × (std_S + std_F) — tức khác biệt vượt noise
-    DIVERGE_THRESH = 0.20
-    divergent = []
-    for dim in VECTOR_KEYS:
-        if dim not in s_stats or dim not in f_stats:
-            continue
-        ms   = s_stats[dim]["mean"]
-        mf   = f_stats[dim]["mean"]
-        diff = ms - mf
-        noise = 0.5 * (s_stats[dim]["std"] + f_stats[dim]["std"])
-        if abs(diff) >= DIVERGE_THRESH and abs(diff) > noise:
-            divergent.append((dim, diff, ms, mf,
-                               s_stats[dim]["min"], s_stats[dim]["max"],
-                               f_stats[dim]["min"], f_stats[dim]["max"]))
-
-    # Sort theo |diff| giảm dần, lấy tối đa 5 dimension nổi bật nhất
-    divergent.sort(key=lambda x: -abs(x[1]))
-    top_div = divergent[:5]
-
-    # ── Format output ─────────────────────────────────────────────────────
     lines = [
         "",
         "═" * 38,
-        "BOI CANH LICH SU: THANH CONG vs THAT BAI",
+        f"SONG LON: TOP 30% FWD90 ({nb} mau, nguong >= {p70:+.1f}%)",
         "═" * 38,
-        # Cảnh báo overfitting nổi bật với số mẫu cụ thể
-        f"⚠️  CANH BAO: Day chi la mo ta lich su dua tren {total} mau doc lap,",
-        "    KHONG phai quy tac giao dich. Mau nho co the dan den",
-        "    ket luan ngau nhien. Khong dung de ra quyet dinh.",
+        f"⚠️  Chi {nb} mau Song Lon — mau rat nho, chi mang tinh tham khao.",
+        "    Khong su dung de ra quyet dinh giao dich.",
         "─" * 38,
-        # Dòng tổng số mẫu để user tự đánh giá tin cậy
-        f"Dua tren {total} mau doc lap ({ns} thanh cong, {nf} that bai).",
-        f"  Thanh cong: fwd30 TB = {np.mean([e['fwd_30'] for e in success]):+.1f}%"
-        f"  |  That bai: fwd30 TB = {np.mean([e['fwd_30'] for e in failure]):+.1f}%",
+        f"Song Lon ({nb} mau): fwd90 TB = {bw_fwd90_mean:+.1f}%",
+        f"Phan con lai ({nr} mau): fwd90 TB = {rt_fwd90_mean:+.1f}%",
         "",
     ]
 
     if not top_div:
-        lines.append("Khong co dimension nao phan ky ro rang giua 2 nhom (< 0.20 delta).")
-        lines.append("=> Hai nhom co boi canh ky thuat tuong tu — yeu to phan biet co the la macro/tin tuc.")
+        lines.append("Khong co dimension nao phan ky ro rang (< 0.18 delta).")
+        lines.append("=> Song Lon va phan con lai co boi canh ky thuat tuong tu.")
     else:
-        lines.append(f"TOP {len(top_div)} DIMENSION PHAN KY (|delta| >= 0.20):")
-        lines.append(f"  {'Dimension':<18} {'Thanh cong':>14}  {'That bai':>14}  {'Delta':>7}")
+        lines.append(f"TOP {len(top_div)} DIMENSION KHAC BIET (|delta| >= 0.18):")
+        lines.append(
+            f"  {'Dimension':<18} {'Song Lon':>14}  {'Con lai':>14}  {'Delta':>7}"
+        )
         lines.append("  " + "-" * 57)
-        for dim, diff, ms, mf, smin, smax, fmin, fmax in top_div:
+        for dim, diff, mb, mr, bmin, bmax, rmin, rmax in top_div:
             label = _DIM_LABEL.get(dim, dim)
             arrow = "▲ " if diff > 0 else "▼ "
             lines.append(
                 f"  {label:<18} "
-                f"{ms:>+6.2f}[{smin:+.2f},{smax:+.2f}]  "
-                f"{mf:>+6.2f}[{fmin:+.2f},{fmax:+.2f}]  "
+                f"{mb:>+6.2f}[{bmin:+.2f},{bmax:+.2f}]  "
+                f"{mr:>+6.2f}[{rmin:+.2f},{rmax:+.2f}]  "
                 f"{arrow}{abs(diff):.2f}"
             )
 
+        # Mô tả 1 dòng tóm tắt
+        bw_chars = []
+        for dim, diff, *_ in top_div[:3]:
+            bw_chars.append(
+                _HIGH_MEANING.get(dim, f"{dim} cao") if diff > 0
+                else _LOW_MEANING.get(dim, f"{dim} thap")
+            )
         lines.append("")
-        lines.append("MO TA NGAN GON:")
-        _desc = _natural_language_summary(top_div, _DIM_LABEL)
-        lines.extend(_desc)
+        lines.append(
+            f"  Song Lon thuong gap: {', '.join(bw_chars)}."
+        )
+        lines.append(
+            "  Luu y: Day la mo ta thong ke, khong phai dieu kien du/can."
+        )
 
     lines.append("─" * 38)
     return lines
-
-
-def _natural_language_summary(top_div: list, dim_label: dict) -> list[str]:
-    """
-    Chuyển top divergent dimensions thành mô tả ngôn ngữ tự nhiên.
-    Tối đa 3 dòng, tránh dùng ngôn ngữ dứt khoát ("luôn luôn", "chắc chắn").
-    """
-    # Mô tả chiều ý nghĩa của từng dimension khi cao/thấp
-    _HIGH_MEANING = {
-        "rsi_norm":       "RSI cao (vung mua qua)",
-        "macd_hist_norm": "MACD Hist duong (da tang)",
-        "bb_position":    "gia gan BB upper",
-        "volume_spike":   "volume dot bien tang",
-        "trend_slope":    "SMA20 tren SMA50 (uptrend)",
-        "price_vs_sma20": "gia tren SMA20",
-        "price_vs_sma50": "gia tren SMA50",
-        "atr_ratio":      "bien dong cao",
-        "stoch_k_norm":   "Stoch K cao",
-        "ema_cross":      "EMA12 tren EMA26",
-        "momentum_5d":    "da tang 5 phien",
-        "momentum_20d":   "da tang 20 phien",
-        "high_low_pos":   "gia gan dinh 20 phien",
-        "vol_trend":      "vol 5D > vol 20D",
-        "candle_body":    "than nen lon",
-    }
-    _LOW_MEANING = {
-        "rsi_norm":       "RSI thap (vung ban qua)",
-        "macd_hist_norm": "MACD Hist am (da giam)",
-        "bb_position":    "gia gan BB lower",
-        "volume_spike":   "volume suy giam",
-        "trend_slope":    "SMA20 duoi SMA50 (downtrend)",
-        "price_vs_sma20": "gia duoi SMA20",
-        "price_vs_sma50": "gia duoi SMA50",
-        "atr_ratio":      "bien dong thap",
-        "stoch_k_norm":   "Stoch K thap",
-        "ema_cross":      "EMA12 duoi EMA26",
-        "momentum_5d":    "da giam 5 phien",
-        "momentum_20d":   "da giam 20 phien",
-        "high_low_pos":   "gia gan day 20 phien",
-        "vol_trend":      "vol suy yeu",
-        "candle_body":    "than nen nho (do du)",
-    }
-
-    success_chars, failure_chars = [], []
-    for dim, diff, ms, mf, *_ in top_div[:3]:
-        # Success cao hơn failure
-        if diff > 0:
-            success_chars.append(_HIGH_MEANING.get(dim, f"{dim} cao"))
-            failure_chars.append(_LOW_MEANING.get(dim, f"{dim} thap"))
-        else:
-            success_chars.append(_LOW_MEANING.get(dim, f"{dim} thap"))
-            failure_chars.append(_HIGH_MEANING.get(dim, f"{dim} cao"))
-
-    desc = []
-    if success_chars:
-        desc.append(f"  Nhom THANH CONG thuong gap: {', '.join(success_chars)}.")
-    if failure_chars:
-        desc.append(f"  Nhom THAT BAI thuong gap: {', '.join(failure_chars)}.")
-    desc.append(
-        "  Luu y: Nhung dac diem tren chi xuat hien trong mau nho — "
-        "can them du lieu de xac nhan."
-    )
-    return desc
 
 
 def format_analog_report(
@@ -1000,8 +969,8 @@ def format_analog_report(
 
     footer = ["Luu y: Phan tich chi mang tinh tham khao. QK khong dam bao TL."]
 
-    # ── Phần 5: Phân tích bối cảnh (sau Kết luận, trước Cảnh báo) ────────
-    p5 = _format_context_split(analogs, cache_df=None)
+    # ── Phần 5: Big Wave Analysis (sau Kết luận, trước Cảnh báo) ─────────
+    p5 = _format_big_wave(analogs)
 
     return ("\n".join(p1 + p2 + p3 + p3b + p3c + p3d + p3e + p5 + p4 + footer))[:max_chars]
 
