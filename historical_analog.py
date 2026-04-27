@@ -549,7 +549,9 @@ def format_analog_report(
         ]
     if vf60: p3.append(f"  Median LN 60D : {float(np.median(vf60)):+.2f}%")
     if vf90: p3.append(f"  Median LN 90D : {float(np.median(vf90)):+.2f}%")
-    if vmdd: p3.append(f"  MAE TB (MDD)  : {float(np.mean(vmdd)):+.2f}%")
+    if vmdd:
+        mae_med = float(np.median(vmdd))
+        p3.append(f"  MAE TB (MDD)  : {float(np.mean(vmdd)):+.2f}% | Median: {mae_med:+.2f}%")
     if vmg:  p3.append(f"  MFE TB (Peak) : {float(np.mean(vmg)):+.2f}%")
     if vdv:  p3.append(f"  Bien dong TB  : {float(np.mean(vdv)):.1f}%/ngay")
     p3.append(f"  Thoi gian TU  : {_best_holding(analogs)}")
@@ -561,9 +563,12 @@ def format_analog_report(
     not_healed = len(vdd_any) - len(vrec)
     p3b = ["PHUC HOI SAU SUT GIAM:", "─" * 38]
     if vrec:
-        p3b.append(f"  Phuc hoi TB sau sut giam : {float(np.mean(vrec)):.0f} ngay (tren {len(vrec)} mau)")
-        if not_healed > 0:
-            p3b.append(f"  Chua hoi phuc trong 90D  : {not_healed} mau")
+        healed_n    = len(vrec)
+        not_heal_n  = not_healed
+        p3b.append(
+            f"  Phuc hoi TB sau sut giam : {float(np.mean(vrec)):.0f} ngay "
+            f"(tren {healed_n} mau co phuc hoi; {not_heal_n} mau khong phuc hoi trong 90D)"
+        )
     else:
         p3b.append("  Khong du lieu phuc hoi (tat ca chua ve hoa von trong 90D)")
     p3b.append("")
@@ -585,24 +590,41 @@ def format_analog_report(
         p3c.append("  Khong du lieu (khong co mau nao co drawdown >1%)")
     p3c.append("")
 
-    # ── CHANGE 3: Kế hoạch hành động ─────────────────────────────────
+    # ── CHANGE 3: Ke hoach hanh dong — MAE median SL + R:R ──────────
     p3d = []
     if vf30 and vmdd and vmg:
-        med30_ap = float(np.median(vf30))
-        p75_ap   = float(np.percentile(vf30, 75)) if n >= 4 else None
+        med30_ap  = float(np.median(vf30))
+        p75_ap    = float(np.percentile(vf30, 75)) if n >= 4 else None
+        mae_med_ap  = float(np.median(vmdd))           # MAE median dung cho SL
         mae_avg_ap  = float(np.mean(vmdd))
-        mae_worst_ap = float(min(vmdd))
-        current_close_vals = [a.get("close") for a in analogs if a.get("close")]
-        # Ambil giá tham chiếu từ meta nếu có, không thì skip
-        # Action plan chỉ hiện nếu có current_close từ caller context
-        # (format_analog_report không nhận current_price, nên dùng median close analogs làm ví dụ)
-        # Hiện kế hoạch theo % thay vì giá tuyệt đối để không sai
+        # Lay gia hien tai tu close cua analog cuoi cung (closest to present)
+        close_vals = [a.get("close", 0) for a in analogs if a.get("close", 0) > 0]
+        entry_price = float(close_vals[0]) if close_vals else 0.0
         p3d = ["KE HOACH HANH DONG (tu dong):", "─" * 38]
-        p3d.append(f"  SL (MAE TB)  : {mae_avg_ap:+.1f}% tu entry")
-        p3d.append(f"  SL Worst     : {mae_worst_ap:+.1f}% tu entry (MAE toi te nhat)")
-        p3d.append(f"  TP1 (Median) : {med30_ap:+.1f}% tu entry")
-        if p75_ap is not None:
-            p3d.append(f"  TP2 (P75)    : {p75_ap:+.1f}% tu entry")
+        if entry_price > 0:
+            # SL = MAE median + buffer -2%
+            sl_pct   = mae_med_ap - 2.0          # e.g. -14% - 2% = -16%
+            sl_price = entry_price * (1 + sl_pct / 100)
+            # TP1 = median return (P50)
+            tp1_price = entry_price * (1 + med30_ap / 100)
+            # R:R = TP_gain / SL_risk (so sanh voi entry)
+            sl_risk  = abs(sl_pct)                # % risk
+            tp1_gain = med30_ap                   # % gain
+            rr1 = round(tp1_gain / sl_risk, 1) if sl_risk > 0 else 0
+            p3d.append(f"  Entry  : {entry_price:,.1f} (gia hien tai)")
+            p3d.append(f"  SL     : {sl_price:,.1f} (MAE median {mae_med_ap:+.1f}% + buffer -2%) [{sl_pct:+.1f}%]")
+            p3d.append(f"  TP1    : {tp1_price:,.1f} ({med30_ap:+.1f}% - P50) | R:R = 1:{rr1}")
+            if p75_ap is not None:
+                tp2_price = entry_price * (1 + p75_ap / 100)
+                rr2 = round(p75_ap / sl_risk, 1) if sl_risk > 0 else 0
+                p3d.append(f"  TP2    : {tp2_price:,.1f} ({p75_ap:+.1f}% - P75) | R:R = 1:{rr2}")
+        else:
+            # Fallback: chi hien % neu khong co gia
+            sl_pct = mae_med_ap - 2.0
+            p3d.append(f"  SL     : {sl_pct:+.1f}% tu entry (MAE median + buffer -2%)")
+            p3d.append(f"  TP1    : {med30_ap:+.1f}% tu entry (P50)")
+            if p75_ap is not None:
+                p3d.append(f"  TP2    : {p75_ap:+.1f}% tu entry (P75)")
         if mae_avg_ap < -10:
             p3d.append(f"  ⚠️ MAE TB {mae_avg_ap:.1f}%: Chi vao lenh neu chap nhan rui ro sut giam manh")
         p3d.append("")

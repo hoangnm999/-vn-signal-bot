@@ -250,6 +250,7 @@ def _scan_one_symbol(symbol: str) -> dict:
                     a["close"] = current_price
 
         result_base.update({
+            "gate":            "PASS",   # BUG FIX: was left as "UNKNOWN" → excluded from valid_results
             "analogs":         analogs,
             "volume_avg_bill": volume_avg_bill,
             "cache_days":      cache_days,
