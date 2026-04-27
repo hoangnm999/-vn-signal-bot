@@ -50,13 +50,12 @@ DATA_DIR          = pathlib.Path("data")
 WAVE_CACHE_SUFFIX = "_waves.json"
 CACHE_MAX_AGE_DAYS = 7        # rebuild nếu cache > 7 ngày
 ZIGZAG_MIN_PCT    = 5.0       # fallback nếu auto-tune thất bại
-MAX_ZIGZAG_PCT    = 10.0      # giới hạn trên — sóng > 10% là super-cycle, không phải trading wave
-WAVE_TOP_PCT      = 30        # lấy top 30% sóng lớn nhất mỗi chiều
-TARGET_WAVES_MIN  = 10        # tối thiểu sóng mong muốn sau auto-tune
-TARGET_WAVES_MAX  = 60        # tối đa — tránh noise
+MAX_ZIGZAG_PCT    = 10.0      # giới hạn trên — sóng > 10% là super-cycle
+TARGET_WAVES_MIN  = 15        # tối thiểu sóng mong muốn sau auto-tune (tăng lại vì không còn filter top30%)
+TARGET_WAVES_MAX  = 80        # tối đa — tránh noise
 MIN_WAVES         = 5         # tối thiểu sóng mỗi nhóm để phân tích
-WARN_WAVES        = 10        # cảnh báo mẫu thấp khi n_up hoặc n_down < ngưỡng này
-MIN_MEANINGFUL_SCORE = 0.25   # ngưỡng tối thiểu để verdict có ý nghĩa (nếu cả 2 < ngưỡng → KHONG RO)
+WARN_WAVES        = 15        # cảnh báo mẫu thấp
+MIN_MEANINGFUL_SCORE = 0.25   # ngưỡng tối thiểu để verdict có ý nghĩa
 MIN_BARS_REQUIRED = 200       # tối thiểu bars lịch sử
 LOAD_DAYS         = 2000      # ~8 năm
 
@@ -260,25 +259,25 @@ def _zigzag(close: np.ndarray, min_pct: float = ZIGZAG_MIN_PCT) -> list[tuple[in
 
 def _extract_waves(
     pivots: list[tuple[int, float, str]],
-    wave_top_pct: int = WAVE_TOP_PCT,
 ) -> tuple[list[dict], list[dict]]:
     """
-    Từ danh sách pivots (đỉnh/đáy ZigZag), trích xuất các con sóng.
+    Từ danh sách pivots (đỉnh/đáy ZigZag), trích xuất TẤT CẢ các con sóng.
 
     Sóng tăng: BOT → TOP (amplitude = (top - bot) / bot * 100)
     Sóng giảm: TOP → BOT (amplitude = (top - bot) / top * 100)
 
-    Lọc top wave_top_pct% biên độ lớn nhất cho mỗi chiều.
+    Không filter thêm — ZigZag đã là bộ lọc (chỉ xác nhận pivot >= min_pct%).
+    Tất cả sóng ZigZag đều đủ biên độ có ý nghĩa.
 
     Returns:
         (waves_up, waves_down) — mỗi phần tử là dict:
         {
-            "start_idx":  int,    # index trong df gốc của điểm bắt đầu
+            "start_idx":  int,
             "end_idx":    int,
             "start_price": float,
             "end_price":   float,
-            "amplitude":  float,  # % tăng/giảm
-            "duration":   int,    # số ngày
+            "amplitude":  float,
+            "duration":   int,
             "type":       "UP" | "DOWN",
         }
     """
@@ -315,24 +314,7 @@ def _extract_waves(
                 "type":        "DOWN",
             })
 
-    # Lọc top wave_top_pct% theo biên độ — ngưỡng động
-    # Nếu sau filter còn ít hơn MIN_WAVES * 2 → bỏ filter, dùng tất cả
-    def _filter_top(waves: list[dict]) -> list[dict]:
-        if not waves:
-            return []
-        if len(waves) <= MIN_WAVES * 2:
-            # Quá ít sóng — không filter thêm, dùng hết
-            return waves
-        amps = [w["amplitude"] for w in waves]
-        thresh = float(np.percentile(amps, 100 - wave_top_pct))
-        filtered = [w for w in waves if w["amplitude"] >= thresh]
-        # Safety: nếu filter quá mạnh, giữ tối thiểu MIN_WAVES * 2
-        if len(filtered) < MIN_WAVES * 2:
-            waves_sorted = sorted(waves, key=lambda w: w["amplitude"], reverse=True)
-            return waves_sorted[:max(MIN_WAVES * 2, len(filtered))]
-        return filtered
-
-    return _filter_top(waves_up), _filter_top(waves_down)
+    return waves_up, waves_down
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -568,8 +550,8 @@ def build_wave_cache(symbol: str, force: bool = False) -> tuple[bool, str]:
     if len(pivots) < 6:
         return False, f"Khong du pivots ({len(pivots)}) — lich su qua ngan"
 
-    # Extract waves
-    waves_up, waves_down = _extract_waves(pivots, wave_top_pct=WAVE_TOP_PCT)
+    # Extract waves — dùng tất cả, không filter top%
+    waves_up, waves_down = _extract_waves(pivots)
 
     if len(waves_up) < MIN_WAVES:
         return False, f"Chi co {len(waves_up)} song tang (can >= {MIN_WAVES})"
@@ -608,7 +590,6 @@ def build_wave_cache(symbol: str, force: bool = False) -> tuple[bool, str]:
         "dur_up_mean":  round(dur_up_mean, 1),
         "dur_down_mean":round(dur_down_mean, 1),
         "zigzag_pct":  optimal_pct,
-        "wave_top_pct":WAVE_TOP_PCT,
         "dist_up":     dist_up,
         "dist_down":   dist_down,
         # Lưu vectors để so sánh sau nếu cần
@@ -751,11 +732,6 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
     score_up,   dim_z_up   = _zscore_membership(cur_arr, dist_up)
     score_down, dim_z_down = _zscore_membership(cur_arr, dist_down)
 
-    # Bootstrap confidence interval cho score (quan trọng khi n nhỏ)
-    vecs_up_raw   = [np.array(v, dtype=np.float32) for v in cache.get("vecs_up",   [])]
-    vecs_down_raw = [np.array(v, dtype=np.float32) for v in cache.get("vecs_down", [])]
-    score_up_ci, score_down_ci = _bootstrap_score_ci(cur_arr, vecs_up_raw, vecs_down_raw)
-
     # Verdict
     diff = score_up - score_down
     # Nếu cả 2 scores đều thấp → vector hiện tại là outlier so với cả 2 nhóm
@@ -797,8 +773,6 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
         "zigzag_pct":       cache.get("zigzag_pct", ZIGZAG_MIN_PCT),
         "score_up":         score_up,
         "score_down":       score_down,
-        "score_up_ci":      score_up_ci,    # (lo, hi) bootstrap 90% CI
-        "score_down_ci":    score_down_ci,
         "verdict":          verdict,
         "confidence":       round(abs(diff), 3),
         "top_dims":         top_dims,
@@ -949,21 +923,26 @@ def format_wave_report(result: dict) -> str:
         "🟡 KHONG RO RANG"
     )
 
-    ci_up   = result.get("score_up_ci",   (0.0, 0.0))
-    ci_down = result.get("score_down_ci", (0.0, 0.0))
-    # Hiển thị CI nếu khoảng rộng > 5% (tức là n nhỏ, đáng cảnh báo)
-    ci_up_str   = f"  CI90%: [{ci_up[0]:.0%} – {ci_up[1]:.0%}]"   if ci_up[1]   - ci_up[0]   > 0.05 else ""
-    ci_down_str = f"  CI90%: [{ci_down[0]:.0%} – {ci_down[1]:.0%}]" if ci_down[1] - ci_down[0] > 0.05 else ""
+    # Reliability label — thay CI số (quá rộng với n nhỏ, không thực dụng)
+    # Tiêu chí: n mẫu × score spread (confidence)
+    n_min_side = min(n_up, n_down)
+    def _reliability(n: int, conf: float) -> str:
+        if n >= 20 and conf >= 0.15: return "★★★ Cao"
+        if n >= 15 and conf >= 0.10: return "★★☆ Kha"
+        if n >= 10 and conf >= 0.08: return "★★☆ Kha (n gioi han)"
+        if n >= 7  and conf >= 0.08: return "★☆☆ Thap (n={})" .format(n)
+        return "☆☆☆ Rat thap (n={})".format(n)
+
+    reliability = _reliability(n_min_side, confidence)
 
     lines += [
         "SO SANH VOI HIEN TAI:",
         "─" * 40,
-        f"  Song tang : {bar_up} {score_up:.1%}" + (f"  {ci_up_str}" if ci_up_str else ""),
-        f"  Song giam : {bar_down} {score_down:.1%}" + (f"  {ci_down_str}" if ci_down_str else ""),
-        f"  Chenh lech: {confidence:.1%}",
+        f"  Song tang : {bar_up} {score_up:.1%}  (n={n_up})",
+        f"  Song giam : {bar_down} {score_down:.1%}  (n={n_down})",
+        f"  Chenh lech: {confidence:.1%}  |  Do tin cay: {reliability}",
         "",
         f"=> {verdict_em}",
-        f"   (Do tin cay: {'Cao' if confidence >= 0.15 else 'Trung binh' if confidence >= 0.08 else 'Thap'})",
         "",
     ]
 
