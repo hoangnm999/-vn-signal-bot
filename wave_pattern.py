@@ -608,6 +608,54 @@ def build_wave_cache(symbol: str, force: bool = False) -> tuple[bool, str]:
     )
 
 
+def _bootstrap_score_ci(
+    current_vec:   np.ndarray,
+    vecs_up:       list[np.ndarray],
+    vecs_down:     list[np.ndarray],
+    n_boot:        int = 500,
+    ci:            float = 0.90,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """
+    Bootstrap confidence interval cho score_up và score_down.
+
+    Với n nhỏ (8-15 mẫu), score điểm đơn rất không ổn định.
+    Bootstrap resample 500 lần, lấy percentile 5%-95% → CI 90%.
+
+    Returns:
+        (ci_up, ci_down) — mỗi cái là (lo, hi) float tuple.
+        Trả về (0.0, 0.0) nếu không đủ dữ liệu.
+    """
+    rng = np.random.default_rng(seed=42)
+    alpha = (1 - ci) / 2  # 0.05 cho CI 90%
+
+    def _boot_one(vecs: list[np.ndarray]) -> tuple[float, float]:
+        n = len(vecs)
+        if n < 3:
+            return (0.0, 0.0)
+        scores = []
+        mat = np.stack(vecs, axis=0)
+        for _ in range(n_boot):
+            idx    = rng.integers(0, n, size=n)
+            sample = mat[idx]
+            # Tính dist từ bootstrap sample
+            dist_b: dict = {}
+            for j, dim in enumerate(VECTOR_KEYS):
+                col = sample[:, j]
+                dist_b[dim] = {
+                    "mean": float(np.mean(col)),
+                    "std":  float(np.std(col, ddof=1)) if n > 1 else 0.01,
+                }
+            s, _ = _zscore_membership(current_vec, dist_b)
+            scores.append(s)
+        lo = float(np.percentile(scores, alpha * 100))
+        hi = float(np.percentile(scores, (1 - alpha) * 100))
+        return (round(lo, 3), round(hi, 3))
+
+    ci_up   = _boot_one(vecs_up)
+    ci_down = _boot_one(vecs_down)
+    return ci_up, ci_down
+
+
 def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
     """
     Phân tích sóng cho symbol và so sánh với vector hiện tại.
@@ -685,6 +733,11 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
     score_up,   dim_z_up   = _zscore_membership(cur_arr, dist_up)
     score_down, dim_z_down = _zscore_membership(cur_arr, dist_down)
 
+    # Bootstrap confidence interval cho score (quan trọng khi n nhỏ)
+    vecs_up_raw   = [np.array(v, dtype=np.float32) for v in cache.get("vecs_up",   [])]
+    vecs_down_raw = [np.array(v, dtype=np.float32) for v in cache.get("vecs_down", [])]
+    score_up_ci, score_down_ci = _bootstrap_score_ci(cur_arr, vecs_up_raw, vecs_down_raw)
+
     # Verdict
     diff = score_up - score_down
     if diff >= 0.08:
@@ -722,6 +775,8 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
         "zigzag_pct":       cache.get("zigzag_pct", ZIGZAG_MIN_PCT),
         "score_up":         score_up,
         "score_down":       score_down,
+        "score_up_ci":      score_up_ci,    # (lo, hi) bootstrap 90% CI
+        "score_down_ci":    score_down_ci,
         "verdict":          verdict,
         "confidence":       round(abs(diff), 3),
         "top_dims":         top_dims,
@@ -788,11 +843,15 @@ def format_wave_report(result: dict) -> str:
     ]
 
     # ── Cảnh báo mẫu thấp ─────────────────────────────────────────────────
-    if n_up < WARN_WAVES or n_down < WARN_WAVES:
+    low_side = []
+    if n_up < WARN_WAVES:
+        low_side.append(f"tang={n_up}")
+    if n_down < WARN_WAVES:
+        low_side.append(f"giam={n_down}")
+    if low_side:
         lines += [
-            f"⚠️  MAU THAP: {min(n_up, n_down)} song — ket qua mang tinh tham khao yeu.",
-            f"   (Khuyen nghi >= {WARN_WAVES} mau moi chieu de co y nghia thong ke)",
-            f"   Thu: /wave {sym} --rebuild de load them lich su.",
+            f"⚠️  MAU THAP ({', '.join(low_side)}) — ket qua mang tinh tham khao yeu.",
+            f"   Khoang tin cay rong khi n < {WARN_WAVES}. Xem CI bên dưới.",
             "",
         ]
 
@@ -868,11 +927,17 @@ def format_wave_report(result: dict) -> str:
         "🟡 KHONG RO RANG"
     )
 
+    ci_up   = result.get("score_up_ci",   (0.0, 0.0))
+    ci_down = result.get("score_down_ci", (0.0, 0.0))
+    # Hiển thị CI nếu khoảng rộng > 5% (tức là n nhỏ, đáng cảnh báo)
+    ci_up_str   = f"  CI90%: [{ci_up[0]:.0%} – {ci_up[1]:.0%}]"   if ci_up[1]   - ci_up[0]   > 0.05 else ""
+    ci_down_str = f"  CI90%: [{ci_down[0]:.0%} – {ci_down[1]:.0%}]" if ci_down[1] - ci_down[0] > 0.05 else ""
+
     lines += [
         "SO SANH VOI HIEN TAI:",
         "─" * 40,
-        f"  Song tang : {bar_up} {score_up:.1%}",
-        f"  Song giam : {bar_down} {score_down:.1%}",
+        f"  Song tang : {bar_up} {score_up:.1%}" + (f"  {ci_up_str}" if ci_up_str else ""),
+        f"  Song giam : {bar_down} {score_down:.1%}" + (f"  {ci_down_str}" if ci_down_str else ""),
         f"  Chenh lech: {confidence:.1%}",
         "",
         f"=> {verdict_em}",
