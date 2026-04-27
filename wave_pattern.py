@@ -10,8 +10,8 @@ Triết lý:
   Câu hỏi trả lời: "Hiện tại giống bối cảnh trước sóng tăng hay sóng giảm?"
 
 Pipeline:
-  1. ZigZag(min_pct=10%) → danh sách đỉnh/đáy cục bộ
-  2. Lọc sóng đủ biên độ (top 30% động)
+  1. ZigZag(min_pct=auto-tune 3-15%) → danh sách đỉnh/đáy cục bộ
+  2. Lọc sóng đủ biên độ (top 30% động, safety floor = MIN_WAVES*2)
   3. Tính vector tại điểm bắt đầu mỗi sóng (không lookahead bias)
   4. Tính phân phối (median, P25, P75) của 15 dimensions cho 2 nhóm
   5. Z-score membership: hiện tại nằm ở đâu trong phân phối mỗi nhóm
@@ -127,20 +127,19 @@ def _find_optimal_zigzag_pct(
     Tự động tìm ngưỡng ZigZag phù hợp nhất cho mã.
 
     Logic:
-    - Thử các ngưỡng từ nhỏ → lớn
-    - Chọn ngưỡng lớn nhất mà vẫn cho >= TARGET_WAVES_MIN sóng mỗi chiều
+    - Thử các ngưỡng từ LỚN → NHỎ (ưu tiên ngưỡng lớn = sóng có ý nghĩa hơn)
+    - Chọn ngưỡng LỚN NHẤT mà vẫn cho >= TARGET_WAVES_MIN sóng mỗi chiều
     - Không bao giờ vượt TARGET_WAVES_MAX (quá nhiều = noise)
-    - Fallback về ZIGZAG_MIN_PCT nếu không tìm được
+    - Fallback về ngưỡng nhỏ nhất trong candidates nếu không tìm được ngưỡng tốt
 
-    Ví dụ STB: 3%→80 sóng (quá nhiều), 5%→38 sóng (OK), 7%→22 sóng (OK),
-               10%→6 sóng (quá ít) → chọn 7%
+    Ví dụ STB: 15%→3 sóng, 12%→4 sóng, 10%→6 sóng, 7%→22 sóng (OK → chọn 7%),
+               5%→38 sóng (OK), 3%→80 sóng (quá nhiều)
     """
-    best_pct  = ZIGZAG_MIN_PCT
-    best_n    = 0
-
-    for pct in candidates:
+    # Đếm sóng cho từng ngưỡng — từ lớn → nhỏ
+    candidates_desc = sorted(candidates, reverse=True)
+    results = []
+    for pct in candidates_desc:
         pivots = _zigzag(close, min_pct=pct)
-        # Đếm sóng tăng (BOT→TOP) và sóng giảm (TOP→BOT) trước khi filter top30%
         n_up = sum(
             1 for i in range(len(pivots) - 1)
             if pivots[i][2] == "BOT" and pivots[i+1][2] == "TOP"
@@ -150,18 +149,29 @@ def _find_optimal_zigzag_pct(
             if pivots[i][2] == "TOP" and pivots[i+1][2] == "BOT"
         )
         n_min = min(n_up, n_down)
+        results.append((pct, n_min))
+        logger.debug(f"ZigZag tune {pct:.0f}%: {n_up}↑ {n_down}↓ → min={n_min}")
 
-        if n_min >= TARGET_WAVES_MIN and n_min <= TARGET_WAVES_MAX:
-            # Ưu tiên ngưỡng lớn hơn (ít sóng hơn nhưng có ý nghĩa hơn)
-            if pct > best_pct or best_n < TARGET_WAVES_MIN:
-                best_pct = pct
-                best_n   = n_min
-        elif n_min > TARGET_WAVES_MAX and best_n < TARGET_WAVES_MIN:
-            # Chưa tìm được ngưỡng tốt, ghi nhận tạm
-            best_pct = pct
-            best_n   = n_min
+    # Chọn ngưỡng lớn nhất trong vùng [TARGET_WAVES_MIN, TARGET_WAVES_MAX]
+    for pct, n_min in results:  # đã sort desc → gặp cái đầu tiên đạt yêu cầu là tốt nhất
+        if TARGET_WAVES_MIN <= n_min <= TARGET_WAVES_MAX:
+            logger.info(f"ZigZag auto-tune: chon {pct:.0f}% → {n_min} waves/side")
+            return pct
 
-    logger.info(f"ZigZag auto-tune: {best_pct:.0f}% → ~{best_n} waves/side")
+    # Không có ngưỡng nào trong vùng lý tưởng
+    # → Chọn ngưỡng nhỏ nhất có sóng > TARGET_WAVES_MAX (nhiều sóng nhất có ý nghĩa)
+    for pct, n_min in reversed(results):  # từ nhỏ → lớn
+        if n_min > TARGET_WAVES_MAX:
+            logger.info(f"ZigZag auto-tune (fallback many): {pct:.0f}% → {n_min} waves/side")
+            return pct
+
+    # Fallback: chọn ngưỡng nhỏ nhất (nhiều sóng nhất), dù dưới TARGET_WAVES_MIN
+    best_pct = min(candidates)
+    best_n   = next((n for p, n in results if p == best_pct), 0)
+    logger.warning(
+        f"ZigZag auto-tune: khong tim duoc nguong ly tuong, "
+        f"fallback {best_pct:.0f}% → {best_n} waves/side"
+    )
     return best_pct
 
 
@@ -298,12 +308,21 @@ def _extract_waves(
             })
 
     # Lọc top wave_top_pct% theo biên độ — ngưỡng động
+    # Nếu sau filter còn ít hơn MIN_WAVES * 2 → bỏ filter, dùng tất cả
     def _filter_top(waves: list[dict]) -> list[dict]:
         if not waves:
             return []
+        if len(waves) <= MIN_WAVES * 2:
+            # Quá ít sóng — không filter thêm, dùng hết
+            return waves
         amps = [w["amplitude"] for w in waves]
         thresh = float(np.percentile(amps, 100 - wave_top_pct))
-        return [w for w in waves if w["amplitude"] >= thresh]
+        filtered = [w for w in waves if w["amplitude"] >= thresh]
+        # Safety: nếu filter quá mạnh, giữ tối thiểu MIN_WAVES * 2
+        if len(filtered) < MIN_WAVES * 2:
+            waves_sorted = sorted(waves, key=lambda w: w["amplitude"], reverse=True)
+            return waves_sorted[:max(MIN_WAVES * 2, len(filtered))]
+        return filtered
 
     return _filter_top(waves_up), _filter_top(waves_down)
 
