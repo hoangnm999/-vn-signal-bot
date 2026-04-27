@@ -513,8 +513,13 @@ def format_analog_report(
                 if a.get("fwd_30") is not None and a.get("max_gain") and a["max_gain"] > 0]
         if caps:
             cr   = float(np.mean(caps))
-            note = "⚠️ exit som" if cr < 40 else "✅ hieu qua" if cr > 80 else ""
-            p2.append(f"  MFE thu duoc (30D) : {cr:.0f}%" + (" " + note if note else ""))
+            if cr < 40:
+                note = f"⚠️ exit som (Chi giu duoc {cr:.0f}% tiem nang – nen nam giu qua 30D)"
+            elif cr > 80:
+                note = f"✅ hieu qua (Giu duoc {cr:.0f}% muc loi nhuan tiem nang trong 30D)"
+            else:
+                note = f"(Giu duoc {cr:.0f}% muc loi nhuan tiem nang neu thoat sau 30D)"
+            p2.append(f"  MFE thu duoc (30D) : {cr:.0f}%  {note}")
     if vmgd:
         p2.append(f"  Hold den dinh TB   : {float(np.mean(vmgd)):.0f}D "
                   f"(median {float(np.median(vmgd)):.0f}D, max {int(max(vmgd))}D)")
@@ -603,28 +608,55 @@ def format_analog_report(
         p3d = ["KE HOACH HANH DONG (tu dong):", "─" * 38]
         if entry_price > 0:
             # SL = MAE median + buffer -2%
-            sl_pct   = mae_med_ap - 2.0          # e.g. -14% - 2% = -16%
-            sl_price = entry_price * (1 + sl_pct / 100)
-            # TP1 = median return (P50)
+            sl_pct    = mae_med_ap - 2.0           # e.g. -14% - 2% = -16%
+            sl_price  = entry_price * (1 + sl_pct / 100)
             tp1_price = entry_price * (1 + med30_ap / 100)
-            # R:R = TP_gain / SL_risk (so sanh voi entry)
-            sl_risk  = abs(sl_pct)                # % risk
-            tp1_gain = med30_ap                   # % gain
-            rr1 = round(tp1_gain / sl_risk, 1) if sl_risk > 0 else 0
+
+            # CHANGE 1: R:R dung gia tuyet doi
+            # Risk  = |Entry - SL|  (so tien co the mat)
+            # Reward = |TP - Entry| (so tien co the loi)
+            # Format "1:X" voi X = Reward/Risk (X > 1 la tot)
+            risk_abs  = abs(entry_price - sl_price)  # duong
+            rw1_abs   = abs(tp1_price - entry_price)
+            rr1 = round(rw1_abs / risk_abs, 1) if risk_abs > 0 else 0
+
             p3d.append(f"  Entry  : {entry_price:,.1f} (gia hien tai)")
             p3d.append(f"  SL     : {sl_price:,.1f} (MAE median {mae_med_ap:+.1f}% + buffer -2%) [{sl_pct:+.1f}%]")
             p3d.append(f"  TP1    : {tp1_price:,.1f} ({med30_ap:+.1f}% - P50) | R:R = 1:{rr1}")
             if p75_ap is not None:
                 tp2_price = entry_price * (1 + p75_ap / 100)
-                rr2 = round(p75_ap / sl_risk, 1) if sl_risk > 0 else 0
+                rw2_abs   = abs(tp2_price - entry_price)
+                rr2 = round(rw2_abs / risk_abs, 1) if risk_abs > 0 else 0
                 p3d.append(f"  TP2    : {tp2_price:,.1f} ({p75_ap:+.1f}% - P75) | R:R = 1:{rr2}")
+
+            # CHANGE 3: R:R khuyen nghi toi thieu, co dieu chinh theo WR
+            # WR cao -> nguong R:R co the thap hon (expectancy van duong)
+            # Cong thuc: min_rr = (1 - WR) / WR  (break-even R:R)
+            wr_ap = len([x for x in vf30 if x > 0]) / len(vf30) if vf30 else 0.5
+            breakeven_rr = round((1 - wr_ap) / wr_ap, 1) if wr_ap > 0 else 2.0
+            standard_rr  = 2.0   # rule of thumb pho bien
+            rec_rr = max(breakeven_rr, 1.0)  # toi thieu bang break-even, va >= 1.0
+
+            rr_best = rr2 if p75_ap is not None else rr1
+            if rr_best >= standard_rr:
+                rr_verdict = f"✅ DAT chuan 1:2.0"
+            elif rr_best >= breakeven_rr:
+                # >= break-even: expectancy duong, chap nhan duoc voi WR nay
+                rr_verdict = f"⚠️ CHAP NHAN DUOC (break-even R:R={breakeven_rr} voi WR {wr_ap:.0%})"
+            else:
+                rr_verdict = f"❌ THAP (< break-even {breakeven_rr} voi WR {wr_ap:.0%}) — can xem lai SL/TP"
+
+            p3d.append(f"  R:R khuyen nghi (1:2.0 chuan) | Thuc te tot nhat: 1:{rr_best} → {rr_verdict}")
         else:
             # Fallback: chi hien % neu khong co gia
             sl_pct = mae_med_ap - 2.0
+            risk_pct = abs(sl_pct)
+            rr1_pct = round(med30_ap / risk_pct, 1) if risk_pct > 0 else 0
             p3d.append(f"  SL     : {sl_pct:+.1f}% tu entry (MAE median + buffer -2%)")
-            p3d.append(f"  TP1    : {med30_ap:+.1f}% tu entry (P50)")
+            p3d.append(f"  TP1    : {med30_ap:+.1f}% tu entry (P50) | R:R = 1:{rr1_pct}")
             if p75_ap is not None:
-                p3d.append(f"  TP2    : {p75_ap:+.1f}% tu entry (P75)")
+                rr2_pct = round(p75_ap / risk_pct, 1) if risk_pct > 0 else 0
+                p3d.append(f"  TP2    : {p75_ap:+.1f}% tu entry (P75) | R:R = 1:{rr2_pct}")
         if mae_avg_ap < -10:
             p3d.append(f"  ⚠️ MAE TB {mae_avg_ap:.1f}%: Chi vao lenh neu chap nhan rui ro sut giam manh")
         p3d.append("")
