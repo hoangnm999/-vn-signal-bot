@@ -33,7 +33,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
-SCAN_TIMEOUT_SECS  = 600    # 10 phút hard limit
+SCAN_TIMEOUT_SECS  = 1800   # 30 phút — đủ cho ~50 mã / 3 workers (~60s/mã)
 MAX_WORKERS        = 3      # parallel workers
 CRON_HOUR          = 8      # 8:00 AM
 CRON_MINUTE        = 0
@@ -475,16 +475,30 @@ def format_scan_report(scan_result: dict) -> list[str]:
     # Footer: rejected + errors + timing
     footer_lines = [f"\n⏱️ Thời gian scan: {elapsed:.0f}s"]
     if partial:
-        footer_lines.append("⚠️ Kết quả chưa đầy đủ — một số mã bị timeout.")
+        # Liệt kê rõ mã nào bị timeout
+        timeout_syms = [r["symbol"] for r in rejected if "timeout" in r.get("reason","").lower()]
+        timeout_syms += [e.split(":")[0] for e in errors if "timeout" in e.lower()]
+        if timeout_syms:
+            syms_str = ", ".join(timeout_syms)
+            footer_lines.append(
+                f"⚠️ Ket qua chua day du — {len(timeout_syms)} ma bi timeout:"
+            )
+            footer_lines.append(f"  {syms_str}")
+        else:
+            footer_lines.append("⚠️ Ket qua chua day du — mot so ma bi timeout.")
     if rejected:
-        footer_lines.append(f"⏭️ Bị loại ({len(rejected)} mã):")
-        for r in rejected[:6]:
-            reason = r.get("reason", "unknown")[:60]
-            footer_lines.append(f"  • {r['symbol']}: {reason}")
-        if len(rejected) > 6:
-            footer_lines.append(f"  ... và {len(rejected)-6} mã khác")
+        non_timeout = [r for r in rejected if "timeout" not in r.get("reason","").lower()]
+        if non_timeout:
+            footer_lines.append(f"⏭️ Bi loai ({len(non_timeout)} ma):")
+            for r in non_timeout[:6]:
+                reason = r.get("reason", "unknown")[:60]
+                footer_lines.append(f"  • {r['symbol']}: {reason}")
+            if len(non_timeout) > 6:
+                footer_lines.append(f"  ... va {len(non_timeout)-6} ma khac")
     if errors:
-        footer_lines.append(f"❌ Lỗi: {'; '.join(errors[:3])}")
+        non_timeout_errs = [e for e in errors if "timeout" not in e.lower()]
+        if non_timeout_errs:
+            footer_lines.append(f"❌ Loi: {'; '.join(non_timeout_errs[:3])}")
 
     full = main_report + "\n".join(footer_lines)
 
