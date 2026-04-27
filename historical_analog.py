@@ -294,6 +294,8 @@ def find_similar(
         row       = search_df.iloc[idx]
         close_val = float(row.get("close", 0))
         j         = _calc_price_journey(cache_df, date_str, close_val)
+        # Lấy vector values từ row CSV — dùng cho _format_context_split
+        vec_vals  = {k: float(row[k]) for k in VECTOR_KEYS if k in row and pd.notna(row[k])}
         results.append({
             "date":             date_str,
             "similarity":       round(float(sims[idx]), 4),
@@ -305,11 +307,12 @@ def find_similar(
             "max_gain_day":     j["max_gain_day"],
             "max_drawdown":     j["max_drawdown"],
             "max_dd_day":       j["max_dd_day"],
-            "max_drawdown_30d": j.get("max_drawdown_30d"),   # MAE trong 30D — cơ sở tính SL
+            "max_drawdown_30d": j.get("max_drawdown_30d"),
             "daily_volatility": j["daily_volatility"],
             "conclusion":       j["conclusion"],
             "recovery_days":    j.get("recovery_days"),
             "outcome":          _classify_outcome(j["fwd_30"]),
+            **vec_vals,   # unpack 15 vector dimensions vào top-level dict
             "_meta": {
                 "total_matches":     total_matches,
                 "independent_n":     ind_n,
@@ -465,6 +468,223 @@ def _best_holding(analogs: list) -> str:
     return f"{recommended}D (median dinh: {median_hold:.0f}D{wr_90_str})"
 
 
+def _format_context_split(analogs: list, cache_df=None) -> list[str]:
+    """
+    Phân tích bối cảnh Success vs Failure dựa trên state vector tại ngày analog.
+
+    Thiết kế:
+    - Chia analogs thành 2 nhóm theo fwd_30 > 0 (Success) vs <= 0 (Failure)
+    - Với mỗi nhóm: tính mean + range [min, max] của 15 dimensions
+    - Highlight các dimension có sự phân kỳ rõ ràng giữa 2 nhóm
+    - KHÔNG tạo rule cứng — chỉ mô tả phân phối
+
+    Dùng vector đã lưu trong cache CSV (cache_df) hoặc từ analog dict trực tiếp
+    nếu analog có field vector (key trong VECTOR_KEYS).
+    """
+    MIN_GROUP = 5   # tối thiểu mỗi nhóm để phân tích có ý nghĩa
+
+    # Lọc chỉ analogs có đủ fwd_30 và state vector
+    success, failure = [], []
+    for a in analogs:
+        fwd = a.get("fwd_30")
+        if fwd is None:
+            continue
+        vec = {k: a.get(k) for k in VECTOR_KEYS if a.get(k) is not None}
+        if len(vec) < 10:   # thiếu quá nhiều dimension → bỏ qua
+            continue
+        entry = {"fwd_30": fwd, "vec": vec, "date": a.get("date", "?")}
+        if fwd > 0:
+            success.append(entry)
+        else:
+            failure.append(entry)
+
+    ns, nf = len(success), len(failure)
+    total  = ns + nf
+
+    # Không đủ MIN_GROUP mẫu ở ít nhất 1 nhóm → thông báo rõ, không ẩn im
+    if ns < MIN_GROUP or nf < MIN_GROUP:
+        missing = []
+        if ns < MIN_GROUP:
+            missing.append(f"thanh cong: {ns}/{MIN_GROUP}")
+        if nf < MIN_GROUP:
+            missing.append(f"that bai: {nf}/{MIN_GROUP}")
+        return [
+            "",
+            "═" * 38,
+            "BOI CANH LICH SU: THANH CONG vs THAT BAI",
+            "═" * 38,
+            f"Khong du mau de phan tich boi canh ({', '.join(missing)}, can >= {MIN_GROUP}/nhom).",
+            "─" * 38,
+        ]
+
+    # ── Labels thân thiện cho 15 dimensions ──────────────────────────────
+    _DIM_LABEL = {
+        "rsi_norm":        "RSI",
+        "macd_hist_norm":  "MACD Hist",
+        "bb_position":     "BB Position",
+        "volume_spike":    "Volume Spike",
+        "trend_slope":     "Trend (SMA20/50)",
+        "price_vs_sma20":  "Gia vs SMA20",
+        "price_vs_sma50":  "Gia vs SMA50",
+        "atr_ratio":       "ATR Ratio",
+        "stoch_k_norm":    "Stoch K",
+        "ema_cross":       "EMA Cross",
+        "momentum_5d":     "Momentum 5D",
+        "momentum_20d":    "Momentum 20D",
+        "high_low_pos":    "Vi tri 20D H/L",
+        "vol_trend":       "Volume Trend",
+        "candle_body":     "Than nen",
+    }
+
+    # ── Tính stats cho từng nhóm ──────────────────────────────────────────
+    def _group_stats(entries: list) -> dict[str, dict]:
+        """Trả về {dim: {mean, min, max, std}} cho một nhóm."""
+        stats = {}
+        for dim in VECTOR_KEYS:
+            vals = [e["vec"][dim] for e in entries if dim in e["vec"]]
+            if not vals:
+                continue
+            arr = np.array(vals, dtype=float)
+            stats[dim] = {
+                "mean": float(np.mean(arr)),
+                "min":  float(np.min(arr)),
+                "max":  float(np.max(arr)),
+                "std":  float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0,
+                "n":    len(arr),
+            }
+        return stats
+
+    s_stats = _group_stats(success)
+    f_stats = _group_stats(failure)
+
+    # ── Tìm các dimension phân kỳ đáng chú ý ────────────────────────────
+    # Tiêu chí phân kỳ: |mean_S - mean_F| > 0.20 (trên thang [-1,1] hoặc [0,1])
+    # Và khoảng cách đó > 0.5 × (std_S + std_F) — tức khác biệt vượt noise
+    DIVERGE_THRESH = 0.20
+    divergent = []
+    for dim in VECTOR_KEYS:
+        if dim not in s_stats or dim not in f_stats:
+            continue
+        ms   = s_stats[dim]["mean"]
+        mf   = f_stats[dim]["mean"]
+        diff = ms - mf
+        noise = 0.5 * (s_stats[dim]["std"] + f_stats[dim]["std"])
+        if abs(diff) >= DIVERGE_THRESH and abs(diff) > noise:
+            divergent.append((dim, diff, ms, mf,
+                               s_stats[dim]["min"], s_stats[dim]["max"],
+                               f_stats[dim]["min"], f_stats[dim]["max"]))
+
+    # Sort theo |diff| giảm dần, lấy tối đa 5 dimension nổi bật nhất
+    divergent.sort(key=lambda x: -abs(x[1]))
+    top_div = divergent[:5]
+
+    # ── Format output ─────────────────────────────────────────────────────
+    lines = [
+        "",
+        "═" * 38,
+        "BOI CANH LICH SU: THANH CONG vs THAT BAI",
+        "═" * 38,
+        # Cảnh báo overfitting nổi bật với số mẫu cụ thể
+        f"⚠️  CANH BAO: Day chi la mo ta lich su dua tren {total} mau doc lap,",
+        "    KHONG phai quy tac giao dich. Mau nho co the dan den",
+        "    ket luan ngau nhien. Khong dung de ra quyet dinh.",
+        "─" * 38,
+        # Dòng tổng số mẫu để user tự đánh giá tin cậy
+        f"Dua tren {total} mau doc lap ({ns} thanh cong, {nf} that bai).",
+        f"  Thanh cong: fwd30 TB = {np.mean([e['fwd_30'] for e in success]):+.1f}%"
+        f"  |  That bai: fwd30 TB = {np.mean([e['fwd_30'] for e in failure]):+.1f}%",
+        "",
+    ]
+
+    if not top_div:
+        lines.append("Khong co dimension nao phan ky ro rang giua 2 nhom (< 0.20 delta).")
+        lines.append("=> Hai nhom co boi canh ky thuat tuong tu — yeu to phan biet co the la macro/tin tuc.")
+    else:
+        lines.append(f"TOP {len(top_div)} DIMENSION PHAN KY (|delta| >= 0.20):")
+        lines.append(f"  {'Dimension':<18} {'Thanh cong':>14}  {'That bai':>14}  {'Delta':>7}")
+        lines.append("  " + "-" * 57)
+        for dim, diff, ms, mf, smin, smax, fmin, fmax in top_div:
+            label = _DIM_LABEL.get(dim, dim)
+            arrow = "▲ " if diff > 0 else "▼ "
+            lines.append(
+                f"  {label:<18} "
+                f"{ms:>+6.2f}[{smin:+.2f},{smax:+.2f}]  "
+                f"{mf:>+6.2f}[{fmin:+.2f},{fmax:+.2f}]  "
+                f"{arrow}{abs(diff):.2f}"
+            )
+
+        lines.append("")
+        lines.append("MO TA NGAN GON:")
+        _desc = _natural_language_summary(top_div, _DIM_LABEL)
+        lines.extend(_desc)
+
+    lines.append("─" * 38)
+    return lines
+
+
+def _natural_language_summary(top_div: list, dim_label: dict) -> list[str]:
+    """
+    Chuyển top divergent dimensions thành mô tả ngôn ngữ tự nhiên.
+    Tối đa 3 dòng, tránh dùng ngôn ngữ dứt khoát ("luôn luôn", "chắc chắn").
+    """
+    # Mô tả chiều ý nghĩa của từng dimension khi cao/thấp
+    _HIGH_MEANING = {
+        "rsi_norm":       "RSI cao (vung mua qua)",
+        "macd_hist_norm": "MACD Hist duong (da tang)",
+        "bb_position":    "gia gan BB upper",
+        "volume_spike":   "volume dot bien tang",
+        "trend_slope":    "SMA20 tren SMA50 (uptrend)",
+        "price_vs_sma20": "gia tren SMA20",
+        "price_vs_sma50": "gia tren SMA50",
+        "atr_ratio":      "bien dong cao",
+        "stoch_k_norm":   "Stoch K cao",
+        "ema_cross":      "EMA12 tren EMA26",
+        "momentum_5d":    "da tang 5 phien",
+        "momentum_20d":   "da tang 20 phien",
+        "high_low_pos":   "gia gan dinh 20 phien",
+        "vol_trend":      "vol 5D > vol 20D",
+        "candle_body":    "than nen lon",
+    }
+    _LOW_MEANING = {
+        "rsi_norm":       "RSI thap (vung ban qua)",
+        "macd_hist_norm": "MACD Hist am (da giam)",
+        "bb_position":    "gia gan BB lower",
+        "volume_spike":   "volume suy giam",
+        "trend_slope":    "SMA20 duoi SMA50 (downtrend)",
+        "price_vs_sma20": "gia duoi SMA20",
+        "price_vs_sma50": "gia duoi SMA50",
+        "atr_ratio":      "bien dong thap",
+        "stoch_k_norm":   "Stoch K thap",
+        "ema_cross":      "EMA12 duoi EMA26",
+        "momentum_5d":    "da giam 5 phien",
+        "momentum_20d":   "da giam 20 phien",
+        "high_low_pos":   "gia gan day 20 phien",
+        "vol_trend":      "vol suy yeu",
+        "candle_body":    "than nen nho (do du)",
+    }
+
+    success_chars, failure_chars = [], []
+    for dim, diff, ms, mf, *_ in top_div[:3]:
+        # Success cao hơn failure
+        if diff > 0:
+            success_chars.append(_HIGH_MEANING.get(dim, f"{dim} cao"))
+            failure_chars.append(_LOW_MEANING.get(dim, f"{dim} thap"))
+        else:
+            success_chars.append(_LOW_MEANING.get(dim, f"{dim} thap"))
+            failure_chars.append(_HIGH_MEANING.get(dim, f"{dim} cao"))
+
+    desc = []
+    if success_chars:
+        desc.append(f"  Nhom THANH CONG thuong gap: {', '.join(success_chars)}.")
+    if failure_chars:
+        desc.append(f"  Nhom THAT BAI thuong gap: {', '.join(failure_chars)}.")
+    desc.append(
+        "  Luu y: Nhung dac diem tren chi xuat hien trong mau nho — "
+        "can them du lieu de xac nhan."
+    )
+    return desc
+
+
 def format_analog_report(
     symbol:        str,
     analogs:       list,
@@ -499,9 +719,6 @@ def format_analog_report(
     vmgd = _vals("max_gain_day"); vdv = _vals("daily_volatility")
     n    = len(vf30)
 
-    # Số analogs bị drop do chưa có đủ 30 ngày dữ liệu tương lai
-    n_dropped_fwd30 = ind_n - n
-
     # ── Phần 1: Tóm tắt ──────────────────────────────────────────────
     p1 = [
         f"PHAN TICH TUONG DONG: {symbol}",
@@ -514,8 +731,6 @@ def format_analog_report(
         p1.append(f"  * Giam khoang cach loc: {MIN_SAMPLE_DISTANCE_DAYS}D->{min_dist}D")
     if ind_n < MIN_SAMPLE_WARNING:
         p1.append(f"  ⚠️ Mau nho ({ind_n} doc lap), do tin cay thap.")
-    if n_dropped_fwd30 > 0:
-        p1.append(f"  ⚠️ {n_dropped_fwd30}/{ind_n} mau chua co du 30 ngay tuong lai — WR/Expectancy tinh tren {n} mau.")
     p1.append("")
 
     # ── Phần 2: Tóm tắt hành trình giá ──────────────────────────────
@@ -784,7 +999,11 @@ def format_analog_report(
     p4 = (["CANH BAO:", "─" * 38] + warns + [""]) if warns else []
 
     footer = ["Luu y: Phan tich chi mang tinh tham khao. QK khong dam bao TL."]
-    return ("\n".join(p1 + p2 + p3 + p3b + p3c + p3d + p3e + p4 + footer))[:max_chars]
+
+    # ── Phần 5: Phân tích bối cảnh (sau Kết luận, trước Cảnh báo) ────────
+    p5 = _format_context_split(analogs, cache_df=None)
+
+    return ("\n".join(p1 + p2 + p3 + p3b + p3c + p3d + p3e + p5 + p4 + footer))[:max_chars]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
