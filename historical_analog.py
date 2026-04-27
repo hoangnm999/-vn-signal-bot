@@ -457,17 +457,20 @@ def _best_holding(analogs: list) -> str:
 
 
 def format_analog_report(
-    symbol:      str,
-    analogs:     list,
-    current_vec: dict,
-    max_chars:   int = 4000,
+    symbol:        str,
+    analogs:       list,
+    current_vec:   dict,
+    max_chars:     int   = 4000,
+    current_price: float = 0.0,   # gia hien tai thuc te — PHAI TRUYEN TU CALLER
 ) -> str:
     """
-    Báo cáo 4 phần — KHÔNG liệt kê từng ngày.
-    1. Tóm tắt nhanh (mẫu độc lập, MDS, ngưỡng)
-    2. Tóm tắt hành trình giá (MFE/MAE, capture rate, hold)
-    3. Thống kê đầy đủ đồng bộ scan_watchlist
-    4. Cảnh báo rủi ro
+    Bao cao 4 phan — KHONG liet ke tung ngay.
+    1. Tom tat nhanh (mau doc lap, MDS, nguong)
+    2. Tom tat hanh trinh gia (MFE/MAE, capture rate, hold)
+    3. Thong ke day du dong bo scan_watchlist
+    4. Canh bao rui ro
+    current_price: bat buoc truyen gia hien tai thuc te tu caller (vd: df["close"].iloc[-1])
+                   de hien Ke hoach hanh dong dung. Neu = 0 -> section bi an.
     """
     if not analogs:
         return f"Khong tim thay ngay tuong dong cho {symbol}."
@@ -602,10 +605,13 @@ def format_analog_report(
         p75_ap    = float(np.percentile(vf30, 75)) if n >= 4 else None
         mae_med_ap  = float(np.median(vmdd))           # MAE median dung cho SL
         mae_avg_ap  = float(np.mean(vmdd))
-        # Lay gia hien tai tu close cua analog cuoi cung (closest to present)
-        close_vals = [a.get("close", 0) for a in analogs if a.get("close", 0) > 0]
-        entry_price = float(close_vals[0]) if close_vals else 0.0
+        # entry_price = gia hien tai THUC TE truyen vao tu caller
+        # KHONG dung analog["close"] vi do la gia lich su (co the sai hoan toan)
+        entry_price = float(current_price) if current_price and current_price > 0 else 0.0
         p3d = ["KE HOACH HANH DONG (tu dong):", "─" * 38]
+        if entry_price <= 0:
+            p3d.append("  (Can truyen current_price vao format_analog_report de hien ke hoach)")
+            p3d.append("")
         if entry_price > 0:
             # SL = MAE median + buffer -2%
             sl_pct    = mae_med_ap - 2.0           # e.g. -14% - 2% = -16%
