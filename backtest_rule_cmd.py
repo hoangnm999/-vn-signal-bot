@@ -659,7 +659,8 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
                 from vn_loader import load_vn_ohlcv
                 _df_price = load_vn_ohlcv(symbol, days=5, min_bars=1)
                 if _df_price is not None and len(_df_price) > 0:
-                    _current_price = float(_df_price["close"].iloc[-1])
+                    # close tu vn_loader don vi NGHIN DONG → nhan 1000 ra dong
+                    _current_price = float(_df_price["close"].iloc[-1]) * 1000
             except Exception as _pe:
                 logger.warning(f"backtest_rule: lay gia hien tai {symbol} fail: {_pe}")
             report       = format_analog_report(symbol, analogs, state_vec,

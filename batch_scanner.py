@@ -94,12 +94,14 @@ def _scan_one_symbol(symbol: str) -> dict:
             if df is not None and len(df) >= 20:
                 close_arr  = df["close"].values[-20:]
                 vol_arr    = df["volume"].values[-20:]
-                # Volume TB 20 phiên × giá → tỷ VND
-                avg_vol_vnd = float((vol_arr * close_arr).mean())
+                # close tu vn_loader don vi NGHIN DONG (VD: 41.9 = 41,900d)
+                # → nhan them 1000 de doi ra dong truoc khi tinh thanh tien
+                avg_vol_vnd = float((vol_arr * close_arr).mean()) * 1000
                 volume_avg_bill = round(avg_vol_vnd / 1e9, 2)
-                current_price   = float(df["close"].iloc[-1])
-                logger.info(f"[{symbol}] volume_avg_bill={volume_avg_bill:.2f}B "
-                            f"current_price={current_price:.1f}")
+                # current_price nhan 1000 → don vi dong (dung cho ke hoach hanh dong)
+                current_price   = float(df["close"].iloc[-1]) * 1000
+                logger.info(f"[{symbol}] volume_avg_bill={volume_avg_bill:.2f}ty "
+                            f"current_price={current_price:.1f}k")
         except Exception as _ve:
             logger.debug(f"[{symbol}] volume load fail: {_ve}")
 
