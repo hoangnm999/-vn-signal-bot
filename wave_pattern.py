@@ -1121,20 +1121,19 @@ def format_wave_report(result: dict) -> str:
                   "─" * 40]
 
         def _discrim_bar(v: float) -> str:
-            # Bar đơn giản: 0 ở giữa, dương → phải (xanh), âm → trái (đỏ)
-            # Scale: mỗi ô = 5%, range [-25%, +25%] → 10 ô
-            steps = round(v / 0.05)           # +5% mỗi bước
-            steps = max(-5, min(5, steps))    # clamp [-5, +5]
-            mid   = "│"
+            # Bar: │ ở giữa, █ về phải = giống thật hơn, ▒ về trái = giống thường hơn
+            # Mỗi ô = 5%, range [-25%, +25%] → 5 ô mỗi bên
+            steps = round(v / 0.05)
+            steps = max(-5, min(5, steps))
             if steps >= 0:
                 right = "█" * steps + "░" * (5 - steps)
-                left  = " " * 5
-                bar   = f"[{left}{mid}{right}]"
+                left  = "░" * 5
+                bar   = f"[{left}│{right}]"
             else:
-                left  = "░" * (-steps) + " " * (5 + steps)
-                right = " " * 5
-                bar   = f"[{left}{mid}{right}]"
-            return bar  # dương = xanh bên phải, âm = đỏ bên trái
+                left  = "░" * (5 + steps) + "▒" * (-steps)
+                right = "░" * 5
+                bar   = f"[{left}│{right}]"
+            return bar
 
         def _discrim_label(v: float, mode: str) -> str:
             if mode == "bottom":
