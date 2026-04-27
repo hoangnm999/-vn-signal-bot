@@ -653,7 +653,17 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
                 return
 
             from historical_analog import format_analog_report
-            report       = format_analog_report(symbol, analogs, state_vec)
+            # Lay gia hien tai thuc te — KHONG dung analog["close"] vi do la gia lich su
+            _current_price = 0.0
+            try:
+                from vn_loader import load_vn_ohlcv
+                _df_price = load_vn_ohlcv(symbol, days=5, min_bars=1)
+                if _df_price is not None and len(_df_price) > 0:
+                    _current_price = float(_df_price["close"].iloc[-1])
+            except Exception as _pe:
+                logger.warning(f"backtest_rule: lay gia hien tai {symbol} fail: {_pe}")
+            report       = format_analog_report(symbol, analogs, state_vec,
+                                                current_price=_current_price)
             header_lines = [
                 f"PHAN TICH TUONG DONG: {symbol}",
                 f"Nguon: /check ({age_str}) | Verdict: {verdict}",
