@@ -275,52 +275,257 @@ def _extract_waves(
     Không filter thêm — ZigZag đã là bộ lọc (chỉ xác nhận pivot >= min_pct%).
     Tất cả sóng ZigZag đều đủ biên độ có ý nghĩa.
 
+    Sub-type classification (context layer, không tách phân phối):
+    ─────────────────────────────────────────────────────────────
+    Sóng tăng (UP): BOT[i] → TOP[i]
+      Nhìn pivot tiếp theo BOT[i+1]:
+      - after_lower_low = True  → BOT[i+1] < BOT[i]  → sóng tăng là relief rally
+      - after_lower_low = False → BOT[i+1] >= BOT[i] → sóng tăng là đáy thực (bottom)
+      sub_type: "BOTTOM_REAL" | "RELIEF_RALLY" | "UNKNOWN" (sóng cuối)
+
+    Sóng giảm (DOWN): TOP[i] → BOT[i]
+      Nhìn pivot tiếp theo TOP[i+1]:
+      - after_higher_high = True  → TOP[i+1] > TOP[i]  → sóng giảm là correction
+      - after_higher_high = False → TOP[i+1] <= TOP[i] → sóng giảm là peak thực
+      sub_type: "PEAK_REAL" | "CORRECTION" | "UNKNOWN" (sóng cuối)
+
     Returns:
         (waves_up, waves_down) — mỗi phần tử là dict:
         {
-            "start_idx":  int,
-            "end_idx":    int,
+            "start_idx":   int,
+            "end_idx":     int,
             "start_price": float,
             "end_price":   float,
-            "amplitude":  float,
-            "duration":   int,
-            "type":       "UP" | "DOWN",
+            "amplitude":   float,
+            "duration":    int,
+            "type":        "UP" | "DOWN",
+            "sub_type":    str,   # xem mô tả trên
+            "next_pivot_price": float | None,  # giá pivot tiếp theo (để debug)
         }
     """
     waves_up:   list[dict] = []
     waves_down: list[dict] = []
 
-    for i in range(len(pivots) - 1):
+    n_pivots = len(pivots)
+
+    for i in range(n_pivots - 1):
         p1_idx, p1_price, p1_type = pivots[i]
         p2_idx, p2_price, p2_type = pivots[i + 1]
 
         if p1_price <= 0:
             continue
 
+        # Pivot tiếp theo sau sóng (i+2) để xác định sub_type
+        # Đây là đỉnh/đáy sau khi sóng kết thúc — nhìn về tương lai của sóng
+        has_next   = (i + 2) < n_pivots
+        next_price = pivots[i + 2][1] if has_next else None
+
         if p1_type == "BOT" and p2_type == "TOP":
+            # Sóng tăng: BOT[i] → TOP[i]
+            # Pivot tiếp theo (i+2) là BOT[i+1]
             amp = (p2_price - p1_price) / p1_price * 100
+            if next_price is not None:
+                # BOT[i+1] < BOT[i] → lower low → đây là relief rally
+                after_lower_low = next_price < p1_price
+                sub_type = "RELIEF_RALLY" if after_lower_low else "BOTTOM_REAL"
+            else:
+                sub_type   = "UNKNOWN"
+                next_price = None
+
             waves_up.append({
-                "start_idx":   p1_idx,
-                "end_idx":     p2_idx,
-                "start_price": p1_price,
-                "end_price":   p2_price,
-                "amplitude":   round(amp, 2),
-                "duration":    p2_idx - p1_idx,
-                "type":        "UP",
+                "start_idx":       p1_idx,
+                "end_idx":         p2_idx,
+                "start_price":     p1_price,
+                "end_price":       p2_price,
+                "amplitude":       round(amp, 2),
+                "duration":        p2_idx - p1_idx,
+                "type":            "UP",
+                "sub_type":        sub_type,
+                "next_pivot_price": next_price,
             })
+
         elif p1_type == "TOP" and p2_type == "BOT":
+            # Sóng giảm: TOP[i] → BOT[i]
+            # Pivot tiếp theo (i+2) là TOP[i+1]
             amp = (p1_price - p2_price) / p1_price * 100
+            if next_price is not None:
+                # TOP[i+1] > TOP[i] → higher high → đây là correction
+                after_higher_high = next_price > p1_price
+                sub_type = "CORRECTION" if after_higher_high else "PEAK_REAL"
+            else:
+                sub_type   = "UNKNOWN"
+                next_price = None
+
             waves_down.append({
-                "start_idx":   p1_idx,
-                "end_idx":     p2_idx,
-                "start_price": p1_price,
-                "end_price":   p2_price,
-                "amplitude":   round(amp, 2),
-                "duration":    p2_idx - p1_idx,
-                "type":        "DOWN",
+                "start_idx":       p1_idx,
+                "end_idx":         p2_idx,
+                "start_price":     p1_price,
+                "end_price":       p2_price,
+                "amplitude":       round(amp, 2),
+                "duration":        p2_idx - p1_idx,
+                "type":            "DOWN",
+                "sub_type":        sub_type,
+                "next_pivot_price": next_price,
             })
 
     return waves_up, waves_down
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BƯỚC 2B — SUBTYPE STATS (context layer, không tách phân phối)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _subtype_stats(waves: list[dict]) -> dict:
+    """
+    Tính stats theo sub_type cho một chiều sóng (up hoặc down).
+
+    Không tách phân phối — chỉ tính median amplitude/duration theo subgroup
+    để dùng làm context layer trong report.
+
+    Returns dict:
+    {
+        "counts":  { sub_type: int },           # số sóng mỗi loại
+        "amp":     { sub_type: float },          # median amplitude
+        "dur":     { sub_type: float },          # median duration
+        "pct":     { sub_type: float },          # tỷ lệ %
+        "key_dims":{ sub_type: {dim: median} },  # median của key dims (trend_slope, momentum_20d)
+        "total_known": int,                      # tổng REAL + CORRECTION/RALLY (bỏ UNKNOWN)
+    }
+
+    Key dims được dùng để so sánh với vector hiện tại:
+    - trend_slope: SMA20 vs SMA50 — uptrend hay downtrend
+    - momentum_20d: xu hướng 20 ngày
+    - price_vs_sma50: khoảng cách giá vs MA50 — overextension
+    """
+    KEY_DIMS = ["trend_slope", "momentum_20d", "price_vs_sma50"]
+
+    counts:   dict[str, int]         = {}
+    amp_vals: dict[str, list[float]] = {}
+    dur_vals: dict[str, list[float]] = {}
+
+    for w in waves:
+        st = w.get("sub_type", "UNKNOWN")
+        counts[st]   = counts.get(st, 0) + 1
+        amp_vals.setdefault(st, []).append(w["amplitude"])
+        dur_vals.setdefault(st, []).append(float(w["duration"]))
+
+    amp_med = {st: float(np.median(v)) for st, v in amp_vals.items()}
+    dur_med = {st: float(np.median(v)) for st, v in dur_vals.items()}
+
+    total_known = sum(v for k, v in counts.items() if k != "UNKNOWN")
+    pct = {
+        st: round(n / total_known * 100, 1) if total_known > 0 else 0.0
+        for st, n in counts.items()
+        if st != "UNKNOWN"
+    }
+
+    return {
+        "counts":      counts,
+        "amp":         {k: round(v, 1) for k, v in amp_med.items()},
+        "dur":         {k: round(v, 1) for k, v in dur_med.items()},
+        "pct":         pct,
+        "total_known": total_known,
+    }
+
+
+def _compare_current_to_subtypes(
+    cur_vec:     np.ndarray,
+    waves:       list[dict],
+    df:          pd.DataFrame,
+    wave_type:   str,   # "UP" hoặc "DOWN"
+) -> dict:
+    """
+    So sánh vector hiện tại với median của từng subgroup theo KEY_DIMS.
+
+    Không tính score mới — chỉ tính khoảng cách (absolute diff) giữa
+    giá trị hiện tại và median của mỗi subgroup trên 3 key dims.
+
+    Kết quả: subgroup nào "gần" hơn → hiện tại giống loại đó hơn.
+
+    Returns:
+    {
+        "key_dims":  [str],             # 3 dims dùng để so sánh
+        "subtypes":  {
+            sub_type: {
+                "n":        int,
+                "medians":  {dim: float},   # median của subgroup
+                "cur_vals": {dim: float},   # giá trị hiện tại
+                "diffs":    {dim: float},   # |cur - median|
+                "total_dist": float,        # sum of |diffs| → nhỏ hơn = gần hơn
+            }
+        },
+        "closest":   str,   # subtype gần nhất
+        "margin":    float, # khoảng cách giữa closest và second closest
+    }
+    """
+    KEY_DIMS = ["trend_slope", "momentum_20d", "price_vs_sma50"]
+
+    # Map dim name → index trong VECTOR_KEYS
+    dim_indices = {d: VECTOR_KEYS.index(d) for d in KEY_DIMS if d in VECTOR_KEYS}
+    if not dim_indices:
+        return {}
+
+    # Tập hợp vectors theo subtype (chỉ dùng waves có sub_type != UNKNOWN)
+    sub_vecs: dict[str, list[np.ndarray]] = {}
+    for w in waves:
+        st = w.get("sub_type", "UNKNOWN")
+        if st == "UNKNOWN":
+            continue
+        idx = w["start_idx"]
+        if idx < 59:
+            continue
+        vec = compute_state_vector_for_date(df, idx)
+        if vec is None:
+            continue
+        arr = vec.get("_array")
+        if arr is not None and len(arr) == VECTOR_DIM:
+            sub_vecs.setdefault(st, []).append(arr.astype(np.float32))
+
+    if not sub_vecs:
+        return {}
+
+    # Tính median và khoảng cách với cur_vec
+    result_subtypes = {}
+    for st, vecs in sub_vecs.items():
+        if len(vecs) < 2:
+            continue
+        mat      = np.stack(vecs, axis=0)
+        medians  = {}
+        cur_vals = {}
+        diffs    = {}
+        for dim, j in dim_indices.items():
+            med        = float(np.median(mat[:, j]))
+            cur        = float(cur_vec[j])
+            medians[dim]  = round(med, 3)
+            cur_vals[dim] = round(cur, 3)
+            diffs[dim]    = round(abs(cur - med), 3)
+
+        total_dist = sum(diffs.values())
+        result_subtypes[st] = {
+            "n":          len(vecs),
+            "medians":    medians,
+            "cur_vals":   cur_vals,
+            "diffs":      diffs,
+            "total_dist": round(total_dist, 3),
+        }
+
+    if not result_subtypes:
+        return {}
+
+    # Tìm subtype gần nhất
+    sorted_st = sorted(result_subtypes.items(), key=lambda x: x[1]["total_dist"])
+    closest   = sorted_st[0][0]
+    margin    = (
+        round(sorted_st[1][1]["total_dist"] - sorted_st[0][1]["total_dist"], 3)
+        if len(sorted_st) >= 2 else 0.0
+    )
+
+    return {
+        "key_dims":  list(dim_indices.keys()),
+        "subtypes":  result_subtypes,
+        "closest":   closest,
+        "margin":    margin,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -678,6 +883,10 @@ def build_wave_cache(symbol: str, force: bool = False) -> tuple[bool, str]:
     dur_up_mean   = float(np.mean([w["duration"]  for w in waves_up]))
     dur_down_mean = float(np.mean([w["duration"]  for w in waves_down]))
 
+    # Subtype stats — context layer (không tách phân phối)
+    subtype_stats_up   = _subtype_stats(waves_up)
+    subtype_stats_down = _subtype_stats(waves_down)
+
     cache_data = {
         "symbol":      symbol,
         "built_at":    datetime.now().isoformat(),
@@ -697,6 +906,12 @@ def build_wave_cache(symbol: str, force: bool = False) -> tuple[bool, str]:
         "dist_false_top":    dist_false_top,       # G4: overbought thường (không tạo đỉnh)
         "n_false_bottom": len(vecs_false_bottom),
         "n_false_top":    len(vecs_false_top),
+        # Subtype stats — context layer
+        "subtype_stats_up":   subtype_stats_up,
+        "subtype_stats_down": subtype_stats_down,
+        # Lưu waves (có sub_type) để _compare_current_to_subtypes() dùng lại
+        "waves_up":   waves_up,
+        "waves_down": waves_down,
         # Lưu vectors để so sánh sau nếu cần
         "vecs_up":     [v.tolist() for v in vecs_up],
         "vecs_down":   [v.tolist() for v in vecs_down],
@@ -808,6 +1023,11 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
         "score_discrim_top":    0.0,   # G3 vs G4: đỉnh thực vs overbought thường
         "n_false_bottom": 0,
         "n_false_top":    0,
+        # Subtype context layer
+        "subtype_stats_up":    {},
+        "subtype_stats_down":  {},
+        "subtype_compare_up":  {},
+        "subtype_compare_down":{},
     }
 
     # Build/load cache
@@ -850,6 +1070,24 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
     score_false_top,    _ = _zscore_membership(cur_arr, dist_false_top)    if dist_false_top    else (0.0, [])
     score_discrim_bottom = round(score_up   - score_false_bottom, 3)
     score_discrim_top    = round(score_down - score_false_top,    3)
+
+    # Subtype context layer — so sánh hiện tại với median của từng subgroup
+    # Dùng waves đã lưu trong cache (có sub_type field)
+    waves_up_cached   = cache.get("waves_up",   [])
+    waves_down_cached = cache.get("waves_down", [])
+    subtype_stats_up   = cache.get("subtype_stats_up",   {})
+    subtype_stats_down = cache.get("subtype_stats_down", {})
+
+    # Load df một lần để dùng trong _compare_current_to_subtypes
+    # Ưu tiên dùng df_now nếu đủ bars, fallback load full
+    try:
+        from vn_loader import load_vn_ohlcv as _load_vn
+        df_full = _load_vn(symbol, days=LOAD_DAYS, min_bars=MIN_BARS_REQUIRED)
+    except Exception:
+        df_full = df_now  # fallback
+
+    subtype_compare_up   = _compare_current_to_subtypes(cur_arr, waves_up_cached,   df_full, "UP")
+    subtype_compare_down = _compare_current_to_subtypes(cur_arr, waves_down_cached, df_full, "DOWN")
 
     # Verdict
     diff = score_up - score_down
@@ -912,6 +1150,11 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
         "base_rate_down":     base_rate_down,
         "avg_interval_up":    avg_interval_up,
         "avg_interval_down":  avg_interval_down,
+        # Subtype context layer
+        "subtype_stats_up":    subtype_stats_up,
+        "subtype_stats_down":  subtype_stats_down,
+        "subtype_compare_up":  subtype_compare_up,
+        "subtype_compare_down":subtype_compare_down,
     })
     return result_base
 
@@ -919,6 +1162,167 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 # FORMAT OUTPUT
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _fmt_subtype_section(lines: list[str], result: dict, verdict: str) -> None:
+    """
+    Thêm section PHAN LOAI SONG vào lines (in-place).
+
+    Hiển thị:
+    - Tỷ lệ phân loại sóng (Loại A / Loại B) cho cả 2 chiều
+    - So sánh vector hiện tại với median của từng subgroup (key dims)
+    - Kết luận: hiện tại giống loại nào hơn
+    - Safety: chỉ hiển thị nếu total_known >= MIN_SUBTYPE_KNOWN
+
+    Hoàn toàn là context layer — không thay đổi verdict chính.
+    """
+    MIN_SUBTYPE_KNOWN = 6   # cần ít nhất 6 sóng có sub_type xác định
+
+    # Labels thân thiện
+    SUBTYPE_LABEL = {
+        # Sóng tăng
+        "BOTTOM_REAL":  "Day that     (Loai B)",
+        "RELIEF_RALLY": "Relief Rally (Loai A)",
+        # Sóng giảm
+        "PEAK_REAL":    "Peak that    (Loai B)",
+        "CORRECTION":   "Correction   (Loai A)",
+        "UNKNOWN":      "Chua xac dinh",
+    }
+    SUBTYPE_EMOJI = {
+        "BOTTOM_REAL":  "🟢",
+        "RELIEF_RALLY": "🟡",
+        "PEAK_REAL":    "🔴",
+        "CORRECTION":   "🟡",
+        "UNKNOWN":      "⚪",
+    }
+    # Mô tả ngắn khi "closest"
+    CLOSEST_DESC = {
+        "BOTTOM_REAL":  "Day that → co the tang ben vung, it co lower low",
+        "RELIEF_RALLY": "Relief Rally → tang ngan han trong downtrend, chu y lower low",
+        "PEAK_REAL":    "Peak that → co the giam sau va dai, it co higher high",
+        "CORRECTION":   "Correction → giam ngan han trong uptrend, chu y higher high",
+    }
+
+    KEY_DIM_LABEL = {
+        "trend_slope":   "Trend SMA20/50",
+        "momentum_20d":  "Momentum 20D",
+        "price_vs_sma50":"Gia vs SMA50",
+    }
+
+    def _fmt_one_side(
+        label_header: str,
+        stats: dict,
+        compare: dict,
+        subtype_a: str,   # e.g. "CORRECTION" / "RELIEF_RALLY"
+        subtype_b: str,   # e.g. "PEAK_REAL"  / "BOTTOM_REAL"
+    ) -> list[str]:
+        out = []
+        if not stats:
+            return out
+
+        counts      = stats.get("counts", {})
+        amp         = stats.get("amp",    {})
+        dur         = stats.get("dur",    {})
+        pct         = stats.get("pct",    {})
+        total_known = stats.get("total_known", 0)
+
+        if total_known < MIN_SUBTYPE_KNOWN:
+            return out   # không đủ mẫu → bỏ qua
+
+        out.append(label_header)
+        out.append("─" * 40)
+
+        for st in [subtype_a, subtype_b, "UNKNOWN"]:
+            n   = counts.get(st, 0)
+            if n == 0:
+                continue
+            lbl = SUBTYPE_LABEL.get(st, st)
+            em  = SUBTYPE_EMOJI.get(st, "")
+            p   = pct.get(st, 0.0)
+            a   = amp.get(st, 0.0)
+            d   = dur.get(st, 0.0)
+            if st == "UNKNOWN":
+                out.append(f"  {em} {lbl}: {n} song (cuoi chuoi, chua biet ket qua)")
+            else:
+                sign = "+" if st in ("BOTTOM_REAL", "RELIEF_RALLY") else "-"
+                out.append(
+                    f"  {em} {lbl}: {n} song ({p:.0f}%)  "
+                    f"TB {sign}{a:.0f}%  ~{d:.0f} ngay"
+                )
+
+        # So sánh hiện tại với subgroup
+        if compare and compare.get("subtypes"):
+            subtypes_data = compare["subtypes"]
+            closest       = compare.get("closest", "")
+            margin        = compare.get("margin",  0.0)
+            key_dims      = compare.get("key_dims", [])
+
+            out.append("")
+            out.append("  So sanh hien tai vs cac loai (3 key dims):")
+
+            # Header dims
+            dim_hdrs = "  ".join(f"{KEY_DIM_LABEL.get(d,d):>14}" for d in key_dims)
+            out.append(f"  {'':20}  {dim_hdrs}")
+
+            for st in [subtype_a, subtype_b]:
+                if st not in subtypes_data:
+                    continue
+                sd   = subtypes_data[st]
+                lbl  = SUBTYPE_LABEL.get(st, st)[:18]
+                meds = "  ".join(
+                    f"{sd['medians'].get(d,0):>+14.2f}" for d in key_dims
+                )
+                out.append(f"  {'['+lbl+']':<20}  {meds}")
+
+            # Hàng "Hien tai"
+            if subtypes_data:
+                first_st    = next(iter(subtypes_data))
+                cur_vals_ex = subtypes_data[first_st]["cur_vals"]
+                cur_row     = "  ".join(
+                    f"{cur_vals_ex.get(d,0):>+14.2f}" for d in key_dims
+                )
+                out.append(f"  {'[Hien tai]':<20}  {cur_row}")
+
+            # Kết luận
+            if closest and closest in subtypes_data:
+                em_c  = SUBTYPE_EMOJI.get(closest, "")
+                lbl_c = SUBTYPE_LABEL.get(closest, closest)
+                desc  = CLOSEST_DESC.get(closest, "")
+                margin_str = (
+                    f" (khoang cach: {margin:.3f})"
+                    if margin < 0.05 else ""  # chỉ note khi gần nhau
+                )
+                out.append("")
+                out.append(f"  → Hien tai gan nhat voi: {em_c} {lbl_c}{margin_str}")
+                if desc:
+                    out.append(f"     {desc}")
+                if margin < 0.05:
+                    out.append("     ⚠️  Hai loai rat gan nhau — khong ket luan ro rang.")
+
+        out.append("")
+        return out
+
+    # ── Sóng tăng ──────────────────────────────────────────────────────────
+    st_up  = result.get("subtype_stats_up",    {})
+    cmp_up = result.get("subtype_compare_up",  {})
+    lines += _fmt_one_side(
+        label_header = "PHAN LOAI SONG TANG (context layer):",
+        stats        = st_up,
+        compare      = cmp_up,
+        subtype_a    = "RELIEF_RALLY",
+        subtype_b    = "BOTTOM_REAL",
+    )
+
+    # ── Sóng giảm ──────────────────────────────────────────────────────────
+    st_dn  = result.get("subtype_stats_down",   {})
+    cmp_dn = result.get("subtype_compare_down", {})
+    lines += _fmt_one_side(
+        label_header = "PHAN LOAI SONG GIAM (context layer):",
+        stats        = st_dn,
+        compare      = cmp_dn,
+        subtype_a    = "CORRECTION",
+        subtype_b    = "PEAK_REAL",
+    )
+
 
 def format_wave_report(result: dict) -> str:
     """
@@ -1185,6 +1589,9 @@ def format_wave_report(result: dict) -> str:
                 cur = f"{cur_vec[j]:+.2f}" if j >= 0 else "?"
                 lines.append(f"  {lbl:<18} hien tai={cur}  z={z:+.2f}")
             lines.append("")
+
+    # ── Phân loại sóng — context layer ────────────────────────────────────
+    _fmt_subtype_section(lines, result, verdict)
 
     # ── Footer ────────────────────────────────────────────────────────────
     # Calibration note: dùng score và base_rate của verdict thực tế
