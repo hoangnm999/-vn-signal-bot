@@ -98,6 +98,8 @@ def _scan_one_symbol(symbol: str) -> dict:
                 avg_vol_vnd = float((vol_arr * close_arr).mean())
                 volume_avg_bill = round(avg_vol_vnd / 1e9, 2)
                 current_price   = float(df["close"].iloc[-1])
+                logger.info(f"[{symbol}] volume_avg_bill={volume_avg_bill:.2f}B "
+                            f"current_price={current_price:.1f}")
         except Exception as _ve:
             logger.debug(f"[{symbol}] volume load fail: {_ve}")
 
@@ -358,6 +360,18 @@ def run_batch_scan(
                 all_stats.append(stats)
                 valid_results[sym] = res
 
+    # Debug: log mã nào KHÔNG vào valid_results dù gate=PASS
+    for sym, res in raw_results.items():
+        if res.get("gate") == "PASS" and sym not in valid_results:
+            analogs = res.get("analogs")
+            n_ana   = len(analogs) if analogs else 0
+            if analogs:
+                from guardrails import compute_base_stats as _cbs
+                st = _cbs(analogs)
+                logger.warning(f"[BatchScan] {sym} gate=PASS analogs={n_ana} "
+                               f"but valid=False: stats={st}")
+            else:
+                logger.warning(f"[BatchScan] {sym} gate=PASS but no analogs")
     _progress(f"Tính Guard Rails cho {len(valid_results)} mã hợp lệ...")
 
     # Chạy guardrails với z-score đầy đủ
@@ -379,6 +393,7 @@ def run_batch_scan(
             continue
 
         if sym not in valid_results:
+            logger.warning(f"[BatchScan] {sym} gate={res.get('gate')} NOT in valid_results")
             rejected.append({"symbol": sym, "reason": "Không có analogs hợp lệ"})
             continue
 
@@ -393,7 +408,10 @@ def run_batch_scan(
         )
 
         if gr["gate"] == "REJECT":
-            rejected.append({"symbol": sym, "reason": gr.get("reason", "Gate reject")})
+            reason = gr.get("reason", "Gate reject")
+            logger.warning(f"[BatchScan] {sym} guardrail REJECT: {reason}")
+            _progress(f"  REJECT {sym}: {reason[:80]}")
+            rejected.append({"symbol": sym, "reason": reason})
             continue
 
         if gr["risk_tier"] == "EXCLUDED":
