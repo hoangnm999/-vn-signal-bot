@@ -732,13 +732,10 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
     score_up,   dim_z_up   = _zscore_membership(cur_arr, dist_up)
     score_down, dim_z_down = _zscore_membership(cur_arr, dist_down)
 
-    # Verdict
+    # Verdict — chỉ dựa trên diff, không gate bằng MIN_MEANINGFUL_SCORE
+    # MIN_MEANINGFUL_SCORE gây false KHONG RO khi hiện tại ở trạng thái trung lập
     diff = score_up - score_down
-    # Nếu cả 2 scores đều thấp → vector hiện tại là outlier so với cả 2 nhóm
-    # → không nên kết luận về chiều nào — đây là KHONG RO thực sự
-    if max(score_up, score_down) < MIN_MEANINGFUL_SCORE:
-        verdict = "KHONG RO"
-    elif diff >= 0.08:
+    if diff >= 0.08:
         verdict = "SONG TANG"
     elif diff <= -0.08:
         verdict = "SONG GIAM"
@@ -935,6 +932,13 @@ def format_wave_report(result: dict) -> str:
 
     reliability = _reliability(n_min_side, confidence)
 
+    # Weak signal note khi cả 2 scores thấp = trạng thái trung lập, không phải outlier
+    max_score = max(score_up, score_down)
+    weak_note = (
+        "  ⚡ Tin hieu yeu — thi truong dang trung lap / cho huong."
+        if max_score < MIN_MEANINGFUL_SCORE else ""
+    )
+
     lines += [
         "SO SANH VOI HIEN TAI:",
         "─" * 40,
@@ -943,20 +947,22 @@ def format_wave_report(result: dict) -> str:
         f"  Chenh lech: {confidence:.1%}  |  Do tin cay: {reliability}",
         "",
         f"=> {verdict_em}",
-        "",
     ]
+    if weak_note:
+        lines.append(weak_note)
+    lines.append("")
 
     # ── Top 5 dimensions điển hình nhất với hiện tại ──────────────────────
     # Filter: bỏ degenerate dims (z=nan), chỉ hiển thị dims hợp lệ
     def _valid_dims(dim_z_list):
         return [(d, z) for d, z in dim_z_list if z == z]  # z==z fails for nan
 
-    # Nếu cả 2 scores thấp → outlier situation → thông báo rõ
-    if max(score_up, score_down) < MIN_MEANINGFUL_SCORE:
+    # Khi cả 2 scores thấp: thị trường đang trung lập (không phải outlier kỹ thuật)
+    if max_score < MIN_MEANINGFUL_SCORE:
         lines += [
-            "⚠️  TRANG THAI HIEN TAI LA NGOAI LE (OUTLIER):",
-            "   Vector hien tai khong nam trong phan phoi cua ca 2 nhom.",
-            "   Day la trang thai chua tung xuat hien truoc song lon nao trong lich su.",
+            "ℹ️  TRANG THAI TRUNG LAP:",
+            "   Hien tai khong giong ro rang boi canh truoc song tang hay giam.",
+            "   Thuong gap khi thi truong dang tich luy hoac chua chon huong.",
             "",
         ]
 
