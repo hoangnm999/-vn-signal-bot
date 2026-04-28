@@ -509,9 +509,8 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     weights = _regime_data.get("weights", {})
                     _regime_msg = (
                         f"{_regime_line}\n"
-                        f"   Wave x{weights.get('wave',1):.1f} | "
-                        f"Analog x{weights.get('analog',1):.1f} | "
-                        f"Engine x{weights.get('engine',1):.1f}\n"
+                        f"   Tin hieu TANG x{weights.get('bull',1):.2f} | "
+                        f"Tin hieu GIAM x{weights.get('bear',1):.2f}\n"
                         f"   /regime --history de xem chi tiet"
                     )
                     await update.message.reply_text(_regime_msg)

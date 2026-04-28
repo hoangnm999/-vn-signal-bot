@@ -1102,7 +1102,10 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
     else:
         verdict = "KHONG RO"
 
-    # Regime weight — điều chỉnh score theo Market Regime VNINDEX
+    # Regime weight — điều chỉnh ĐỊNH HƯỚNG theo Market Regime VNINDEX
+    # Bull regime → khuếch đại score_up, giảm score_down
+    # Bear regime → khuếch đại score_down, giảm score_up
+    # Ví dụ STB ở R3 Bear Quiet: score_up ×0.8=10.7%, score_down ×1.2=61.3%
     regime_data    = None
     score_up_adj   = score_up
     score_down_adj = score_down
@@ -1110,9 +1113,10 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
     regime_note_dn = ""
     try:
         from market_regime import get_market_regime, apply_regime_weight
-        regime_data                  = get_market_regime()
-        score_up_adj,   regime_note_up = apply_regime_weight(score_up,   "wave", regime_data)
-        score_down_adj, regime_note_dn = apply_regime_weight(score_down, "wave", regime_data)
+        regime_data = get_market_regime()
+        score_up_adj, score_down_adj, regime_note_up, regime_note_dn = (
+            apply_regime_weight(score_up, score_down, regime_data)
+        )
     except Exception as _re:
         logger.debug(f"regime weight skip: {_re}")
 

@@ -80,13 +80,28 @@ REGIME_DESC = {
     4: "Downtrend bien dong — uu tien cash, tranh mo position moi",
 }
 
-# Weight điều chỉnh cho wave/analog signal theo regime
-# Format: (wave_weight, analog_weight)
+# Weight điều chỉnh ĐỊNH HƯỚNG cho wave/analog signal theo regime
+#
+# Triết lý: regime không scale cả 2 chiều xuống như nhau
+# mà TĂNG CƯỜNG chiều phù hợp với regime, GIẢM chiều ngược lại
+#
+# Format: {
+#   "bull": float,   # nhân vào score_up   (Bull signal)
+#   "bear": float,   # nhân vào score_down (Bear signal)
+#   "engine": float, # overall engine weight (cho /check)
+# }
+#
+# R1 Bull Quiet:    up ×1.2, down ×0.8  → Bull signal được khuếch đại
+# R2 Bull Volatile: up ×1.1, down ×0.9  → Bull nhẹ hơn vì vol cao = rủi ro đảo chiều
+# R3 Bear Quiet:    up ×0.8, down ×1.2  → Bear signal được khuếch đại
+# R4 Bear Volatile: up ×0.6, down ×1.4  → Bear rất mạnh, Bull bị giảm mạnh
+#
+# Giới hạn: nhân tối đa 1.4 để tránh score vượt 100% sau adjust
 REGIME_WEIGHTS = {
-    1: {"wave": 1.00, "analog": 1.00, "engine": 1.00},
-    2: {"wave": 0.70, "analog": 0.80, "engine": 0.85},
-    3: {"wave": 0.80, "analog": 0.70, "engine": 0.75},
-    4: {"wave": 0.30, "analog": 0.30, "engine": 0.40},
+    1: {"bull": 1.20, "bear": 0.80, "engine": 1.00},
+    2: {"bull": 1.10, "bear": 1.00, "engine": 0.85},  # bear neutral — vol cao, không dám giảm score_down
+    3: {"bull": 0.80, "bear": 1.20, "engine": 0.75},
+    4: {"bull": 0.60, "bear": 1.40, "engine": 0.40},
 }
 
 # Lời khuyên position sizing theo regime
@@ -416,16 +431,14 @@ def get_market_regime(force_rebuild: bool = False) -> dict:
 
 def get_signal_weights(regime: Optional[int] = None) -> dict:
     """
-    Lấy weights cho wave/analog/engine signal theo regime hiện tại.
-
-    Dùng trong analyze_wave(), historical_analog.py, batch_scanner.py.
-
-    Args:
-        regime: int 1-4, nếu None thì tự load regime hiện tại
+    Lấy directional weights theo regime hiện tại.
 
     Returns:
-        {"wave": float, "analog": float, "engine": float}
-        Fallback về R3 weights nếu load thất bại (conservative).
+        {"bull": float, "bear": float, "engine": float}
+        - bull:   nhân vào score_up   (khuếch đại hay giảm nhẹ tín hiệu tăng)
+        - bear:   nhân vào score_down (khuếch đại hay giảm nhẹ tín hiệu giảm)
+        - engine: overall weight cho 16 engines (/check)
+        Fallback về R3 nếu load thất bại (conservative).
     """
     if regime is not None:
         return REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS[3])
@@ -569,11 +582,13 @@ def format_regime_report(regime_data: dict, show_history: bool = False) -> str:
         return "[" + "█" * filled + "░" * (5 - filled) + "]"
 
     lines += [
-        "DIEU CHINH WEIGHT SIGNAL:",
+        "DIEU CHINH WEIGHT SIGNAL (directional):",
         "─" * 40,
-        f"  Wave Analysis : {_w_bar(weights['wave'])} {weights['wave']:.0%}",
-        f"  Historical Analog: {_w_bar(weights['analog'])} {weights['analog']:.0%}",
-        f"  16 Engines    : {_w_bar(weights['engine'])} {weights['engine']:.0%}",
+        f"  Tin hieu TANG (score_up)  : {_w_bar(weights['bull'])} x{weights['bull']:.2f}",
+        f"  Tin hieu GIAM (score_down): {_w_bar(weights['bear'])} x{weights['bear']:.2f}",
+        f"  16 Engines overall        : {_w_bar(weights['engine'])} x{weights['engine']:.2f}",
+        "  * Bull regime: khuech dai score_up, giam score_down",
+        "  * Bear regime: khuech dai score_down, giam score_up",
         "",
         f"📊 Position sizing: {pos_advice}",
         "",
@@ -648,42 +663,55 @@ def format_regime_inline(regime_data: dict) -> str:
     weights = regime_data["weights"]
     return (
         f"{emoji} Regime: R{r} {label} "
-        f"| wave×{weights['wave']:.1f} analog×{weights['analog']:.1f}"
+        f"| Bull×{weights['bull']:.2f} Bear×{weights['bear']:.2f}"
     )
 
 
-def apply_regime_weight(score: float, signal_type: str,
-                         regime_data: Optional[dict] = None) -> tuple[float, str]:
+def apply_regime_weight(
+    score_up:    float,
+    score_down:  float,
+    regime_data: Optional[dict] = None,
+) -> tuple[float, float, str, str]:
     """
-    Áp dụng regime weight vào score của một signal.
+    Áp dụng directional regime weight vào cặp score (up, down).
+
+    Logic:
+      - Regime Bull → khuếch đại score_up, giảm score_down
+      - Regime Bear → khuếch đại score_down, giảm score_up
+      → Verdict sau điều chỉnh rõ ràng hơn, không phải scale đều cả 2
 
     Args:
-        score:       score gốc (0-1)
-        signal_type: "wave" | "analog" | "engine"
+        score_up:    score gốc chiều tăng (0-1)
+        score_down:  score gốc chiều giảm (0-1)
         regime_data: dict từ get_market_regime(), nếu None thì tự load
 
     Returns:
-        (adjusted_score, note_str)
-        note_str: mô tả điều chỉnh, ví dụ "×0.30 (R4 Bear Volatile)"
+        (adj_up, adj_down, note_up, note_down)
+        adj_*: score đã điều chỉnh, clip tại [0, 1]
+        note_*: mô tả điều chỉnh
     """
     if regime_data is None:
         try:
             regime_data = get_market_regime()
         except Exception:
-            return score, ""
+            return score_up, score_down, "", ""
 
     if not regime_data.get("ok"):
-        return score, ""
+        return score_up, score_down, "", ""
 
-    weights = regime_data.get("weights", REGIME_WEIGHTS[3])
-    weight  = weights.get(signal_type, 1.0)
-    r       = regime_data.get("regime", 3)
-    label   = REGIME_LABELS[r].split("—")[1].strip()
+    weights    = regime_data.get("weights", REGIME_WEIGHTS[3])
+    w_bull     = weights.get("bull", 1.0)
+    w_bear     = weights.get("bear", 1.0)
+    r          = regime_data.get("regime", 3)
+    label      = REGIME_LABELS[r].split("—")[1].strip()
 
-    adjusted = round(score * weight, 3)
-    note     = f"×{weight:.2f} (R{r} {label})"
+    adj_up   = round(min(1.0, score_up   * w_bull), 3)
+    adj_down = round(min(1.0, score_down * w_bear), 3)
 
-    return adjusted, note
+    note_up   = f"×{w_bull:.2f} (R{r} {label})"
+    note_down = f"×{w_bear:.2f} (R{r} {label})"
+
+    return adj_up, adj_down, note_up, note_down
 
 
 # ══════════════════════════════════════════════════════════════════════════════
