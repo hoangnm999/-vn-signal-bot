@@ -1603,16 +1603,150 @@ def _score_bar(score: float, width: int = 10) -> str:
     return "[" + "█" * filled + "░" * (width - filled) + "]"
 
 
+def _build_sr_debug_report(symbol: str) -> str:
+    """
+    Build debug report cho Stock Regime GMM.
+    Gọi từ /wave <MA> --debug — gửi như tin nhắn thứ 2.
+
+    Kiểm tra:
+      1. SR probs thực tế (không làm tròn) — detect confidence 100% giả
+      2. Centroid separation — 4 cluster có tách biệt hợp lý không
+      3. Số bars thực tế được dùng
+      4. Inertia / log-likelihood — fit quality
+      5. Vector hiện tại của mã — 15 dims
+    """
+    lines = [f"🔬 DEBUG Stock Regime — {symbol}", "─" * 38]
+
+    try:
+        from stock_regime import (
+            get_stock_regime, _build_vector_matrix, _fit_gmm,
+            _predict_current, SR_LABELS,
+        )
+        from vn_loader import load_vn_ohlcv
+    except ImportError as e:
+        return f"❌ Import fail: {e}"
+
+    # ── 1. Load data + build vectors ─────────────────────────────────────────
+    try:
+        df = load_vn_ohlcv(symbol, days=600, min_bars=120)
+        lines.append(f"📂 Data: {len(df)} bars loaded")
+    except Exception as e:
+        return f"❌ Load data fail: {e}"
+
+    vectors = _build_vector_matrix(df, max_bars=500)
+    if vectors is None:
+        return f"❌ Khong du vectors de fit GMM"
+
+    n_vecs = len(vectors)
+    lines.append(f"📐 Vectors built: {n_vecs} (tu {len(df)} bars)")
+
+    # ── 2. Fit GMM ────────────────────────────────────────────────────────────
+    fit_result = _fit_gmm(vectors)
+    if fit_result is None:
+        return f"❌ GMM fit that bai"
+
+    gmm, scaler, label_mapping, centroids = fit_result
+
+    # Log-likelihood — đo fit quality (càng cao càng tốt)
+    try:
+        ll = gmm.score(scaler.transform(vectors))
+        lines.append(f"📈 GMM log-likelihood: {ll:.4f} (>-10 la tot)")
+    except Exception:
+        pass
+
+    # ── 3. Centroid separation ────────────────────────────────────────────────
+    lines.append("")
+    lines.append("CENTROID SUMMARY (4 clusters):")
+    lines.append("─" * 38)
+
+    # Header
+    lines.append(f"  {'SR':<4} {'Label':<14} {'Momentum':>9} {'Volume':>8} {'Trend':>7}")
+
+    # Sort theo SR label để dễ đọc
+    centroid_rows = []
+    for c_idx, sr_idx in label_mapping.items():
+        c = centroids[c_idx]
+        momentum = float(c[10] + c[11])   # momentum_5d + momentum_20d
+        volume   = float(c[3])             # volume_spike
+        trend    = float(c[4])             # trend_slope
+        centroid_rows.append((sr_idx, SR_LABELS[sr_idx].split("—")[1].strip(),
+                               momentum, volume, trend))
+    centroid_rows.sort(key=lambda x: x[0])
+
+    for sr_idx, label, momentum, volume, trend in centroid_rows:
+        em = {1: "🔵", 2: "🟢", 3: "🟡", 4: "🔴"}.get(sr_idx, "⚪")
+        lines.append(
+            f"  {em} SR{sr_idx} {label:<14} "
+            f"{momentum:>+8.3f}  {volume:>+7.3f}  {trend:>+6.3f}"
+        )
+
+    # Kiểm tra separation: momentum SR2 phải > SR3 > SR1 > SR4
+    mom_vals = {row[0]: row[2] for row in centroid_rows}
+    sep_ok = (mom_vals.get(2, 0) > mom_vals.get(3, 0) >
+              mom_vals.get(1, 0) > mom_vals.get(4, 0))
+    lines.append("")
+    lines.append(
+        f"  Momentum ordering: {'✅ SR2>SR3>SR1>SR4 (hop ly)' if sep_ok else '⚠️ Sai thu tu — label co the bi nham'}"
+    )
+
+    # ── 4. Current vector → raw probs ────────────────────────────────────────
+    lines.append("")
+    lines.append("RAW PROBABILITIES (vector hom nay):")
+    lines.append("─" * 38)
+
+    current_vec = vectors[-1]
+    sr, conf, sr_probs = _predict_current(gmm, scaler, label_mapping, current_vec)
+
+    for i, (prob, label_row) in enumerate(zip(sr_probs, centroid_rows)):
+        sr_i   = label_row[0]
+        lbl    = label_row[1]
+        em     = {1: "🔵", 2: "🟢", 3: "🟡", 4: "🔴"}.get(sr_i, "⚪")
+        bar    = "█" * round(prob * 20) + "░" * (20 - round(prob * 20))
+        marker = " ← CURRENT" if sr_i == sr else ""
+        lines.append(f"  {em} SR{sr_i} [{bar}] {prob:.4f} ({prob:.1%}){marker}")
+
+    lines.append("")
+    if conf >= 0.9999:
+        lines.append("  ⚠️  CANH BAO: prob=100% — co the GMM degenerate")
+        lines.append("  Kiem tra: centroid co cluster nao qua sát nhau khong?")
+        lines.append("  Fix: thu force_rebuild hoac tang reg_covar trong stock_regime.py")
+    elif conf >= 0.75:
+        lines.append(f"  ✅ Confidence {conf:.1%} — GMM separation tot")
+    else:
+        lines.append(f"  🟡 Confidence {conf:.1%} — dang o bien gioi, binh thuong")
+
+    # ── 5. Current vector values (top 5 dims) ────────────────────────────────
+    lines.append("")
+    lines.append("VECTOR HIEN TAI (5 dims quan trong nhat):")
+    lines.append("─" * 38)
+
+    from state_vector import VECTOR_DIMS
+    dim_vals = list(zip(VECTOR_DIMS, current_vec))
+    # Sort by absolute value — dims nào đang "kéo" mạnh nhất
+    dim_vals_sorted = sorted(dim_vals, key=lambda x: abs(x[1]), reverse=True)[:5]
+    for dim, val in dim_vals_sorted:
+        bar_len = round(abs(val) * 10)
+        direction = "+" if val >= 0 else "-"
+        bar = direction * bar_len + "·" * (10 - bar_len)
+        lines.append(f"  {dim:<18} [{bar}] {val:+.3f}")
+
+    lines.append("─" * 38)
+    lines.append("ℹ️  /wave HAH --debug --rebuild de fit lai GMM moi")
+
+    return "\n".join(lines)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TELEGRAM COMMAND HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def wave_cmd(update, context):
     """
-    /wave <MÃ> [--rebuild]
+    /wave <MÃ> [--rebuild] [--debug]
 
     Phân tích sóng lịch sử cho mã cổ phiếu.
     --rebuild: bỏ qua cache, build lại từ đầu.
+    --debug:   in thêm thông tin GMM Stock Regime để kiểm tra độ tin cậy.
     """
     try:
         from bot import is_allowed, _deny
@@ -1627,9 +1761,10 @@ async def wave_cmd(update, context):
     args = context.args or []
     if not args:
         await update.message.reply_text(
-            "Cu phap: /wave <MA> [--rebuild]\n"
+            "Cu phap: /wave <MA> [--rebuild] [--debug]\n"
             "Vi du:  /wave STB\n"
-            "        /wave HAH --rebuild\n\n"
+            "        /wave HAH --rebuild\n"
+            "        /wave HAH --debug\n\n"
             "Phan tich song lich su: tim dau hieu chung truoc song tang/giam\n"
             "va so sanh voi trang thai hien tai."
         )
@@ -1643,10 +1778,12 @@ async def wave_cmd(update, context):
 
     symbol        = symbol_raw
     force_rebuild = "--rebuild" in args
+    debug_mode    = "--debug"   in args
 
     msg = await update.message.reply_text(
         f"🔍 Dang phan tich song lich su: {symbol}...\n"
         f"{'(Rebuild cache) ' if force_rebuild else ''}"
+        f"{'(Debug mode) ' if debug_mode else ''}"
         f"Co the mat 20-60 giay lan dau."
     )
 
@@ -1681,5 +1818,14 @@ async def wave_cmd(update, context):
         if part2:
             try:
                 await update.message.reply_text(part2[:4096])
+            except Exception:
+                pass
+
+    # ── Debug mode: gửi tin nhắn thứ 2 với GMM diagnostics ───────────────────
+    if debug_mode:
+        debug_text = await asyncio.to_thread(_build_sr_debug_report, symbol)
+        if debug_text:
+            try:
+                await update.message.reply_text(debug_text[:4096])
             except Exception:
                 pass
