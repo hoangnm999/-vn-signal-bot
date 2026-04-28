@@ -374,7 +374,28 @@ def _run_analog_sync(symbol: str, use_regime: bool = True) -> dict:
         except Exception:
             pass
 
-    # ── 2. find_similar ───────────────────────────────────────────────────────
+    # ── 2. Kiểm tra và build cache nếu chưa có ───────────────────────────────
+    try:
+        from historical_analog import cache_exists, build_vector_cache
+        if not cache_exists(symbol):
+            logger.info(f"analog {symbol}: cache chua co → auto build...")
+            ok, build_msg = build_vector_cache(symbol)
+            if ok:
+                logger.info(f"analog {symbol}: cache built OK — {build_msg[:80]}")
+            else:
+                logger.warning(f"analog {symbol}: build cache fail — {build_msg[:80]}")
+                return {
+                    "status":  "error",
+                    "message": (
+                        f"Cache chua co va khong build duoc cho {symbol}.\n"
+                        f"Ly do: {build_msg[:200]}\n\n"
+                        f"Thu chay /check {symbol} truoc de tao du lieu."
+                    ),
+                }
+    except Exception as e:
+        logger.warning(f"analog {symbol}: cache check/build fail: {e}")
+
+    # ── 3. find_similar ───────────────────────────────────────────────────────
     try:
         from historical_analog import find_similar
         current_regime_arg = -1 if use_regime else 0   # -1=auto-detect, 0=disable
@@ -395,18 +416,17 @@ def _run_analog_sync(symbol: str, use_regime: bool = True) -> dict:
     if analogs is None and use_regime:
         logger.info(f"analog {symbol}: regime filter → None, retry without filter")
         try:
-            from historical_analog import find_similar
             analogs = find_similar(
                 symbol         = symbol,
                 target_vector  = state_vec,
-                years          = 8,        # mở rộng thêm
+                years          = 8,
                 exclude_days   = 90,
                 min_results    = 3,
-                current_regime = 0,        # tắt regime filter
+                current_regime = 0,
             )
             if analogs:
                 regime_fallback_used = True
-                logger.info(f"analog {symbol}: fallback (no regime filter) → {len(analogs)} samples")
+                logger.info(f"analog {symbol}: fallback OK → {len(analogs)} samples")
         except Exception as e:
             logger.warning(f"analog {symbol}: fallback find_similar fail: {e}")
 
@@ -532,7 +552,7 @@ async def analog_cmd(update, context):
     regime_tag = "" if use_regime else " [regime filter OFF]"
     msg = await update.message.reply_text(
         f"Dang phan tich tuong dong lich su: {symbol}{regime_tag}...\n"
-        f"(Regime filter: {'ON' if use_regime else 'OFF'} | Co the mat 20-60s)"
+        f"(Lan dau co the mat 60-120s neu phai build cache vector)"
     )
 
     async def _bg():
