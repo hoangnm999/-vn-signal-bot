@@ -59,6 +59,14 @@ except ImportError:
     logger.warning("backtest_rule_cmd.py chua co — /backtest_rule bi tat")
 
 try:
+    from analog_cmd import analog_cmd
+    _ANALOG = True
+    logger.info("analog_cmd.py loaded OK")
+except ImportError:
+    _ANALOG = False
+    logger.warning("analog_cmd.py chua co — /analog bi tat")
+
+try:
     from batch_scanner import scan_watchlist_cmd, _start_scan_cron
     _BATCH_SCANNER = True
 except ImportError:
@@ -258,7 +266,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/cancel              — Huy tac vu local_swarm dang chay\n"
         "/scan                — Quet nhanh RSI+Vol toan watchlist\n"
         "/deepscan            — Phan tich sau 16 engines toan watchlist\n\n"
-        "━━━ BACKTEST ━━━\n"
+        "━━━ BACKTEST & ANALOG ━━━\n"
+        "/analog <MA>         — Phan tich tuong dong lich su (regime filter ON)\n"
+        "/analog <MA> --raw   — Tat regime filter\n"
         "/backtest_rule <MA>  — Backtest tu dong (Auto Context)\n"
         "/backtest_rule <MA> \"entry_rule\" \"exit_rule\"  — Manual\n"
         "/wave <MA>           — Phan tich song lich su (Wave Pattern)\n\n"
@@ -1492,6 +1502,8 @@ def main():
     app.add_handler(CommandHandler("check_all",   check_all_cmd))
     if _BACKTEST_RULE:
         app.add_handler(CommandHandler("backtest_rule", backtest_rule_cmd))
+        if _ANALOG:
+            app.add_handler(CommandHandler("analog", analog_cmd))
     if _BATCH_SCANNER:
         app.add_handler(CommandHandler("scan_watchlist", scan_watchlist_cmd))
     if _WAVE_PATTERN:
