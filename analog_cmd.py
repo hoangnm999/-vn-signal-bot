@@ -102,7 +102,14 @@ def _format_analog_result(
     ]
 
     # ── Regime filter info ────────────────────────────────────────────────────
-    if regime_on:
+    regime_fallback = meta.get("regime_fallback", False)
+
+    if regime_fallback:
+        lines.append(
+            "Regime filter: FALLBACK — it mau cung regime, dung 8Y khong filter"
+        )
+        lines.append("Ket qua can than hon — mau tu nhieu regime khac nhau")
+    elif regime_on:
         r_name = regime_names.get(cur_regime, f"R{cur_regime}")
         match_str = f" | Khop: {match_pct:.0%}" if match_pct is not None else ""
         lines.append(
@@ -383,17 +390,47 @@ def _run_analog_sync(symbol: str, use_regime: bool = True) -> dict:
         logger.error(f"analog find_similar {symbol}: {e}")
         return {"status": "error", "message": f"find_similar loi: {str(e)[:200]}"}
 
+    # Fallback: nếu regime filter làm weighted_n quá thấp → thử lại không filter
+    regime_fallback_used = False
+    if analogs is None and use_regime:
+        logger.info(f"analog {symbol}: regime filter → None, retry without filter")
+        try:
+            from historical_analog import find_similar
+            analogs = find_similar(
+                symbol         = symbol,
+                target_vector  = state_vec,
+                years          = 8,        # mở rộng thêm
+                exclude_days   = 90,
+                min_results    = 3,
+                current_regime = 0,        # tắt regime filter
+            )
+            if analogs:
+                regime_fallback_used = True
+                logger.info(f"analog {symbol}: fallback (no regime filter) → {len(analogs)} samples")
+        except Exception as e:
+            logger.warning(f"analog {symbol}: fallback find_similar fail: {e}")
+
     if not analogs:
         return {
             "status":  "warn_no_analog",
             "message": (
-                f"Khong tim duoc mau tuong dong cho {symbol}.\n"
-                f"Co the do:\n"
+                f"Khong tim duoc mau tuong dong cho {symbol}.\n\n"
+                f"Da thu:\n"
+                f"  1. Regime filter ON (5Y) → qua it mau\n"
+                f"  2. Regime filter OFF (8Y) → van qua it mau\n\n"
+                f"Nguyen nhan co the:\n"
                 f"  - Cache chua co: /check {symbol} truoc\n"
-                f"  - Weighted N qua thap sau regime filter\n"
-                f"  - Ma qua it lich su (<300 phien)"
+                f"  - Ma qua it lich su (<300 phien)\n"
+                f"  - Vector hien tai qua khac biet so voi lich su\n\n"
+                f"Thu: /backtest_rule {symbol} de xem ket qua thay the."
             ),
         }
+
+    # Gắn flag fallback vào meta để format output hiển thị warning
+    if regime_fallback_used:
+        for a in analogs:
+            if "_meta" in a:
+                a["_meta"]["regime_fallback"] = True
 
     # Gắn close_px vào analogs để format output dùng được
     for a in analogs:

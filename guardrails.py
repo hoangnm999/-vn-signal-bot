@@ -346,6 +346,19 @@ def compute_reference_score(
             f"MaxDD median {median_mdd:.1f}% < {MAXDD_EXCLUDE_THRESH}% — rui ro qua cao, reject"
         ], "EXCLUDED"
 
+    # Gate 5: Weighted N quá thấp sau regime filter
+    # Nếu regime filter active và weighted_n < ngưỡng → mẫu thực sự quá ít
+    # để có ý nghĩa thống kê, dù raw n có vẻ đủ.
+    # Ngưỡng REGIME_MIN_WEIGHTED = 5.0 (từ historical_analog.py)
+    weighted_n = stats.get("weighted_n", float(n))
+    regime_filter_active = stats.get("regime_filter_active", False)
+    REGIME_MIN_WEIGHTED = 5.0   # phải khớp với historical_analog.REGIME_MIN_WEIGHTED
+    if regime_filter_active and weighted_n < REGIME_MIN_WEIGHTED:
+        return 0.0, [
+            f"Weighted N {weighted_n:.1f} < {REGIME_MIN_WEIGHTED} sau regime filter "
+            f"— khong du mau tuong dong cung regime, reject"
+        ], "EXCLUDED"
+
     # ══════════════════════════════════════════════════════════════════
     # Z-SCORE NORMALIZATION trên toàn watchlist
     # ══════════════════════════════════════════════════════════════════
