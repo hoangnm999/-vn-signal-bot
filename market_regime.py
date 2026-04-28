@@ -284,8 +284,8 @@ def compute_regime(df: pd.DataFrame) -> dict:
         "trend_pct":       trend_pct,
         "weights":         REGIME_WEIGHTS[regime],
         "position_advice": REGIME_POSITION_ADVICE[regime],
-        "is_bull":         trend_slope >= TREND_BULL_THRESH,
-        "is_quiet":        current_vol <= vol_median,
+        "is_bull":         bool(trend_slope >= TREND_BULL_THRESH),
+        "is_quiet":        bool(current_vol <= vol_median),
         "history_90d":     history_90d,
     }
 
@@ -348,19 +348,35 @@ def _load_regime_cache() -> Optional[dict]:
             return None
         return data
     except Exception as e:
-        logger.warning(f"Regime cache load fail: {e}")
+        logger.warning(f"Regime cache load fail: {e} — xoa cache cu")
+        try:
+            REGIME_CACHE_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
         return None
 
 
 def _save_regime_cache(data: dict):
-    """Lưu cache."""
+    """Lưu cache — atomic write để tránh file corrupt khi bị interrupt."""
     try:
         DATA_DIR.mkdir(exist_ok=True)
-        with open(REGIME_CACHE_FILE, "w", encoding="utf-8") as f:
-            # Không lưu history_90d vào cache (tốn space, tính lại nhanh)
-            cache_data = {k: v for k, v in data.items() if k != "history_90d"}
-            cache_data["built_at"] = datetime.now().isoformat()
-            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        cache_data = {k: v for k, v in data.items() if k != "history_90d"}
+        cache_data["built_at"] = datetime.now().isoformat()
+
+        # Custom encoder để handle numpy types (np.bool_, np.float32, np.int64...)
+        class _NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                import numpy as _np
+                if isinstance(obj, _np.bool_):   return bool(obj)
+                if isinstance(obj, _np.integer): return int(obj)
+                if isinstance(obj, _np.floating): return float(obj)
+                return super().default(obj)
+
+        # Atomic write: ghi ra file tạm rồi rename → tránh corrupt
+        tmp_file = REGIME_CACHE_FILE.with_suffix(".tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2, cls=_NumpyEncoder)
+        tmp_file.replace(REGIME_CACHE_FILE)
         logger.info(f"Regime cache saved: regime={data['regime']}")
     except Exception as e:
         logger.warning(f"Regime cache save fail: {e}")
