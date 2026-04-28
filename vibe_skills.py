@@ -318,8 +318,27 @@ class IchimokuEngine:
         pos    = "TREN may" if bool(above_cloud.iloc[-1]) else "DUOI may" if bool(below_cloud.iloc[-1]) else "TRONG may"
         cloud_dir = "Tang(xanh)" if bool(bullish_cloud.iloc[-1]) else "Giam(do)"
         cur   = _last(sig)
+
+        # TL reason: giải thích rõ tại sao TL thay vì chỉ im lặng
+        # Ichimoku TL vì event-based (cần TK cross ĐÚNG NGÀY) — không phải state
+        if cur == 0:
+            _tk_above = tenkan.iloc[-1] > kijun.iloc[-1] if not pd.isna(tenkan.iloc[-1]) else None
+            if pos == "TRONG may":
+                tl_reason = "TL-ly-do: gia trong dam may(consolidation), cho breakout"
+            elif not bool(tk_cross_up.iloc[-1]) and not bool(tk_cross_down.iloc[-1]):
+                # Có hướng nhưng không có cross event hôm nay
+                if _tk_above:
+                    tl_reason = f"TL-ly-do: TK>Kijun(tang) nhung cross da xay ra truoc, cho cross moi"
+                else:
+                    tl_reason = f"TL-ly-do: TK<Kijun(giam) nhung cross da xay ra truoc, cho cross moi"
+            else:
+                tl_reason = "TL-ly-do: co cross nhung thieu xac nhan (vi tri gia/may)"
+        else:
+            tl_reason = ""
+
         det   = (f"Tenkan={tk_val} Kijun={kj_val} | {pos} (top={ct_val} bot={cb_val}) "
-                 f"| May={cloud_dir} | TK_cross={'UP' if bool(tk_cross_up.iloc[-1]) else 'DOWN' if bool(tk_cross_down.iloc[-1]) else 'none'}")
+                 f"| May={cloud_dir} | TK_cross={'UP' if bool(tk_cross_up.iloc[-1]) else 'DOWN' if bool(tk_cross_down.iloc[-1]) else 'none'}"
+                 + (f" | {tl_reason}" if tl_reason else ""))
         return sig, det
 
     def generate(self, data_map):
@@ -348,13 +367,18 @@ class TechnicalEngine:
               (trend_bear|mr_overbought) & vol_bear & ~mr_oversold → SELL
     """
     def __init__(self, ema_fast=12, ema_slow=26, adx_period=14,
-                 adx_threshold=25.0, bb_window=20, bb_std=2.0,
+                 adx_threshold=20.0, bb_window=20, bb_std=2.0,
                  rsi_period=14, rsi_oversold=30, rsi_overbought=70,
                  obv_ma_period=20):
+        # adx_threshold=20.0 (VN adaptation): HKUDS gốc dùng 25.0 cho thị trường
+        # thanh khoản cao (US/HK). TTCK VN mid/small-cap thường ADX 15-22 khi
+        # sideway → ngưỡng 25 loại bỏ oan nhiều trend hợp lệ.
+        # Khi ADX 20-25: signal vẫn fire nhưng detail ghi note "trend yếu".
+        self.adx_threshold       = adx_threshold
+        self.adx_threshold_orig  = 25.0   # ngưỡng gốc HKUDS — dùng để note
         self.ema_fast       = ema_fast
         self.ema_slow       = ema_slow
         self.adx_period     = adx_period
-        self.adx_threshold  = adx_threshold
         self.bb_window      = bb_window
         self.bb_std         = bb_std
         self.rsi_period     = rsi_period
@@ -436,8 +460,15 @@ class TechnicalEngine:
         cur_rsi   = round(float(rsi.iloc[-1]),   1) if not pd.isna(rsi.iloc[-1])   else "N/A"
         trend_str = "bull" if bool(trend_bull.iloc[-1]) else "bear" if bool(trend_bear.iloc[-1]) else "neutral"
         cur       = _last(sig)
+
+        # ADX weak-trend note: nếu ADX nằm trong vùng 20-25 (đã hạ từ ngưỡng gốc 25)
+        # → signal vẫn fire nhưng ghi chú rõ để trader biết trend chưa mạnh
+        adx_note = ""
+        if isinstance(cur_adx, float) and self.adx_threshold <= cur_adx < self.adx_threshold_orig:
+            adx_note = f" ⚠️trend-yeu(ADX {cur_adx}<{self.adx_threshold_orig:.0f} nguong-goc)"
+
         det = (f"EMA{self.ema_fast}={cur_ema_f} EMA{self.ema_slow}={cur_ema_s} "
-               f"ADX={cur_adx} RSI={cur_rsi} trend={trend_str} "
+               f"ADX={cur_adx}{adx_note} RSI={cur_rsi} trend={trend_str} "
                f"| OBV={'bull' if bool(vol_bull.iloc[-1]) else 'bear'} "
                f"| Signal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'}")
         return sig, det
@@ -650,6 +681,15 @@ class ElliottEngine:
                     det = (f"[HKUDS] {wave_type} {'tang' if last_dir > 0 else 'giam'} ket thuc tai {last_idx}. "
                            f"Signal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'} "
                            f"({len(swings)} swing points)")
+                else:
+                    # TL reason: giải thích cụ thể tại sao không tìm được pattern
+                    n_sw = len(swings)
+                    if n_sw < 6:
+                        tl_reason = f"TL-ly-do: chi co {n_sw} swing points, can >=6 de xac dinh 5-song"
+                    else:
+                        tl_reason = (f"TL-ly-do: co {n_sw} swing points nhung khong khop "
+                                     f"3 Iron Rules + Fibonacci (tolerance=±{self.fib_tolerance:.0%})")
+                    det = f"[HKUDS] {tl_reason}"
             except Exception as e:
                 det = f"Loi ElliottEngine: {e}"
             signals[code] = _last(sig)
@@ -1555,11 +1595,25 @@ class MLStrategyEngine:
                         else -1 if x < -self.threshold else 0).astype(int)
         cur     = _last(sig)
         cur_raw = round(float(raw.iloc[-1]), 3)
+
+        # TL reason: cho trader biết raw signal đang ở đâu so với ngưỡng
+        if cur == 0:
+            pct_to_threshold = round(abs(cur_raw) / self.threshold * 100)
+            if abs(cur_raw) < 0.05:
+                tl_reason = f"TL-ly-do: RawSignal={cur_raw:+.3f} gan trung tinh (0%), chua co xu huong ro"
+            else:
+                direction = "tang" if cur_raw > 0 else "giam"
+                tl_reason = (f"TL-ly-do: RawSignal={cur_raw:+.3f} nghieng {direction} "
+                             f"({pct_to_threshold}% den nguong ±{self.threshold})")
+        else:
+            tl_reason = ""
+
         det = (f"[HKUDS] ML(RandomForest n=100 depth=5 "
                f"train={self.min_train}D retrain={self.retrain_f}D "
                f"horizon={self.horizon}D) "
                f"RawSignal={cur_raw:+.3f} threshold=±{self.threshold} "
-               f"Signal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'}")
+               f"Signal={'BUY' if cur>0 else 'SELL' if cur<0 else 'NEUTRAL'}"
+               + (f" | {tl_reason}" if tl_reason else ""))
         return sig, det
 
     def generate(self, data_map: dict) -> tuple:

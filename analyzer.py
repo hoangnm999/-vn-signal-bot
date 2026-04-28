@@ -1963,10 +1963,10 @@ def _vibe_verdict(vibe: dict, ind: dict, market: dict, news: dict,
             elif any(kw in hl_lo for kw in _NEG_KW):
                 neg += 1
 
-        if pos > neg and pos >= 2:
+        if pos > neg and pos >= 1:
             signals["NewsSentiment"] = 1
             ns_label = "TICH CUC"
-        elif neg > pos and neg >= 2:
+        elif neg > pos and neg >= 1:
             signals["NewsSentiment"] = -1
             ns_label = "TIEU CUC"
         elif pos > 0 and pos == neg:
@@ -2232,11 +2232,43 @@ def _build_vibe_message(
     # Emoji từng signal
     def _sig_emoji(v): return "🟢" if v > 0 else "🔴" if v < 0 else "⚪"
 
-    sigs = verdict["signals"]
+    sigs    = verdict["signals"]
+    details = dict(vibe.get("details", {}))
+    details.update(verdict.get("context_details", {}))
+
+    # Engines hiếm khi fire — khi có signal thì đáng chú ý đặc biệt
+    _RARE_ENGINES = {"Ichimoku", "ElliottWave", "Harmonic", "Chanlun"}
+
+    def _tl_note(name, det_str):
+        """Trích TL reason từ detail string nếu có."""
+        if not det_str:
+            return ""
+        # TL reason được embed trong detail với prefix "TL-ly-do:"
+        if "TL-ly-do:" in det_str:
+            idx = det_str.index("TL-ly-do:")
+            reason = det_str[idx:].split("|")[0].strip()
+            # Rút gọn để vừa 1 dòng
+            return " — " + reason.replace("TL-ly-do:", "").strip()[:60]
+        return ""
+
     agents_lines = "\n".join(
         f"  {_sig_emoji(v)} {name:<16} {'MUA' if v>0 else 'BAN' if v<0 else 'TL'}"
+        + (_tl_note(name, details.get(name, "")) if v == 0 else
+           (" ⭐" if name in _RARE_ENGINES and v != 0 else ""))
         for name, v in sigs.items()
     )
+
+    # Rare Signal Highlight block — chỉ hiện khi có ít nhất 1 rare engine fire
+    rare_fired = [(name, v) for name, v in sigs.items()
+                  if name in _RARE_ENGINES and v != 0]
+    rare_block = ""
+    if rare_fired:
+        rare_lines = []
+        for name, v in rare_fired:
+            direction = "MUA" if v > 0 else "BAN"
+            det_short = details.get(name, "")[:80].replace("\n", " ")
+            rare_lines.append(f"  ⭐ {name} → {direction}: {det_short}")
+        rare_block = "\n⚡ HIGH-CONVICTION (engine hiem khi fire):\n" + "\n".join(rare_lines) + "\n"
 
     header = (
         f"{emoji} {symbol} — {now}\n\n"
@@ -2249,6 +2281,7 @@ def _build_vibe_message(
         f"Khang cu: {_fmt_price(ind['resistance_20d'])}\n"
         f"  VN-Index: {vnindex_str}\n\n"
         f"VIBE-TRADING ({n} AGENTS):\n{agents_lines}\n"
+        + rare_block
     )
 
     verdict_block = (
