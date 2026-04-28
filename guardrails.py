@@ -31,13 +31,16 @@ HIGH_DISPERSION_STD   = 20.0   # % std — quá phân tán
 RECENCY_BIAS_THRESH   = 0.60   # > 60% mẫu trong 12 tháng gần → flag
 
 # Layer 3
-WINRATE_FLOOR         = 0.50   # dưới này cap score ở 4.0
+WINRATE_FLOOR         = 0.40   # hard gate — dưới này reject luôn (giảm từ 0.50)
+WINRATE_SOFT_FLOOR    = 0.50   # dưới này ghi chú warning nhưng không cap
+EXPECTANCY_FLOOR      = 0.0    # hard gate — Expectancy <= 0 → reject
+PF_FLOOR              = 1.0    # hard gate — Profit Factor < 1 → reject
 MAXDD_FLAG_THRESH     = -15.0  # % — flag "Rủi ro cao", giảm score × 0.8
 MAXDD_EXCLUDE_THRESH  = -25.0  # % — loại top5, đưa vào mục riêng
 SHARPE_FLOOR          = 0.30   # dưới này score × 0.8
 SMALL_SAMPLE_PENALTY  = 0.70   # nhân hệ số nếu sample < MIN_SAMPLE_FOR_RANK
 SCORE_MAX             = 8.5    # ceiling — không bao giờ = 10
-SCORE_CAP_LOW_WR      = 4.0    # cap khi WinRate < 50%
+SCORE_CAP_LOW_WR      = 4.0    # cap khi WinRate < 50% (soft warning)
 
 # Layer 5
 MARKET_DOWN_THRESH    = -3.0   # % — VN-Index giảm > 3% trong 5 ngày → warning
@@ -274,100 +277,154 @@ def sanity_check(stats: dict) -> list[str]:
 def compute_reference_score(
     stats:       dict,
     flags:       list[str],
-    all_stats:   list[dict],          # toàn bộ mã để z-score
-    n_override:  Optional[int] = None,  # mẫu độc lập SAU lọc khoảng cách
+    all_stats:   list[dict],
+    n_override:  Optional[int] = None,
 ) -> tuple[float, list[str], str]:
     """
-    Tính Reference Score (0–8.5) với các penalties.
+    Tính Reference Score (0–8.5).
+
+    FORMULA MỚI — dựa trên Expectancy + Profit Factor:
+      raw_score = expectancy_z * 0.40
+                + pf_z         * 0.30
+                + rvr_z        * 0.20
+                + mdd_z        * 0.10
+
+    Hard gates (reject trước khi tính score):
+      - Expectancy <= 0      → EXCLUDED
+      - Profit Factor < 1.0  → EXCLUDED
+      - Win Rate < 40%       → EXCLUDED
+      - MaxDD < -25%         → EXCLUDED
+
+    Win Rate chỉ dùng làm soft warning (không ảnh hưởng score công thức).
 
     Returns:
         (score, penalty_notes, risk_tier)
         risk_tier: "NORMAL" | "HIGH_RISK" | "EXCLUDED"
     """
     if not stats.get("valid"):
-        return 0.0, ["Không đủ dữ liệu thống kê"], "EXCLUDED"
+        return 0.0, ["Khong du du lieu thong ke"], "EXCLUDED"
 
-    # Dùng n_override (số mẫu độc lập sau lọc khoảng cách) nếu có
-    # Gate "mẫu nhỏ" phải check trên số mẫu SAU lọc, không phải số thô
-    n          = n_override if n_override is not None else stats["n"]
-    win_rate   = stats["win_rate"]
-    median_ret = stats["median_ret"]
-    rvr        = stats.get("return_vol_ratio", 0)  # Return/Vol ratio
-    median_mdd = stats["median_mdd"]
-    penalties  = []
-    risk_tier  = "NORMAL"
+    n           = n_override if n_override is not None else stats["n"]
+    win_rate    = stats["win_rate"]
+    median_ret  = stats["median_ret"]
+    expectancy  = stats.get("expectancy", median_ret)  # fallback median_ret nếu chưa có
+    pf          = stats.get("profit_factor", 0.0)
+    rvr         = stats.get("return_vol_ratio", 0.0)
+    median_mdd  = stats["median_mdd"]
+    penalties   = []
+    risk_tier   = "NORMAL"
 
-    # ── Z-score normalization trên toàn bộ mã ─────────────────────────
-    def _zscore_field(field: str, val: float, invert: bool = False) -> float:
-        """Tính z-score của val trong toàn bộ all_stats."""
-        vals = [s[field] for s in all_stats if s.get("valid") and s.get(field) is not None]
+    # ══════════════════════════════════════════════════════════════════
+    # HARD GATES — reject trước khi tính score
+    # ══════════════════════════════════════════════════════════════════
+
+    # Gate 1: Expectancy âm → không có edge
+    if expectancy <= EXPECTANCY_FLOOR:
+        return 0.0, [
+            f"Expectancy {expectancy:+.1f}% <= 0 — khong co edge, reject"
+        ], "EXCLUDED"
+
+    # Gate 2: Profit Factor < 1 → thua nhiều hơn thắng về giá trị
+    if pf < PF_FLOOR:
+        return 0.0, [
+            f"Profit Factor {pf:.2f} < 1.0 — tong thua > tong thang, reject"
+        ], "EXCLUDED"
+
+    # Gate 3: Win Rate < 40% → quá ít lần thắng
+    if win_rate < WINRATE_FLOOR:
+        return 0.0, [
+            f"Win Rate {win_rate:.0%} < {WINRATE_FLOOR:.0%} — reject"
+        ], "EXCLUDED"
+
+    # Gate 4: MaxDD quá lớn
+    if median_mdd < MAXDD_EXCLUDE_THRESH:
+        return 0.0, [
+            f"MaxDD median {median_mdd:.1f}% < {MAXDD_EXCLUDE_THRESH}% — rui ro qua cao, reject"
+        ], "EXCLUDED"
+
+    # ══════════════════════════════════════════════════════════════════
+    # Z-SCORE NORMALIZATION trên toàn watchlist
+    # ══════════════════════════════════════════════════════════════════
+
+    def _z(field: str, val: float, invert: bool = False) -> float:
+        vals = [
+            s[field] for s in all_stats
+            if s.get("valid") and s.get(field) is not None
+        ]
         if len(vals) < 2:
             return 0.0
         arr  = np.array(vals, dtype=float)
         std  = float(np.std(arr, ddof=1))
         mean = float(np.mean(arr))
-        if std == 0:
+        if std < 1e-9:
             return 0.0
         z = (val - mean) / std
         return float(np.clip(-z if invert else z, -3, 3))
 
-    z_ret   = _zscore_field("median_ret", median_ret)
-    z_rvr   = _zscore_field("return_vol_ratio", rvr)
-    z_mdd   = _zscore_field("median_mdd", median_mdd, invert=True)  # mdd âm → invert
+    z_exp = _z("expectancy",        expectancy)
+    z_pf  = _z("profit_factor",     pf)
+    z_rvr = _z("return_vol_ratio",  rvr)
+    z_mdd = _z("median_mdd",        median_mdd, invert=True)
 
-    # ── Reference Score formula ────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+    # FORMULA MỚI — Expectancy + PF làm chủ đạo
+    # ══════════════════════════════════════════════════════════════════
+    # z-score range [-3, 3] → raw range ~ [-3, 3]
+    # Scale: (raw + 3) / 6 * 10 → [0, 10]
     raw_score = (
-        win_rate  * 0.35 +
-        z_ret     * 0.25 +
-        z_rvr     * 0.25 -
-        z_mdd     * 0.15
+        z_exp * 0.40 +   # Expectancy — metric quyết định có edge không
+        z_pf  * 0.30 +   # Profit Factor — chất lượng W/L ratio
+        z_rvr * 0.20 +   # Return/Vol — consistency, tránh high vol
+        z_mdd * 0.10     # Drawdown control — risk guard
     )
-    # Scale về 0–10 (z-score range ~[-3,3] → raw ~ [-1.35, 1.35])
-    score = float(np.clip((raw_score + 1.35) / 2.70 * 10, 0, 10))
+    score = float(np.clip((raw_score + 3.0) / 6.0 * 10, 0, 10))
 
-    # ── Penalties theo thứ tự ─────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+    # SOFT WARNINGS — không reject nhưng ghi chú và điều chỉnh score
+    # ══════════════════════════════════════════════════════════════════
 
-    # Rule 1: WinRate < 50% → cap
-    if win_rate < WINRATE_FLOOR:
-        score = min(score, SCORE_CAP_LOW_WR)
-        penalties.append(f"Cap {SCORE_CAP_LOW_WR}/10 do WinRate {win_rate:.0%} < 50%")
-
-    # Rule 2: MaxDD
-    if median_mdd < MAXDD_EXCLUDE_THRESH:
-        risk_tier = "EXCLUDED"
+    # Soft 1: WR 40-50% — warning, nhân 0.85
+    if win_rate < WINRATE_SOFT_FLOOR:
+        score *= 0.85
         penalties.append(
-            f"MaxDD median {median_mdd:.1f}% < {MAXDD_EXCLUDE_THRESH}% "
-            f"— loại khỏi Top 5, đưa vào mục 'Rủi ro cao'"
-        )
-    elif median_mdd < MAXDD_FLAG_THRESH:
-        score     *= 0.8
-        risk_tier  = "HIGH_RISK"
-        penalties.append(
-            f"MaxDD median {median_mdd:.1f}% → Rủi ro cao, score × 0.8"
+            f"WR {win_rate:.0%} thap (40-50%) — can than, score x0.85"
         )
 
-    # Rule 3: Sharpe thấp
+    # Soft 2: MaxDD flag
+    if median_mdd < MAXDD_FLAG_THRESH:
+        score    *= 0.8
+        risk_tier = "HIGH_RISK"
+        penalties.append(
+            f"MaxDD median {median_mdd:.1f}% → Rui ro cao, score x0.8"
+        )
+
+    # Soft 3: Return/Vol thấp
     if rvr < SHARPE_FLOOR and risk_tier == "NORMAL":
         score *= 0.8
-        penalties.append(f"Return/Vol {rvr:.2f} < {SHARPE_FLOOR} → score × 0.8")
+        penalties.append(f"Return/Vol {rvr:.2f} < {SHARPE_FLOOR} → score x0.8")
 
-    # Rule 4: Mẫu nhỏ
+    # Soft 4: Mẫu nhỏ
     if n < MIN_SAMPLE_FOR_RANK:
         score *= SMALL_SAMPLE_PENALTY
         penalties.append(
-            f"Mẫu nhỏ ({n} ngày < {MIN_SAMPLE_FOR_RANK}) → score × {SMALL_SAMPLE_PENALTY}"
+            f"Mau nho ({n} < {MIN_SAMPLE_FOR_RANK}) → score x{SMALL_SAMPLE_PENALTY}"
         )
 
-    # Outlier risk từ Layer 2
+    # Soft 5: Outlier risk từ Layer 2
     if any("OUTLIER_RISK" in f for f in flags):
         score *= 0.6
-        penalties.append("Outlier risk → score × 0.6")
+        penalties.append("Outlier risk → score x0.6")
 
-    # High dispersion → Sharpe = 0 trong score
+    # Soft 6: High dispersion — bỏ z_rvr khỏi tính toán
     if any("HIGH_DISPERSION" in f for f in flags):
-        raw2  = win_rate * 0.35 + z_ret * 0.25 - z_mdd * 0.15
-        score = float(np.clip((raw2 + 1.35) / 2.70 * 10, 0, 10))
-        penalties.append("High dispersion → Return/Vol = 0 trong công thức")
+        raw2  = z_exp * 0.50 + z_pf * 0.35 + z_mdd * 0.15
+        score = float(np.clip((raw2 + 3.0) / 6.0 * 10, 0, 10))
+        penalties.append("High dispersion → bo Return/Vol khoi cong thuc")
+
+    # Soft 7: Dead cat — cảnh báo xu hướng dài hạn yếu
+    if any("DEAD_CAT" in f for f in flags):
+        score *= 0.85
+        penalties.append("Dead cat pattern — xu huong dai han yeu, score x0.85")
 
     # Score ceiling
     score = min(score, SCORE_MAX)
