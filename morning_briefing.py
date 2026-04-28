@@ -32,8 +32,13 @@ TOP_N_SCAN         = 7
 TOP_N_RECOMMEND    = 5
 MORNING_HOUR       = 8
 MORNING_MINUTE     = 15
-WAVE_TIMEOUT_SECS  = 15
-TOTAL_TIMEOUT_SECS = 90
+WAVE_TIMEOUT_SECS  = 60    # tăng lên để build wave cache lần đầu
+TOTAL_TIMEOUT_SECS = 600   # 10 phút — đủ cho scan + wave build lần đầu
+
+# Weighted N tối thiểu để mã được gợi ý trong /morning
+# Mã có weighted_n < ngưỡng này bị loại khỏi danh sách ưu tiên
+# vì không đủ mẫu tương đồng cùng regime → kết quả analog không tin cậy
+MORNING_MIN_WEIGHTED_N = 5.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -79,24 +84,80 @@ def _get_top_symbols_fast(n: int = TOP_N_SCAN) -> tuple[list[dict], bool]:
             ranked = scan_result.get("ranked", [])
             if ranked:
                 top = []
-                for r in ranked[:n]:
-                    s = r.get("stats", {})
+                skipped_low_n = []
+                for r in ranked:
+                    if len(top) >= n:
+                        break
+                    s          = r.get("stats", {})
+                    weighted_n = s.get("weighted_n", float(s.get("n", 0)))
+                    # Loại mã có weighted_n thấp — analog sẽ không cho kết quả
+                    # tin cậy vì thiếu mẫu tương đồng cùng regime
+                    if weighted_n < MORNING_MIN_WEIGHTED_N:
+                        skipped_low_n.append(
+                            f"{r['symbol']}(N={weighted_n:.1f})"
+                        )
+                        continue
                     top.append({
-                        "symbol": r["symbol"],
-                        "score":  r.get("score", 0.0),
-                        "wr":     s.get("win_rate", 0.0),
+                        "symbol":     r["symbol"],
+                        "score":      r.get("score", 0.0),
+                        "wr":         s.get("win_rate", 0.0),
+                        "weighted_n": weighted_n,
                     })
+                if skipped_low_n:
+                    logger.info(
+                        f"morning: loai {len(skipped_low_n)} ma weighted_n < "
+                        f"{MORNING_MIN_WEIGHTED_N}: {', '.join(skipped_low_n)}"
+                    )
                 logger.info(f"morning: {len(top)} symbols from scan cache")
                 return top, True
     except Exception as e:
         logger.debug(f"morning: scan cache miss: {e}")
 
-    # Fallback: watchlist thô
+    # Fallback: chạy scan nhẹ (chỉ lấy score từ cache analog có sẵn, không recompute)
+    try:
+        from batch_scanner import load_watchlist, run_batch_scan
+        symbols = load_watchlist()
+        logger.info(f"morning: no scan cache, running lightweight scan for {len(symbols)} symbols")
+        scan_result = run_batch_scan(symbols)
+        # Cache lại để lần sau dùng
+        try:
+            import batch_scanner as _bs2
+            _bs2._last_scan_result = scan_result
+        except Exception:
+            pass
+        ranked = scan_result.get("ranked", [])
+        if ranked:
+            top = []
+            skipped_low_n = []
+            for r in ranked:
+                if len(top) >= n:
+                    break
+                s          = r.get("stats", {})
+                weighted_n = s.get("weighted_n", float(s.get("n", 0)))
+                if weighted_n < MORNING_MIN_WEIGHTED_N:
+                    skipped_low_n.append(f"{r['symbol']}(N={weighted_n:.1f})")
+                    continue
+                top.append({
+                    "symbol":     r["symbol"],
+                    "score":      r.get("score", 0.0),
+                    "wr":         s.get("win_rate", 0.0),
+                    "weighted_n": weighted_n,
+                })
+            if skipped_low_n:
+                logger.info(f"morning: loai {len(skipped_low_n)} ma: {', '.join(skipped_low_n)}")
+            if top:
+                logger.info(f"morning: {len(top)} symbols from fresh scan")
+                return top, True
+    except Exception as e:
+        logger.warning(f"morning: lightweight scan fail: {e}")
+
+    # Fallback cuối: watchlist thô không có score
     try:
         from batch_scanner import load_watchlist
         symbols = load_watchlist()[:n]
         logger.info(f"morning: fallback watchlist ({len(symbols)} symbols, no score)")
-        return [{"symbol": s, "score": 0.0, "wr": 0.0} for s in symbols], False
+        return [{"symbol": s, "score": 0.0, "wr": 0.0, "weighted_n": 0.0}
+                for s in symbols], False
     except Exception as e:
         logger.warning(f"morning: load_watchlist fail: {e}")
         return [], False
@@ -107,15 +168,13 @@ def _get_top_symbols_fast(n: int = TOP_N_SCAN) -> tuple[list[dict], bool]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _get_wave_cached(symbol: str) -> dict:
-    """Chỉ đọc wave cache. Cache miss → trả về KHONG RO ngay."""
+    """
+    Đọc wave cache. Nếu cache miss → tự build (mất 10-30s lần đầu).
+    Dùng timeout trong ThreadPoolExecutor để tránh block quá lâu.
+    """
     try:
-        import pathlib
-        cache_path = pathlib.Path("data") / f"{symbol.upper()}_waves.json"
-        if not cache_path.exists():
-            return {"symbol": symbol, "verdict": "KHONG RO",
-                    "confidence": 0.0, "cache_miss": True}
-
         from wave_pattern import analyze_wave
+        # force_rebuild=False: dùng cache nếu có, build nếu chưa có
         result     = analyze_wave(symbol, force_rebuild=False)
         verdict    = result.get("verdict", "KHONG RO")
         score_up   = result.get("score_up", 0.0)
@@ -256,6 +315,26 @@ def build_morning_briefing() -> str:
     if not has_score:
         lines += ["(Chua co ket qua scan — hien thi wave cho watchlist)", ""]
 
+    # Hiển thị số mã bị loại do weighted_n thấp (nếu có)
+    try:
+        import batch_scanner as _bs
+        scan_result = getattr(_bs, "_last_scan_result", None)
+        if scan_result and has_score:
+            ranked = scan_result.get("ranked", [])
+            n_low  = sum(
+                1 for r in ranked
+                if r.get("stats", {}).get("weighted_n",
+                   float(r.get("stats", {}).get("n", 99))) < MORNING_MIN_WEIGHTED_N
+            )
+            if n_low > 0:
+                lines.append(
+                    f"(Da loc {n_low} ma it mau analog cung regime "
+                    f"[weighted N < {MORNING_MIN_WEIGHTED_N:.0f}])"
+                )
+                lines.append("")
+    except Exception:
+        pass
+
     # Timeout check trước wave
     if time.time() - t0 > TOTAL_TIMEOUT_SECS - 20:
         lines += ["TOP MA HOM NAY (het thoi gian lay wave):", "─" * 38]
@@ -372,7 +451,7 @@ async def morning_cmd(update, context):
 
     msg = await update.message.reply_text(
         "Dang chuan bi Morning Briefing...\n"
-        "(Regime + Wave cache | target < 30s)"
+        "(Lan dau trong ngay co the mat 2-5 phut de build wave cache)"
     )
 
     try:
