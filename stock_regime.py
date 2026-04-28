@@ -124,38 +124,51 @@ def _assign_labels(centroids: np.ndarray) -> dict[int, int]:
     Returns:
         dict {cluster_idx: stock_regime (1-4)}
 
-    Logic:
-        1. Tính momentum_score = momentum_5d + momentum_20d cho mỗi centroid
-        2. Tính volume_score   = volume_spike
-        3. Rank theo momentum:
-           - Cao nhất  → SR2 Markup
-           - Thấp nhất → SR4 Markdown
-        4. Trong 2 centroid còn lại:
-           - Volume cao hơn → SR1 Accumulation (tích lũy + volume tăng)
-           - Volume thấp    → SR3 Distribution  (đỉnh + volume giảm dần)
-    """
-    n = len(centroids)
-    momentum_scores = (centroids[:, _IDX_MOMENTUM_5D] +
-                       centroids[:, _IDX_MOMENTUM_20D])
-    volume_scores   = centroids[:, _IDX_VOLUME_SPIKE]
+    Logic (v2 — robust hơn, dùng composite score):
+        Mỗi cluster được score theo 3 chiều độc lập:
 
-    # Sort by momentum
-    ranked = np.argsort(momentum_scores)   # ascending: [worst, ..., best]
+        bull_score  = momentum_5d + momentum_20d + trend_slope + price_vs_sma20
+                      → đo xu hướng tăng tổng thể
+        bear_score  = -(momentum_5d + momentum_20d + trend_slope + price_vs_sma20)
+                      → đo xu hướng giảm tổng thể
+        volume_score= volume_spike
+                      → đo hoạt động volume bất thường
+
+        Phân loại:
+          SR2 Markup    = bull_score cao nhất
+          SR4 Markdown  = bear_score cao nhất (bull_score thấp nhất)
+          Trong 2 còn lại:
+            SR1 Accum   = volume_score cao hơn (gom hàng âm thầm)
+            SR3 Distrib = volume_score thấp hơn (đỉnh, vol giảm dần)
+
+        Fallback safety: nếu SR2 và SR4 cùng cluster (không thể) → dùng rank đơn giản
+    """
+    # Composite bull score — 4 dims đo xu hướng tăng
+    bull_scores = (
+        centroids[:, _IDX_MOMENTUM_5D]  +
+        centroids[:, _IDX_MOMENTUM_20D] +
+        centroids[:, _IDX_TREND_SLOPE]  +
+        centroids[:, _IDX_PRICE_SMA20]
+    )
+    volume_scores = centroids[:, _IDX_VOLUME_SPIKE]
+
+    ranked = np.argsort(bull_scores)   # ascending: [most bear → most bull]
 
     mapping = {}
-    # Markup = highest momentum
-    mapping[int(ranked[-1])] = 2   # SR2
-    # Markdown = lowest momentum
-    mapping[int(ranked[0])]  = 4   # SR4
+    markup_idx   = int(ranked[-1])   # bull_score cao nhất → SR2 Markup
+    markdown_idx = int(ranked[0])    # bull_score thấp nhất → SR4 Markdown
 
-    # Middle 2: distinguish by volume
+    mapping[markup_idx]   = 2   # SR2
+    mapping[markdown_idx] = 4   # SR4
+
+    # 2 clusters còn lại → phân biệt bằng volume
     middle = [int(ranked[1]), int(ranked[2])]
-    vol_middle = [(i, volume_scores[i]) for i in middle]
-    vol_middle.sort(key=lambda x: x[1], reverse=True)
+    vol_middle = sorted([(i, volume_scores[i]) for i in middle],
+                        key=lambda x: x[1], reverse=True)
 
-    # Higher volume in middle → Accumulation (vol spike + low momentum)
+    # Volume cao hơn trong middle → Accumulation (smart money đang gom)
     mapping[vol_middle[0][0]] = 1   # SR1 Accumulation
-    # Lower volume in middle → Distribution
+    # Volume thấp hơn → Distribution (đỉnh, volume cạn dần)
     mapping[vol_middle[1][0]] = 3   # SR3 Distribution
 
     return mapping
@@ -217,9 +230,23 @@ def _predict_current(
         (stock_regime: int 1-4,
          confidence: float 0-1,
          all_probs: np.ndarray shape (4,) — prob của mỗi SR)
+
+    Outlier detection:
+        Nếu tất cả raw cluster probs đều rất nhỏ (vector nằm xa mọi centroid),
+        confidence bị inflate giả tạo sau normalize. Trong trường hợp này
+        trả về confidence thấp để caller biết kết quả không đáng tin.
     """
     x = scaler.transform(current_vector.reshape(1, -1))
     probs_raw = gmm.predict_proba(x)[0]   # (N_CLUSTERS,)
+
+    # Outlier check: nếu max raw prob < ngưỡng → vector nằm xa mọi centroid
+    # Dùng log-probability để detect (predict_proba đã softmax, cần score gốc)
+    try:
+        log_probs = gmm.score_samples(x)   # log-likelihood của sample
+        # Ngưỡng: nếu log-likelihood < -50 thì điểm này là outlier rõ ràng
+        is_outlier = float(log_probs[0]) < -50
+    except Exception:
+        is_outlier = False
 
     # Map raw cluster probs → SR probs
     sr_probs = np.zeros(4)
@@ -228,7 +255,15 @@ def _predict_current(
 
     # Predict = SR với prob cao nhất
     best_sr = int(np.argmax(sr_probs)) + 1   # 1-indexed
-    confidence = float(sr_probs[best_sr - 1])
+    raw_confidence = float(sr_probs[best_sr - 1])
+
+    # Nếu là outlier: giảm confidence để phản ánh độ không chắc chắn thực tế
+    # Không thay đổi SR label (vẫn là SR gần nhất), nhưng đánh dấu là outlier
+    if is_outlier:
+        # Cap confidence tại 0.55 — vẫn ra label nhưng trader biết không tin cậy
+        confidence = min(raw_confidence, 0.55)
+    else:
+        confidence = raw_confidence
 
     return best_sr, confidence, sr_probs
 

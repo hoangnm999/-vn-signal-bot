@@ -1660,33 +1660,34 @@ def _build_sr_debug_report(symbol: str) -> str:
     lines.append("─" * 38)
 
     # Header
-    lines.append(f"  {'SR':<4} {'Label':<14} {'Momentum':>9} {'Volume':>8} {'Trend':>7}")
+    lines.append(f"  {'SR':<4} {'Label':<14} {'BullScore':>10} {'Volume':>8} {'Trend':>7}")
 
     # Sort theo SR label để dễ đọc
     centroid_rows = []
     for c_idx, sr_idx in label_mapping.items():
         c = centroids[c_idx]
-        momentum = float(c[10] + c[11])   # momentum_5d + momentum_20d
-        volume   = float(c[3])             # volume_spike
-        trend    = float(c[4])             # trend_slope
+        # Bull score = composite (giống _assign_labels v2)
+        bull_score = float(c[10] + c[11] + c[4] + c[5])  # mom5d+mom20d+trend+pvssma20
+        volume     = float(c[3])
+        trend      = float(c[4])
         centroid_rows.append((sr_idx, SR_LABELS[sr_idx].split("—")[1].strip(),
-                               momentum, volume, trend))
+                               bull_score, volume, trend))
     centroid_rows.sort(key=lambda x: x[0])
 
-    for sr_idx, label, momentum, volume, trend in centroid_rows:
+    for sr_idx, label, bull_score, volume, trend in centroid_rows:
         em = {1: "🔵", 2: "🟢", 3: "🟡", 4: "🔴"}.get(sr_idx, "⚪")
         lines.append(
             f"  {em} SR{sr_idx} {label:<14} "
-            f"{momentum:>+8.3f}  {volume:>+7.3f}  {trend:>+6.3f}"
+            f"{bull_score:>+9.3f}  {volume:>+7.3f}  {trend:>+6.3f}"
         )
 
-    # Kiểm tra separation: momentum SR2 phải > SR3 > SR1 > SR4
-    mom_vals = {row[0]: row[2] for row in centroid_rows}
-    sep_ok = (mom_vals.get(2, 0) > mom_vals.get(3, 0) >
-              mom_vals.get(1, 0) > mom_vals.get(4, 0))
+    # Kiểm tra separation: bull_score SR2 > SR3 > SR1 > SR4
+    bull_vals = {row[0]: row[2] for row in centroid_rows}
+    sep_ok = (bull_vals.get(2, 0) > bull_vals.get(3, 0) >
+              bull_vals.get(1, 0) > bull_vals.get(4, 0))
     lines.append("")
     lines.append(
-        f"  Momentum ordering: {'✅ SR2>SR3>SR1>SR4 (hop ly)' if sep_ok else '⚠️ Sai thu tu — label co the bi nham'}"
+        f"  BullScore ordering: {'✅ SR2>SR3>SR1>SR4 (hop ly)' if sep_ok else '⚠️ Sai thu tu — label co the bi nham'}"
     )
 
     # ── 4. Current vector → raw probs ────────────────────────────────────────
@@ -1696,6 +1697,15 @@ def _build_sr_debug_report(symbol: str) -> str:
 
     current_vec = vectors[-1]
     sr, conf, sr_probs = _predict_current(gmm, scaler, label_mapping, current_vec)
+
+    # Log-likelihood của vector hiện tại — detect outlier
+    try:
+        x_scaled = scaler.transform(current_vec.reshape(1, -1))
+        ll_current = float(gmm.score_samples(x_scaled)[0])
+        ll_note = "✅ Binh thuong" if ll_current > -50 else f"⚠️ OUTLIER (ll={ll_current:.1f}) — vector rat xa moi centroid"
+        lines.append(f"  Log-likelihood vector hom nay: {ll_current:.2f} | {ll_note}")
+    except Exception:
+        pass
 
     for i, (prob, label_row) in enumerate(zip(sr_probs, centroid_rows)):
         sr_i   = label_row[0]
