@@ -33,7 +33,7 @@ RECENCY_BIAS_THRESH   = 0.60   # > 60% mẫu trong 12 tháng gần → flag
 # Layer 3
 WINRATE_FLOOR         = 0.40   # hard gate — dưới này reject luôn (giảm từ 0.50)
 WINRATE_SOFT_FLOOR    = 0.50   # dưới này ghi chú warning nhưng không cap
-EXPECTANCY_FLOOR      = 0.0    # hard gate — Expectancy <= 0 → reject
+EXPECTANCY_FLOOR      = -2.0   # hard gate — Expectancy < -2% → reject (tránh reject quá mức)
 PF_FLOOR              = 1.0    # hard gate — Profit Factor < 1 → reject
 MAXDD_FLAG_THRESH     = -15.0  # % — flag "Rủi ro cao", giảm score × 0.8
 MAXDD_EXCLUDE_THRESH  = -25.0  # % — loại top5, đưa vào mục riêng
@@ -308,24 +308,28 @@ def compute_reference_score(
     win_rate    = stats["win_rate"]
     median_ret  = stats["median_ret"]
     expectancy  = stats.get("expectancy", median_ret)  # fallback median_ret nếu chưa có
-    pf          = stats.get("profit_factor", 0.0)
+    pf          = stats.get("profit_factor", 99.0)     # fallback 99 nếu chưa có (no loss = good)
     rvr         = stats.get("return_vol_ratio", 0.0)
     median_mdd  = stats["median_mdd"]
     penalties   = []
     risk_tier   = "NORMAL"
 
+    # Normalize PF: 99 là sentinel "không có lần thua" → treat as valid
+    pf_for_gate = pf if pf < 99.0 else 99.0
+
     # ══════════════════════════════════════════════════════════════════
     # HARD GATES — reject trước khi tính score
     # ══════════════════════════════════════════════════════════════════
 
-    # Gate 1: Expectancy âm → không có edge
-    if expectancy <= EXPECTANCY_FLOOR:
+    # Gate 1: Expectancy quá âm → không có edge
+    if expectancy < EXPECTANCY_FLOOR:
         return 0.0, [
-            f"Expectancy {expectancy:+.1f}% <= 0 — khong co edge, reject"
+            f"Expectancy {expectancy:+.1f}% < {EXPECTANCY_FLOOR}% — khong co edge, reject"
         ], "EXCLUDED"
 
     # Gate 2: Profit Factor < 1 → thua nhiều hơn thắng về giá trị
-    if pf < PF_FLOOR:
+    # Chỉ reject nếu PF rõ ràng < 1 (có lần thua thực tế, pf < 99)
+    if pf_for_gate < PF_FLOOR and pf < 99.0:
         return 0.0, [
             f"Profit Factor {pf:.2f} < 1.0 — tong thua > tong thang, reject"
         ], "EXCLUDED"

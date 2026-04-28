@@ -425,6 +425,17 @@ def run_batch_scan(
             continue
 
         if gr["risk_tier"] == "EXCLUDED":
+            # Log lý do để debug
+            pen = gr.get("penalties", [])
+            pen_str = pen[0][:80] if pen else "score=0"
+            s = gr.get("stats", {})
+            logger.info(
+                f"[BatchScan] {sym} EXCLUDED: exp={s.get('expectancy',0):+.1f}% "
+                f"pf={s.get('profit_factor',0):.2f} wr={s.get('win_rate',0):.0%} "
+                f"| {pen_str}"
+            )
+            _progress(f"  EXCLUDED {sym}: {pen_str[:60]}")
+            gr["_exclude_reason"] = pen_str   # attach lý do vào gr để formatter dùng
             excluded.append(gr)
         else:
             ranked.append(gr)
@@ -528,6 +539,21 @@ def _format_overview_table(
     _render_group("TIEM NANG (4.0 - 4.9):", grp_potential)
     _render_group("THAM KHAO (< 4.0):", grp_ref)
     _render_group("RUI RO CAO (Excluded):", grp_excluded, show_excluded=True)
+
+    # Debug: lý do từng mã bị excluded — giúp tune threshold
+    if grp_excluded:
+        lines.append("  Chi tiet excluded:")
+        for r in excluded[:15]:
+            s      = r.get("stats", {})
+            exp    = s.get("expectancy", 0)
+            pf     = s.get("profit_factor", 0)
+            wr     = s.get("win_rate", 0)
+            reason = r.get("_exclude_reason", "?")[:50]
+            lines.append(
+                f"  {r['symbol']:<6} Exp:{exp:+.1f}% "
+                f"PF:{pf:.1f} WR:{wr:.0%} | {reason}"
+            )
+        lines.append("")
 
     # Mã không có kết quả
     non_timeout_rej = [r for r in rejected if "timeout" not in r.get("reason","").lower()]
