@@ -89,6 +89,14 @@ except ImportError:
     logger.warning("portfolio.py chua co — /buy /sell /portfolio bi tat")
 
 try:
+    from morning_briefing import morning_cmd, _start_morning_cron
+    _MORNING = True
+    logger.info("morning_briefing.py loaded OK")
+except ImportError:
+    _MORNING = False
+    logger.warning("morning_briefing.py chua co — /morning bi tat")
+
+try:
     from vibe_client import (
         is_available as vibe_available,
         start_swarm, poll_swarm, format_swarm_result,
@@ -262,6 +270,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/alerts              — Xem canh bao dang hoat dong\n"
         "/alert cancel <id>   — Huy canh bao\n\n"
         "━━━ PORTFOLIO ━━━\n"
+        "/morning             — Morning briefing: regime + top ma + wave filter\n"
         "/buy <MA> <gia> <SL> <KL> [TP] — Ghi nhan vi the mua\n"
         "/sell <MA> [gia]     — Dong vi the\n"
         "/portfolio           — Tong quan P&L + goi y hanh dong\n"
@@ -1501,6 +1510,8 @@ def main():
         app.add_handler(CommandHandler("buy",       buy_cmd))
         app.add_handler(CommandHandler("sell",      sell_cmd))
         app.add_handler(CommandHandler("portfolio", portfolio_cmd))
+    if _MORNING:
+        app.add_handler(CommandHandler("morning", morning_cmd))
     app.add_error_handler(_error_handler)
 
     async def post_init(application):
@@ -1526,6 +1537,8 @@ def main():
             asyncio.create_task(_start_alert_cron(application))
         if _PORTFOLIO:
             asyncio.create_task(_start_portfolio_cron(application.bot, _scan_ids if _BATCH_SCANNER else []))
+        if _MORNING:
+            asyncio.create_task(_start_morning_cron(application.bot, _scan_ids if _BATCH_SCANNER else []))
 
     app.post_init = post_init
 
