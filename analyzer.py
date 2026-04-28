@@ -2678,7 +2678,7 @@ def analyze_stock_full(symbol: str) -> tuple:
 
     # 1. Thu thập data song song
     with ThreadPoolExecutor(max_workers=5) as ex:
-        f_price     = ex.submit(get_price_data,    symbol, 500)
+        f_price     = ex.submit(get_price_data,    symbol, 600)   # 600D cho GMM
         f_market    = ex.submit(get_market_data)
         f_news      = ex.submit(get_news_data,     symbol)
         f_commodity = ex.submit(get_commodity_data, symbol)
@@ -2754,6 +2754,27 @@ def analyze_stock_full(symbol: str) -> tuple:
         vnindex_str = "N/A"
     msg = _build_vibe_message(emoji, symbol, now, ind, vnindex_str, vibe, verdict)
 
+    # ── Phase 2: Stock Regime context ─────────────────────────────────────────
+    # Load song song với các bước khác đã xong — dùng data đã có (không fetch lại)
+    stock_regime_data = None
+    try:
+        from stock_regime import get_combined_regime_context
+        combined = get_combined_regime_context(symbol, df=price_data["df"])
+        stock_regime_data = combined
+        # Append regime context block vào cuối msg (trước === footer)
+        regime_inline = combined.get("inline_text", "")
+        if regime_inline:
+            # Chèn trước dòng === cuối cùng
+            if "================================" in msg:
+                last_sep = msg.rfind("================================")
+                msg = (msg[:last_sep].rstrip() +
+                       f"\n\nREGIME CONTEXT:\n{regime_inline}\n" +
+                       msg[last_sep:])
+            else:
+                msg += f"\n\nREGIME CONTEXT:\n{regime_inline}"
+    except Exception as e:
+        _logger.debug(f"Stock regime load fail ({symbol}): {e}")
+
     # ── Thêm dòng "Lần trước" vào đầu message ────────────────────────────────
     if prev_ctx:
         if prev_ctx.get("expired"):
@@ -2801,5 +2822,6 @@ def analyze_stock_full(symbol: str) -> tuple:
         "macro_data":     macro_data,
         "prev_context":   prev_ctx,            # Persistent Memory: bối cảnh cũ
         "verdict_change": verdict_change_note, # Persistent Memory: note thay đổi
+        "stock_regime":   stock_regime_data,   # Phase 2: Stock Regime GMM
     }
     return msg, metadata

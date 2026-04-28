@@ -1559,6 +1559,16 @@ def format_wave_report(result: dict) -> str:
     else:
         lines.append(f"   Score: giam {score_down:.0%} | tang {score_up:.0%}  (n={n_up}/{n_down})")
 
+    # Dòng 2b — Stock Regime (Phase 2 GMM)
+    try:
+        from stock_regime import get_stock_regime, format_stock_regime_for_wave
+        _sr = get_stock_regime(sym)
+        _sr_line = format_stock_regime_for_wave(_sr)
+        if _sr_line:
+            lines.append(f"   {_sr_line}")
+    except Exception:
+        pass
+
     # Dòng 3 — Approach A
     if approach_a:
         lines.append(f"   {approach_a}")

@@ -228,6 +228,7 @@ def _format_rule_result(
     bars: int,
     trade_analytics: dict = None,
     wave_result: dict = None,
+    stock_regime_result: dict = None,
 ) -> str:
     """Tạo text output compact cho /backtest_rule."""
     ret  = metrics.get("total_return_pct", 0)
@@ -338,6 +339,17 @@ def _format_rule_result(
                     f"{cl_em} Gan nhat: {cl_lbl}"
                 )
 
+    # Stock Regime section (Phase 2 GMM)
+    sr_lines = []
+    if stock_regime_result and stock_regime_result.get("ok"):
+        try:
+            from stock_regime import format_stock_regime_for_backtest
+            _sr_block = format_stock_regime_for_backtest(stock_regime_result)
+            if _sr_block:
+                sr_lines = _sr_block.splitlines()
+        except Exception:
+            pass
+
     # ── Assemble ──────────────────────────────────────────────────────
     sep = "═" * 32
     lines = [
@@ -366,6 +378,11 @@ def _format_rule_result(
     if wave_lines:
         lines.append("─" * 32)
         lines += wave_lines
+
+    # Stock Regime section
+    if sr_lines:
+        lines.append("─" * 32)
+        lines += sr_lines
 
     # Kết luận
     lines += [
@@ -864,6 +881,15 @@ async def backtest_rule_cmd(update, context):
                 _wave_res = await asyncio.to_thread(analyze_wave, symbol, False)
             except Exception as _we:
                 logger.debug(f"wave lookup skip: {_we}")
+
+            # Load stock regime (best-effort, cache 24h)
+            _sr_res = None
+            try:
+                from stock_regime import get_stock_regime
+                _sr_res = await asyncio.to_thread(get_stock_regime, symbol)
+            except Exception as _sre:
+                logger.debug(f"stock regime lookup skip: {_sre}")
+
             summary = _format_rule_result(
                 metrics          = result["metrics"],
                 symbol           = symbol,
@@ -879,6 +905,7 @@ async def backtest_rule_cmd(update, context):
                 bars             = result["bars"],
                 trade_analytics  = _ta,
                 wave_result      = _wave_res,
+                stock_regime_result = _sr_res,
             )
 
             # Gửi metrics text
