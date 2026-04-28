@@ -67,11 +67,13 @@ def load_watchlist() -> list[str]:
 # PER-SYMBOL WORKER (chạy trong thread)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _scan_one_symbol(symbol: str) -> dict:
+def _scan_one_symbol(symbol: str, current_regime: int = 0) -> dict:
     """
     Xử lý đầy đủ một mã: check cache → find_similar → guardrails.
     Chạy trong ThreadPoolExecutor.
-    Returns dict kết quả đầy đủ.
+
+    current_regime: pre-loaded từ run_batch_scan (0 = disable regime filter)
+    → tránh mỗi worker tự load VNINDEX riêng gây rate limit.
     """
     t0 = time.time()
     result_base = {
@@ -237,11 +239,12 @@ def _scan_one_symbol(symbol: str) -> dict:
         try:
             from historical_analog import find_similar
             analogs = find_similar(
-                symbol        = symbol,
-                target_vector = state_vec,
-                years         = 5,
-                exclude_days  = 90,
-                min_results   = 3,
+                symbol         = symbol,
+                target_vector  = state_vec,
+                years          = 5,
+                exclude_days   = 90,
+                min_results    = 3,
+                current_regime = current_regime,   # pre-loaded, tránh re-fetch VNINDEX
             )
         except Exception as _fe:
             logger.warning(f"[{symbol}] find_similar fail: {_fe}")
@@ -318,10 +321,24 @@ def run_batch_scan(
 
     _progress(f"Bat dau scan {total_syms} ma voi {MAX_WORKERS} workers...")
 
+    # ── Pre-load market regime 1 lần — tránh mỗi worker tự load VNINDEX riêng ──
+    current_regime = 0
+    try:
+        from market_regime import get_market_regime
+        _rdata = get_market_regime()
+        if _rdata.get("ok"):
+            current_regime = int(_rdata.get("regime", 0))
+            _progress(f"Market regime: R{current_regime} {_rdata.get('label','').split('—')[-1].strip()}")
+        else:
+            _progress("Market regime: load fail → regime filter disabled")
+    except Exception as _re:
+        logger.warning(f"[BatchScan] regime pre-load fail: {_re}")
+        _progress("Market regime: error → regime filter disabled")
+
     # Chạy song song
     partial = False
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_scan_one_symbol, sym): sym for sym in symbols}
+        futures = {pool.submit(_scan_one_symbol, sym, current_regime): sym for sym in symbols}
         deadline = t_global + SCAN_TIMEOUT_SECS
 
         # BUG FIX: as_completed() raise TimeoutError ra ngoài vòng for khi
