@@ -1357,328 +1357,232 @@ def _fmt_subtype_section(lines: list[str], result: dict, verdict: str) -> None:
 
 def format_wave_report(result: dict) -> str:
     """
-    Format kết quả analyze_wave() thành text Telegram-friendly.
-    Tối đa ~4000 ký tự.
+    Format compact — 5-8 dòng, chỉ kết luận + key evidence.
+
+    Cấu trúc:
+      Header:  /wave STB ════
+      Verdict: emoji + SONG TANG/GIAM/KHONG RO + reliability
+      Score:   goc → adj theo regime (1 dòng)
+      Regime:  label + weights (1 dòng)
+      ApproachA: 1 dòng nếu có signal rõ
+      Subtype: loại A/B của chiều phù hợp verdict (1-2 dòng)
+      Kỳ vọng: TB ±X% trong ~Y ngày
     """
     if not result.get("ok"):
-        return f"❌ Loi phan tich song {result['symbol']}: {result.get('error','?')}"
+        return f"❌ /wave {result['symbol']}: {result.get('error','?')}"
 
     sym        = result["symbol"]
-    n_bars     = result["n_bars"]
     n_up       = result["n_up"]
     n_down     = result["n_down"]
-    n_up_tot   = result.get("n_up_total", n_up)
-    n_down_tot = result.get("n_down_total", n_down)
-    amp_u      = result["amp_up_mean"]
-    amp_d      = result["amp_down_mean"]
-    dur_u      = result["dur_up_mean"]
-    dur_d      = result["dur_down_mean"]
-    zz_pct     = result.get("zigzag_pct", ZIGZAG_MIN_PCT)
     score_up   = result["score_up"]
     score_down = result["score_down"]
     verdict    = result["verdict"]
     confidence = result["confidence"]
-    top_dims   = result["top_dims"]
-    dist_up    = result["dist_up"]
-    dist_down  = result["dist_down"]
-    cur_vec    = result["current_vec"]
-    dim_z_up   = result["dim_z_up"]
-    dim_z_down = result["dim_z_down"]
+    amp_u      = result["amp_up_mean"]
+    amp_d      = result["amp_down_mean"]
+    dur_u      = result["dur_up_mean"]
+    dur_d      = result["dur_down_mean"]
+    n_up_tot   = result.get("n_up_total",   n_up)
+    n_down_tot = result.get("n_down_total", n_down)
+    zz_pct     = result.get("zigzag_pct",   ZIGZAG_MIN_PCT)
     built      = result.get("built_at", "?")[:10]
 
-    lines = []
-
-    # ── Header ────────────────────────────────────────────────────────────
-    lines += [
-        f"PHAN TICH SONG LICH SU: {sym}",
-        "═" * 40,
-        f"Lich su: {n_bars} ngay | ZigZag: {zz_pct:.0f}% | Cache: {built}",
-        f"Song tang: {n_up} mau vec ({n_up_tot} song, TB +{amp_u:.1f}%, ~{dur_u:.0f} ngay)",
-        f"Song giam: {n_down} mau vec ({n_down_tot} song, TB -{amp_d:.1f}%, ~{dur_d:.0f} ngay)",
-        "",
-    ]
-
-    # ── Cảnh báo mẫu thấp ─────────────────────────────────────────────────
-    low_side = []
-    if n_up < WARN_WAVES:
-        low_side.append(f"tang={n_up}")
-    if n_down < WARN_WAVES:
-        low_side.append(f"giam={n_down}")
-    if low_side:
-        lines += [
-            f"⚠️  MAU THAP ({', '.join(low_side)}) — ket qua mang tinh tham khao yeu.",
-            f"   Khoang tin cay rong khi n < {WARN_WAVES}. Xem CI bên dưới.",
-            "",
-        ]
-
-    # ── Base rate — đặt ngay sau header để user thấy trước khi đọc score ──
-    base_rate_up   = result.get("base_rate_up",   0.0)
-    base_rate_down = result.get("base_rate_down",  0.0)
-    avg_int_up     = result.get("avg_interval_up",  0.0)
-    avg_int_down   = result.get("avg_interval_down", 0.0)
-    lines += [
-        "TAN SUAT LICH SU (BASE RATE):",
-        "─" * 40,
-        f"  Song tang: {n_up_tot} lan / {n_bars} ngay = {base_rate_up:.1f}%"
-        + (f"  (TB cu {avg_int_up:.0f} ngay/lan)" if avg_int_up > 0 else ""),
-        f"  Song giam: {n_down_tot} lan / {n_bars} ngay = {base_rate_down:.1f}%"
-        + (f"  (TB cu {avg_int_down:.0f} ngay/lan)" if avg_int_down > 0 else ""),
-        "  * Day la xac suat nen (base rate) — khong lien quan den score ben duoi.",
-        "",
-    ]
-
-    # ── Đặc điểm sóng tăng ────────────────────────────────────────────────
-    lines += [
-        f"TRANG THAI TAI DAY truoc song tang ({n_up} lan, ZigZag {zz_pct:.0f}%):",
-        f"  (Vector tai diem day chinh xac — ngay gia cham day roi tang >= {zz_pct:.0f}%)",
-        "─" * 40,
-        f"  {'Dimension':<18} {'Median':>7}  {'P25':>7}  {'P75':>7}",
-        "  " + "-" * 38,
-    ]
-    # Hiển thị top 5 discriminant dims cho sóng tăng
-    disc_dims = [d[0] for d in top_dims]
-    for dim in disc_dims[:5]:
-        if dim not in dist_up:
-            continue
-        d   = dist_up[dim]
-        lbl = DIM_LABEL.get(dim, dim)
-        lines.append(
-            f"  {lbl:<18} {d['median']:>+7.2f}  {d['p25']:>+7.2f}  {d['p75']:>+7.2f}"
-        )
-    # Mô tả ngắn
-    up_chars = []
-    for dim, mu, md, _ in top_dims[:3]:
-        up_chars.append(DIM_HIGH.get(dim, dim) if mu > md else DIM_LOW.get(dim, dim))
-    if up_chars:
-        lines.append(f"  => {', '.join(up_chars)}.")
-    lines.append("")
-
-    # ── Đặc điểm sóng giảm ────────────────────────────────────────────────
-    lines += [
-        f"TRANG THAI TAI DINH truoc song giam ({n_down} lan, ZigZag {zz_pct:.0f}%):",
-        f"  (Vector tai diem dinh chinh xac — ngay gia cham dinh roi giam >= {zz_pct:.0f}%)",
-        "─" * 40,
-        f"  {'Dimension':<18} {'Median':>7}  {'P25':>7}  {'P75':>7}",
-        "  " + "-" * 38,
-    ]
-    for dim in disc_dims[:5]:
-        if dim not in dist_down:
-            continue
-        d   = dist_down[dim]
-        lbl = DIM_LABEL.get(dim, dim)
-        lines.append(
-            f"  {lbl:<18} {d['median']:>+7.2f}  {d['p25']:>+7.2f}  {d['p75']:>+7.2f}"
-        )
-    down_chars = []
-    for dim, mu, md, _ in top_dims[:3]:
-        down_chars.append(DIM_LOW.get(dim, dim) if mu > md else DIM_HIGH.get(dim, dim))
-    if down_chars:
-        lines.append(f"  => {', '.join(down_chars)}.")
-    lines.append("")
-
-    # ── Regime context ───────────────────────────────────────────────────
-    regime_data    = result.get("regime_data")
+    # Regime
     score_up_adj   = result.get("score_up_adj",   score_up)
     score_down_adj = result.get("score_down_adj", score_down)
     regime_note_up = result.get("regime_note_up", "")
     regime_note_dn = result.get("regime_note_dn", "")
-    has_regime_adj = bool(regime_note_up) and (score_up_adj != score_up or score_down_adj != score_down)
+    regime_data    = result.get("regime_data")
+    has_regime     = bool(regime_note_up)
 
-    # ── So sánh với hiện tại ──────────────────────────────────────────────
-    bar_up   = _score_bar(score_up)
-    bar_down = _score_bar(score_down)
-    verdict_em = (
-        "🟢 HIEN TAI GIONG TRANG THAI TAI DAY (truoc song tang)"  if verdict == "SONG TANG"  else
-        "🔴 HIEN TAI GIONG TRANG THAI TAI DINH (truoc song giam)" if verdict == "SONG GIAM"  else
-        "🟡 KHONG RO RANG (khong giong ro rang day hay dinh)"
-    )
+    # Reliability
+    n_min = min(n_up, n_down)
+    def _rel(n, conf):
+        if n >= 20 and conf >= 0.15: return "★★★"
+        if n >= 15 and conf >= 0.10: return "★★☆"
+        if n >= 10 and conf >= 0.08: return "★★☆"
+        if n >= 7  and conf >= 0.08: return "★☆☆"
+        return "☆☆☆"
+    reliability = _rel(n_min, confidence)
 
-    # Reliability label — thay CI số (quá rộng với n nhỏ, không thực dụng)
-    # Tiêu chí: n mẫu × score spread (confidence)
-    n_min_side = min(n_up, n_down)
-    def _reliability(n: int, conf: float) -> str:
-        if n >= 20 and conf >= 0.15: return "★★★ Cao"
-        if n >= 15 and conf >= 0.10: return "★★☆ Kha"
-        if n >= 10 and conf >= 0.08: return "★★☆ Kha (n gioi han)"
-        if n >= 7  and conf >= 0.08: return "★☆☆ Thap (n={})" .format(n)
-        return "☆☆☆ Rat thap (n={})".format(n)
-
-    reliability = _reliability(n_min_side, confidence)
-
-    # Weak signal note — chỉ hiển thị khi verdict là SONG TANG/GIAM nhưng score thấp
-    # Khi verdict đã là KHONG RO (do trung lập), không cần thêm note này
-    max_score = max(score_up, score_down)
-    weak_note = (
-        "  ⚡ Tin hieu yeu — score thap, can them xac nhan."
-        if max_score < MIN_MEANINGFUL_SCORE and verdict != "KHONG RO"
-        else ""
-    )
-
-    # Regime-adjusted bars (nếu có)    
-    bar_up_adj   = _score_bar(score_up_adj)
-    bar_down_adj = _score_bar(score_down_adj)
-
-    lines += [
-        "SO SANH VOI HIEN TAI:",
-        "─" * 40,
-        f"  Song tang : {bar_up} {score_up:.1%}  (n={n_up})",
-        f"  Song giam : {bar_down} {score_down:.1%}  (n={n_down})",
-        f"  Chenh lech: {confidence:.1%}  |  Do tin cay: {reliability}",
-        "",
-    ]
-    # Hiển thị regime-adjusted nếu có điều chỉnh
-    if has_regime_adj:
-        from market_regime import format_regime_inline
-        regime_inline = format_regime_inline(regime_data) if regime_data else ""
-        lines += [
-            "DIEU CHINH THEO MARKET REGIME:",
-            "─" * 40,
-            f"  {regime_inline}",
-            f"  Song tang (adj): {bar_up_adj} {score_up_adj:.1%}  {regime_note_up}",
-            f"  Song giam (adj): {bar_down_adj} {score_down_adj:.1%}  {regime_note_dn}",
-            "  * Score goc x weight regime = score hieu qua thuc te",
-            "",
-        ]
-    lines += [
-        f"=> {verdict_em}",
-    ]
-    if weak_note:
-        lines.append(weak_note)
-
-    # Kỳ vọng biên độ/thời gian nếu verdict có chiều hướng rõ
+    # Verdict emoji + label
     if verdict == "SONG TANG":
-        lines.append(
-            f"   Neu xay ra: TB +{amp_u:.0f}% trong ~{dur_u:.0f} ngay "
-            f"(dua tren {n_up_tot} song tang lich su)"
-        )
+        v_em  = "🟢"
+        v_lbl = "SONG TANG"
     elif verdict == "SONG GIAM":
-        lines.append(
-            f"   Neu xay ra: TB -{amp_d:.0f}% trong ~{dur_d:.0f} ngay "
-            f"(dua tren {n_down_tot} song giam lich su)"
-        )
-    lines.append("")
+        v_em  = "🔴"
+        v_lbl = "SONG GIAM"
+    else:
+        v_em  = "🟡"
+        v_lbl = "KHONG RO"
 
-    # ── Top 5 dimensions điển hình nhất với hiện tại ──────────────────────
-    # Filter: bỏ degenerate dims (z=nan), chỉ hiển thị dims hợp lệ
-    def _valid_dims(dim_z_list):
-        return [(d, z) for d, z in dim_z_list if z == z]  # z==z fails for nan
-
-    # Khi cả 2 scores thấp: thị trường đang trung lập (không phải outlier kỹ thuật)
-    if max_score < MIN_MEANINGFUL_SCORE:
-        lines += [
-            "ℹ️  TRANG THAI TRUNG LAP:",
-            "   Hien tai khong giong ro rang boi canh truoc song tang hay giam.",
-            "   Thuong gap khi thi truong dang tich luy hoac chua chon huong.",
-            "",
-        ]
-
-    # ── Discriminative Score — trọng tâm của Approach A ──────────────────
-    score_discrim_bottom = result.get("score_discrim_bottom", None)
-    score_discrim_top    = result.get("score_discrim_top",    None)
+    # Approach A — chỉ lấy signal phù hợp với verdict
+    score_discrim_top    = result.get("score_discrim_top",    0.0)
+    score_discrim_bottom = result.get("score_discrim_bottom", 0.0)
     n_fb = result.get("n_false_bottom", 0)
     n_ft = result.get("n_false_top",    0)
 
-    if score_discrim_bottom is not None and n_fb > 0:
-        lines += ["DO PHAN BIET (Approach A — tach day/dinh that vs oversold/overbought thuong):",
-                  "─" * 40]
+    def _approach_a_line(verdict):
+        """1 dòng Approach A cho chiều phù hợp verdict."""
+        if verdict == "SONG GIAM" and n_ft > 0:
+            v = score_discrim_top
+            if v >= 0.15:  return f"✅ Dac trung dinh that ro rang ({v:+.1%} vs overbought thuong)"
+            if v >= 0.05:  return f"🟡 Hoi giong dinh that ({v:+.1%})"
+            if v >= -0.05: return f"⚪ Khong phan biet duoc dinh that vs overbought thuong"
+            return             f"🔴 Giong overbought thuong ({v:+.1%}) — thieu exhaustion"
+        if verdict == "SONG TANG" and n_fb > 0:
+            v = score_discrim_bottom
+            if v >= 0.15:  return f"✅ Dac trung day that ro rang ({v:+.1%} vs oversold thuong)"
+            if v >= 0.05:  return f"🟡 Hoi giong day that ({v:+.1%})"
+            if v >= -0.05: return f"⚪ Khong phan biet duoc day that vs oversold thuong"
+            return             f"🔴 Giong oversold thuong ({v:+.1%}) — thieu capitulation"
+        return ""
 
-        def _discrim_bar(v: float) -> str:
-            # Bar: │ ở giữa, █ về phải = giống thật hơn, ▒ về trái = giống thường hơn
-            # Mỗi ô = 5%, range [-25%, +25%] → 5 ô mỗi bên
-            steps = round(v / 0.05)
-            steps = max(-5, min(5, steps))
-            if steps >= 0:
-                right = "█" * steps + "░" * (5 - steps)
-                left  = "░" * 5
-                bar   = f"[{left}│{right}]"
-            else:
-                left  = "░" * (5 + steps) + "▒" * (-steps)
-                right = "░" * 5
-                bar   = f"[{left}│{right}]"
-            return bar
+    approach_a = _approach_a_line(verdict)
 
-        def _discrim_label(v: float, mode: str) -> str:
-            if mode == "bottom":
-                if v >= 0.15:  return "✅ Co dac diem DAY THAT ro rang (cao hon oversold thuong)"
-                if v >= 0.05:  return "🟡 Hoi giong day that hon oversold thuong"
-                if v >= -0.05: return "⚪ Khong phan biet duoc"
-                if v >= -0.15: return "🔴 Giong oversold thuong hon day that"
-                return            "🔴🔴 Rat giong oversold thuong — KHONG co dac diem capitulation"
-            else:
-                if v >= 0.15:  return "✅ Co dac diem DINH THAT ro rang (cao hon overbought thuong)"
-                if v >= 0.05:  return "🟡 Hoi giong dinh that hon overbought thuong"
-                if v >= -0.05: return "⚪ Khong phan biet duoc"
-                if v >= -0.15: return "🔴 Giong overbought thuong hon dinh that"
-                return            "🔴🔴 Rat giong overbought thuong — KHONG co dac diem exhaustion"
+    # Subtype — chỉ chiều phù hợp verdict
+    def _subtype_line(verdict):
+        """1-2 dòng subtype cho chiều phù hợp verdict."""
+        lines_st = []
+        MIN_KNOWN = 6
+        LABEL = {
+            "PEAK_REAL":    "Peak that (Loai B)",
+            "CORRECTION":   "Correction (Loai A)",
+            "BOTTOM_REAL":  "Day that (Loai B)",
+            "RELIEF_RALLY": "Relief Rally (Loai A)",
+        }
+        EM = {
+            "PEAK_REAL": "🔴", "CORRECTION": "🟡",
+            "BOTTOM_REAL": "🟢", "RELIEF_RALLY": "🟡",
+        }
+        WARN = {
+            "PEAK_REAL":    "giam sau, it higher high",
+            "CORRECTION":   "giam ngan, se co higher high",
+            "BOTTOM_REAL":  "tang ben vung, it lower low",
+            "RELIEF_RALLY": "tang ngan trong downtrend",
+        }
 
-        sfb = result.get("score_false_bottom_raw", 0.0)
-        sft = result.get("score_false_top_raw",    0.0)
-        lines += [
-            f"  [Bot] Day that (G1={n_up}) vs Oversold thuong (G2={n_fb}):",
-            f"         G1 score: {score_up:.1%}  |  G2 score: {sfb:.1%}",
-            f"    Phan biet: {_discrim_bar(score_discrim_bottom)}  {score_discrim_bottom:+.1%}",
-            f"    {_discrim_label(score_discrim_bottom, 'bottom')}",
-            "",
-            f"  [Top] Dinh that (G3={n_down}) vs Overbought thuong (G4={n_ft}):",
-            f"         G3 score: {score_down:.1%}  |  G4 score: {sft:.1%}",
-            f"    Phan biet: {_discrim_bar(score_discrim_top)}  {score_discrim_top:+.1%}",
-            f"    {_discrim_label(score_discrim_top, 'top')}",
-            "",
-        ]
-
-    if dim_z_up and verdict in ("SONG TANG", "KHONG RO"):
-        valid_up = _valid_dims(dim_z_up)[:5]
-        if valid_up:
-            lines.append("DIMS KHOP VOI TRANG THAI TAI DAY (hien tai ~ day lich su):")
-            for dim, z in valid_up:
-                lbl = DIM_LABEL.get(dim, dim)
-                j   = VECTOR_KEYS.index(dim) if dim in VECTOR_KEYS else -1
-                cur = f"{cur_vec[j]:+.2f}" if j >= 0 else "?"
-                lines.append(f"  {lbl:<18} hien tai={cur}  z={z:+.2f}")
-            lines.append("")
-
-    if dim_z_down and verdict in ("SONG GIAM", "KHONG RO"):
-        valid_down = _valid_dims(dim_z_down)[:5]
-        if valid_down:
-            lines.append("DIMS KHOP VOI TRANG THAI TAI DINH (hien tai ~ dinh lich su):")
-            for dim, z in valid_down:
-                lbl = DIM_LABEL.get(dim, dim)
-                j   = VECTOR_KEYS.index(dim) if dim in VECTOR_KEYS else -1
-                cur = f"{cur_vec[j]:+.2f}" if j >= 0 else "?"
-                lines.append(f"  {lbl:<18} hien tai={cur}  z={z:+.2f}")
-            lines.append("")
-
-    # ── Phân loại sóng — context layer ────────────────────────────────────
-    _fmt_subtype_section(lines, result, verdict)
-
-    # ── Footer ────────────────────────────────────────────────────────────
-    # Calibration note: dùng score và base_rate của verdict thực tế
-    if verdict == "SONG TANG":
-        _cal_score = score_up
-        _cal_label = "song tang"
-        _cal_base  = base_rate_up
-    elif verdict == "SONG GIAM":
-        _cal_score = score_down
-        _cal_label = "song giam"
-        _cal_base  = base_rate_down
-    else:
-        # KHONG RO — dùng score cao hơn
-        if score_up >= score_down:
-            _cal_score = score_up;  _cal_label = "song tang"; _cal_base = base_rate_up
+        if verdict == "SONG GIAM":
+            stats   = result.get("subtype_stats_down", {})
+            compare = result.get("subtype_compare_down", {})
+            subtypes_pair = ("CORRECTION", "PEAK_REAL")
+            amp_ref = amp_d
+            dur_ref = dur_d
+        elif verdict == "SONG TANG":
+            stats   = result.get("subtype_stats_up", {})
+            compare = result.get("subtype_compare_up", {})
+            subtypes_pair = ("RELIEF_RALLY", "BOTTOM_REAL")
+            amp_ref = amp_u
+            dur_ref = dur_u
         else:
-            _cal_score = score_down; _cal_label = "song giam"; _cal_base = base_rate_down
+            return []
 
-    lines += [
-        "─" * 40,
-        "GIAI THICH SCORE:",
-        f"  Score {_cal_score:.0%} ({_cal_label}) co nghia: hien tai nam TRONG",
-        f"  phan phoi dien hinh cua {_cal_label} — KHONG phai xac suat",
-        f"  la {_cal_score:.0%}. Xac suat nen thuc te chi la {_cal_base:.1f}%.",
-        "─" * 40,
-        "⚠️  CANH BAO: Phan tich chi mang tinh tham khao.",
-        "   Qua khu khong dam bao tuong lai.",
-        "   Khong su dung de ra quyet dinh giao dich.",
-    ]
+        if not stats or stats.get("total_known", 0) < MIN_KNOWN:
+            return []
+
+        counts = stats.get("counts", {})
+        pct    = stats.get("pct",    {})
+        amp    = stats.get("amp",    {})
+        dur    = stats.get("dur",    {})
+
+        # Tỷ lệ 2 loại
+        st_a, st_b = subtypes_pair
+        n_a   = counts.get(st_a, 0)
+        n_b   = counts.get(st_b, 0)
+        pct_a = pct.get(st_a, 0.0)
+        pct_b = pct.get(st_b, 0.0)
+        amp_a = amp.get(st_a, 0.0)
+        amp_b = amp.get(st_b, 0.0)
+        dur_a = dur.get(st_a, 0.0)
+        dur_b = dur.get(st_b, 0.0)
+
+        sign = "-" if verdict == "SONG GIAM" else "+"
+        lines_st.append(
+            f"  {EM[st_a]} {LABEL[st_a]}: {pct_a:.0f}% ({n_a} song, TB {sign}{amp_a:.0f}%, ~{dur_a:.0f}n)"
+        )
+        lines_st.append(
+            f"  {EM[st_b]} {LABEL[st_b]}: {pct_b:.0f}% ({n_b} song, TB {sign}{amp_b:.0f}%, ~{dur_b:.0f}n)"
+        )
+
+        # Closest subtype
+        closest = compare.get("closest", "")
+        if not closest and compare.get("subtypes"):
+            closest = min(compare["subtypes"], key=lambda s: compare["subtypes"][s]["total_dist"])
+
+        if closest and closest in LABEL:
+            margin  = compare.get("margin", 0.0)
+            warn    = WARN.get(closest, "")
+            margin_note = " (gan nhau)" if 0 < margin < 0.15 else ""
+            lines_st.append(
+                f"  → {EM[closest]} Gan nhat: {LABEL[closest]}{margin_note} — {warn}"
+            )
+
+        return lines_st
+
+    subtype_lines = _subtype_line(verdict)
+
+    # Kỳ vọng biên độ
+    if verdict == "SONG TANG":
+        expectation = f"   Neu xay ra: TB +{amp_u:.0f}% trong ~{dur_u:.0f} ngay ({n_up_tot} song)"
+    elif verdict == "SONG GIAM":
+        expectation = f"   Neu xay ra: TB -{amp_d:.0f}% trong ~{dur_d:.0f} ngay ({n_down_tot} song)"
+    else:
+        expectation = ""
+
+    # Cảnh báo mẫu thấp
+    low_warn = ""
+    if n_min < WARN_WAVES:
+        low_warn = f"⚠️ Mau thap (n={n_min}) — tham khao yeu"
+
+    # ── Assemble ──────────────────────────────────────────────────────────
+    sep = "═" * 32
+    lines = [f"/wave {sym}  [{built} | ZigZag {zz_pct:.0f}% | n={n_up}/{n_down}]",
+             sep]
+
+    # Dòng 1 — Verdict
+    lines.append(f"{v_em} {v_lbl}  {reliability}  (chenh {confidence:.0%})")
+
+    # Dòng 2 — Score gốc → adj
+    if has_regime:
+        regime_lbl = ""
+        if regime_data and regime_data.get("ok"):
+            r = regime_data.get("regime", "?")
+            rl = regime_data.get("label", "").split("—")[1].strip() if "—" in regime_data.get("label","") else ""
+            weights = regime_data.get("weights", {})
+            regime_lbl = f"R{r} {rl} (↑×{weights.get('bull',1):.2f} ↓×{weights.get('bear',1):.2f})"
+        lines.append(
+            f"   Score: giam {score_down:.0%}→{score_down_adj:.0%} | "
+            f"tang {score_up:.0%}→{score_up_adj:.0%}"
+        )
+        if regime_lbl:
+            lines.append(f"   Regime: {regime_lbl}")
+    else:
+        lines.append(f"   Score: giam {score_down:.0%} | tang {score_up:.0%}  (n={n_up}/{n_down})")
+
+    # Dòng 3 — Approach A
+    if approach_a:
+        lines.append(f"   {approach_a}")
+
+    # Separator nhỏ
+    lines.append("─" * 32)
+
+    # Dòng 4-6 — Subtype
+    if subtype_lines:
+        lines += subtype_lines
+
+    # Dòng 7 — Kỳ vọng
+    if expectation:
+        lines.append(expectation)
+
+    # Cảnh báo mẫu
+    if low_warn:
+        lines.append(low_warn)
+
+    # Trung lập note
+    if verdict == "KHONG RO":
+        lines.append("   Thi truong chua chon huong — cho tin hieu xac nhan.")
+
+    lines.append(sep)
 
     return "\n".join(lines)
 
