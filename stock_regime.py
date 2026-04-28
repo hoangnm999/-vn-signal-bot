@@ -74,6 +74,24 @@ _IDX_PRICE_SMA20  = 5
 _IDX_RSI          = 0
 _IDX_BB_POS       = 2
 
+# Dimensions dùng cho GMM clustering — loại trừ dims hay bị clip cứng tại ±1
+# vol_trend (idx=13): clip tại ±1 khi vol MA5/MA20 lệch mạnh → outlier thường xuyên
+# atr_ratio (idx=7) : clip tại [0,1] theo percentile → ít vấn đề hơn nhưng cũng loại
+# candle_body(idx=14): clip tại [0,1] → ít thông tin direction
+# Giữ lại 11 dims có ý nghĩa direction rõ nhất cho GMM
+GMM_DIMS = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11]
+# = rsi_norm, macd_hist_norm, bb_position, volume_spike, trend_slope,
+#   price_vs_sma20, price_vs_sma50, stoch_k_norm, ema_cross,
+#   momentum_5d, momentum_20d
+# Loại: atr_ratio(7), high_low_pos(12), vol_trend(13), candle_body(14)
+
+# Index trong GMM_DIMS (subset) — dùng cho _assign_labels
+_GMM_IDX_MOMENTUM_5D  = GMM_DIMS.index(10)   # = 9
+_GMM_IDX_MOMENTUM_20D = GMM_DIMS.index(11)   # = 10
+_GMM_IDX_VOLUME_SPIKE = GMM_DIMS.index(3)    # = 3
+_GMM_IDX_TREND_SLOPE  = GMM_DIMS.index(4)    # = 4
+_GMM_IDX_PRICE_SMA20  = GMM_DIMS.index(5)    # = 5
+
 # ── Regime definitions ─────────────────────────────────────────────────────────
 SR_LABELS = {
     1: "SR1 — Accumulation",
@@ -145,12 +163,12 @@ def _assign_labels(centroids: np.ndarray) -> dict[int, int]:
     """
     # Composite bull score — 4 dims đo xu hướng tăng
     bull_scores = (
-        centroids[:, _IDX_MOMENTUM_5D]  +
-        centroids[:, _IDX_MOMENTUM_20D] +
-        centroids[:, _IDX_TREND_SLOPE]  +
-        centroids[:, _IDX_PRICE_SMA20]
+        centroids[:, _GMM_IDX_MOMENTUM_5D]  +
+        centroids[:, _GMM_IDX_MOMENTUM_20D] +
+        centroids[:, _GMM_IDX_TREND_SLOPE]  +
+        centroids[:, _GMM_IDX_PRICE_SMA20]
     )
-    volume_scores = centroids[:, _IDX_VOLUME_SPIKE]
+    volume_scores = centroids[:, _GMM_IDX_VOLUME_SPIKE]
 
     ranked = np.argsort(bull_scores)   # ascending: [most bear → most bull]
 
@@ -207,51 +225,44 @@ def _fit_gmm(vectors: np.ndarray) -> Optional[tuple]:
 
     # StandardScaler để normalize
     scaler = StandardScaler()
-    X = scaler.fit_transform(vectors)
+    # Chỉ dùng GMM_DIMS — loại trừ dims hay bị clip cứng (vol_trend, atr_ratio...)
+    X_full = vectors                        # (n, 15) — giữ nguyên để inverse_transform
+    X      = scaler.fit_transform(vectors[:, GMM_DIMS])  # (n, 11)
 
     # Fit GMM với diag covariance — robust hơn full với data ~400 vectors
     gmm = GaussianMixture(
         n_components=N_CLUSTERS,
-        covariance_type="diag",      # đổi từ "full" → "diag"
+        covariance_type="diag",
         max_iter=GMM_MAX_ITER,
         n_init=GMM_N_INIT,
-        reg_covar=1e-3,              # tăng từ 1e-4 → 1e-3 để tránh degenerate
+        reg_covar=1e-3,
         random_state=42,
     )
     gmm.fit(X)
 
-    # Centroids trong original space
-    centroids_scaled = gmm.means_
-    centroids_orig   = scaler.inverse_transform(centroids_scaled)
+    # Centroids trong original space (chỉ GMM_DIMS)
+    centroids_scaled = gmm.means_                          # (4, 11)
+    centroids_orig   = scaler.inverse_transform(centroids_scaled)  # (4, 11)
 
-    # Assign labels
+    # Assign labels — centroids_orig shape (4, 11), index theo _GMM_IDX_*
     label_mapping = _assign_labels(centroids_orig)
 
     # ── Label validity check ──────────────────────────────────────────────────
-    # Tính bull_score cho mỗi cluster theo label đã assign
     bull_scores = (
-        centroids_orig[:, _IDX_MOMENTUM_5D]  +
-        centroids_orig[:, _IDX_MOMENTUM_20D] +
-        centroids_orig[:, _IDX_TREND_SLOPE]  +
-        centroids_orig[:, _IDX_PRICE_SMA20]
+        centroids_orig[:, _GMM_IDX_MOMENTUM_5D]  +
+        centroids_orig[:, _GMM_IDX_MOMENTUM_20D] +
+        centroids_orig[:, _GMM_IDX_TREND_SLOPE]  +
+        centroids_orig[:, _GMM_IDX_PRICE_SMA20]
     )
-    # Lấy bull_score của từng SR
-    sr_bull = {}
-    for c_idx, sr_idx in label_mapping.items():
-        sr_bull[sr_idx] = float(bull_scores[c_idx])
+    sr_bull = {sr_idx: float(bull_scores[c_idx])
+               for c_idx, sr_idx in label_mapping.items()}
 
-    # Điều kiện tối thiểu: SR2 phải có bull_score cao hơn SR4
-    # (không enforce SR2>SR3>SR1>SR4 vì HAH có thể không đủ 4 giai đoạn)
-    markup_bull   = sr_bull.get(2, 0)
-    markdown_bull = sr_bull.get(4, 0)
-
-    if markup_bull <= markdown_bull:
-        # GMM không phân tách được Markup vs Markdown — data không đủ diversity
+    if sr_bull.get(2, 0) <= sr_bull.get(4, 0):
         logger.warning(
-            f"GMM label validity fail: Markup bull={markup_bull:.3f} <= "
-            f"Markdown bull={markdown_bull:.3f} — data khong du 4 giai doan"
+            f"GMM validity fail: SR2 bull={sr_bull.get(2,0):.3f} <= "
+            f"SR4 bull={sr_bull.get(4,0):.3f}"
         )
-        return None   # Caller sẽ trả về "Khong xac dinh"
+        return None
 
     return gmm, scaler, label_mapping, centroids_orig
 
@@ -275,15 +286,15 @@ def _predict_current(
         confidence bị inflate giả tạo sau normalize. Trong trường hợp này
         trả về confidence thấp để caller biết kết quả không đáng tin.
     """
-    x = scaler.transform(current_vector.reshape(1, -1))
-    probs_raw = gmm.predict_proba(x)[0]   # (N_CLUSTERS,)
+    # Chỉ lấy GMM_DIMS từ vector (loại trừ dims bị clip)
+    x_subset = current_vector[GMM_DIMS]
+    x = scaler.transform(x_subset.reshape(1, -1))
+    probs_raw = gmm.predict_proba(x)[0]
 
-    # Outlier check: nếu max raw prob < ngưỡng → vector nằm xa mọi centroid
-    # Dùng log-probability để detect (predict_proba đã softmax, cần score gốc)
+    # Outlier check
     try:
-        log_probs = gmm.score_samples(x)   # log-likelihood của sample
-        # Ngưỡng: nếu log-likelihood < -50 thì điểm này là outlier rõ ràng
-        is_outlier = float(log_probs[0]) < -50
+        log_prob_sample = float(gmm.score_samples(x)[0])
+        is_outlier = log_prob_sample < -50
     except Exception:
         is_outlier = False
 
@@ -577,6 +588,15 @@ def get_stock_regime(
             cached["ok"] = True
             cached.setdefault("history_30d", [])
             return cached
+    else:
+        # Xóa cache file cũ để đảm bảo rebuild hoàn toàn
+        cache_file = _cache_path(symbol)
+        if cache_file.exists():
+            try:
+                cache_file.unlink()
+                logger.info(f"Stock regime cache deleted: {symbol}")
+            except Exception:
+                pass
 
     # Load data nếu không có
     if df is None:
