@@ -72,6 +72,14 @@ except ImportError:
     logger.warning("wave_pattern.py chua co — /wave bi tat")
 
 try:
+    from market_regime import regime_cmd, get_market_regime, format_regime_inline
+    _MARKET_REGIME = True
+    logger.info("market_regime.py loaded OK")
+except ImportError:
+    _MARKET_REGIME = False
+    logger.warning("market_regime.py chua co — /regime bi tat")
+
+try:
     from vibe_client import (
         is_available as vibe_available,
         start_swarm, poll_swarm, format_swarm_result,
@@ -237,6 +245,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/backtest_rule <MA>  — Backtest tu dong (Auto Context)\n"
         "/backtest_rule <MA> \"entry_rule\" \"exit_rule\"  — Manual\n"
         "/wave <MA>           — Phan tich song lich su (Wave Pattern)\n\n"
+        "━━━ THI TRUONG ━━━\n"
+        "/regime              — Market Regime VNINDEX (Bull/Bear x Quiet/Volatile)\n"
+        "/regime --history    — Lich su 90 ngay + chart regime\n\n"
         "━━━ CANH BAO GIA ━━━\n"
         "/alert <MA> <gia> [above|below] — Dat canh bao\n"
         "/alerts              — Xem canh bao dang hoat dong\n"
@@ -301,6 +312,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  Phan tich song lich su: tim dau hieu truoc song tang/giam\n"
         "  So sanh trang thai hien tai voi 2 nhom\n"
         "  --rebuild: build lai cache (mac dinh dung cache <= 7 ngay)\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📈 THI TRUONG\n"
+        "/regime\n"
+        "  Phan loai trang thai VNINDEX: Bull/Bear x Quiet/Volatile\n"
+        "  Dieu chinh weight cua wave/analog signal theo regime\n"
+        "  --history: xem lich su 90 ngay + chart\n"
+        "  --rebuild: tinh lai, bo qua cache\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🔔 CANH BAO GIA\n"
         "/alert <MA> <gia> [above|below]\n"
@@ -481,6 +499,24 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result, meta = await asyncio.to_thread(analyze_stock_full, symbol)
         await _edit_or_split(msg, update.message, result)
+
+        # Gửi regime context ngay sau kết quả /check
+        if _MARKET_REGIME:
+            try:
+                _regime_data = await asyncio.to_thread(get_market_regime)
+                _regime_line = format_regime_inline(_regime_data)
+                if _regime_line:
+                    weights = _regime_data.get("weights", {})
+                    _regime_msg = (
+                        f"{_regime_line}\n"
+                        f"   Wave x{weights.get('wave',1):.1f} | "
+                        f"Analog x{weights.get('analog',1):.1f} | "
+                        f"Engine x{weights.get('engine',1):.1f}\n"
+                        f"   /regime --history de xem chi tiet"
+                    )
+                    await update.message.reply_text(_regime_msg)
+            except Exception as _re:
+                logger.debug(f"regime context skip: {_re}")
 
         if meta:
             try:
@@ -1362,6 +1398,8 @@ def main():
         app.add_handler(CommandHandler("scan_watchlist", scan_watchlist_cmd))
     if _WAVE_PATTERN:
         app.add_handler(CommandHandler("wave", wave_cmd))
+    if _MARKET_REGIME:
+        app.add_handler(CommandHandler("regime", regime_cmd))
     if _LOCAL_SWARM:
         app.add_handler(CommandHandler("local_swarm",  local_swarm_cmd))
         app.add_handler(CommandHandler("cancel",       cancel_swarm_cmd))

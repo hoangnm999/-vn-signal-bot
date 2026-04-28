@@ -1102,6 +1102,20 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
     else:
         verdict = "KHONG RO"
 
+    # Regime weight — điều chỉnh score theo Market Regime VNINDEX
+    regime_data    = None
+    score_up_adj   = score_up
+    score_down_adj = score_down
+    regime_note_up = ""
+    regime_note_dn = ""
+    try:
+        from market_regime import get_market_regime, apply_regime_weight
+        regime_data                  = get_market_regime()
+        score_up_adj,   regime_note_up = apply_regime_weight(score_up,   "wave", regime_data)
+        score_down_adj, regime_note_dn = apply_regime_weight(score_down, "wave", regime_data)
+    except Exception as _re:
+        logger.debug(f"regime weight skip: {_re}")
+
     # Top discriminant dims
     top_dims = _top_discriminant_dims(dist_up, dist_down)
 
@@ -1145,6 +1159,12 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
         "dim_z_up":         dim_z_up,
         "dim_z_down":       dim_z_down,
         "built_at":         cache.get("built_at", "?"),
+        # Regime-adjusted scores
+        "score_up_adj":       score_up_adj,
+        "score_down_adj":     score_down_adj,
+        "regime_note_up":     regime_note_up,
+        "regime_note_dn":     regime_note_dn,
+        "regime_data":        regime_data,
         # Base rate — dùng trong format để calibrate kỳ vọng user
         "base_rate_up":       base_rate_up,
         "base_rate_down":     base_rate_down,
@@ -1452,6 +1472,14 @@ def format_wave_report(result: dict) -> str:
         lines.append(f"  => {', '.join(down_chars)}.")
     lines.append("")
 
+    # ── Regime context ───────────────────────────────────────────────────
+    regime_data    = result.get("regime_data")
+    score_up_adj   = result.get("score_up_adj",   score_up)
+    score_down_adj = result.get("score_down_adj", score_down)
+    regime_note_up = result.get("regime_note_up", "")
+    regime_note_dn = result.get("regime_note_dn", "")
+    has_regime_adj = bool(regime_note_up) and (score_up_adj != score_up or score_down_adj != score_down)
+
     # ── So sánh với hiện tại ──────────────────────────────────────────────
     bar_up   = _score_bar(score_up)
     bar_down = _score_bar(score_down)
@@ -1482,6 +1510,10 @@ def format_wave_report(result: dict) -> str:
         else ""
     )
 
+    # Regime-adjusted bars (nếu có)    
+    bar_up_adj   = _score_bar(score_up_adj)
+    bar_down_adj = _score_bar(score_down_adj)
+
     lines += [
         "SO SANH VOI HIEN TAI:",
         "─" * 40,
@@ -1489,6 +1521,21 @@ def format_wave_report(result: dict) -> str:
         f"  Song giam : {bar_down} {score_down:.1%}  (n={n_down})",
         f"  Chenh lech: {confidence:.1%}  |  Do tin cay: {reliability}",
         "",
+    ]
+    # Hiển thị regime-adjusted nếu có điều chỉnh
+    if has_regime_adj:
+        from market_regime import format_regime_inline
+        regime_inline = format_regime_inline(regime_data) if regime_data else ""
+        lines += [
+            "DIEU CHINH THEO MARKET REGIME:",
+            "─" * 40,
+            f"  {regime_inline}",
+            f"  Song tang (adj): {bar_up_adj} {score_up_adj:.1%}  {regime_note_up}",
+            f"  Song giam (adj): {bar_down_adj} {score_down_adj:.1%}  {regime_note_dn}",
+            "  * Score goc x weight regime = score hieu qua thuc te",
+            "",
+        ]
+    lines += [
         f"=> {verdict_em}",
     ]
     if weak_note:
