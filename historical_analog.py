@@ -814,6 +814,17 @@ def format_analog_report(
         lines.append("─" * 32)
         lines += wave_lines
 
+    # Stock Regime (Phase 2 GMM)
+    try:
+        from stock_regime import get_stock_regime, format_stock_regime_for_backtest
+        _sr = get_stock_regime(symbol)
+        _sr_block = format_stock_regime_for_backtest(_sr)
+        if _sr_block:
+            lines.append("─" * 32)
+            lines += _sr_block.splitlines()
+    except Exception:
+        pass
+
     # Verdict + warnings
     lines.append("─" * 32)
     lines.append(f"{em_v} {verdict_txt}")
