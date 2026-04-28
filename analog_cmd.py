@@ -147,9 +147,17 @@ def _format_analog_result(
         lines.append(f"P25: {p25:+.1f}%  |  P75: {p75:+.1f}%")
 
     # ── Ke hoach hanh dong ────────────────────────────────────────────────────
-    if close_px and mae_avg and mfe_avg:
+    # SL dùng median_mdd (median max drawdown của các mẫu) thay vì mae_avg
+    # vì mae_avg là max drawdown trong toàn hành trình — quá rộng cho SL thực tế
+    # median_mdd phản ánh drawdown điển hình trước khi giá phục hồi
+    sl_from_mdd = med_mdd - 1.0   # median MDD + buffer 1%
+    # Nếu median_mdd quá nhỏ (gần 0) → fallback sang mae_avg / 2
+    if sl_from_mdd > -2.0 and mae_avg < -2.0:
+        sl_from_mdd = mae_avg / 2.0
+
+    if close_px and sl_from_mdd < 0 and mfe_avg:
         lines.append("─" * 32)
-        sl_pct  = mae_avg - 2.0   # conservative buffer
+        sl_pct  = sl_from_mdd
         tp1_pct = med_ret
         tp2_pct = mfe_avg * 0.7   # 70% MFE làm TP2
 
