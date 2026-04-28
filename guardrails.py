@@ -94,6 +94,9 @@ def compute_base_stats(analogs: list) -> dict:
     """
     Tính toán các chỉ số thống kê từ danh sách analogs.
     Dùng MEDIAN thay vì mean để loại outlier.
+
+    Regime Filter: nếu analogs có trường regime_weight → tính weighted WR,
+    weighted Expectancy song song với unweighted để so sánh và hiển thị.
     """
     f30s  = [a["fwd_30"]        for a in analogs if a.get("fwd_30")        is not None]
     mdds  = [a["max_drawdown"]  for a in analogs if a.get("max_drawdown")  is not None]
@@ -108,53 +111,87 @@ def compute_base_stats(analogs: list) -> dict:
     win_rate   = sum(1 for x in f30s if x > 0) / n
     median_mdd = float(np.median(mdds)) if mdds else 0.0
 
-    # Return/Vol ratio 30D — ĐƠN GIẢN HÓA, không phải Sharpe học thuật
-    # (không annualized, không trừ risk-free rate, dùng median thay mean)
+    # ── Regime-weighted statistics ────────────────────────────────────────────
+    # Nếu analogs có regime_weight → tính weighted WR và weighted Expectancy
+    weights = [a.get("regime_weight", 1.0) for a in analogs if a.get("fwd_30") is not None]
+    total_w = sum(weights)
+    regime_filter_active = any(a.get("regime_weight", 1.0) != 1.0 for a in analogs)
+
+    if regime_filter_active and total_w > 0:
+        # Weighted WR: Σ(weight * 1_win) / Σ(weight)
+        weighted_win_sum = sum(
+            w for a, w in zip(
+                [a for a in analogs if a.get("fwd_30") is not None],
+                weights
+            ) if a.get("fwd_30", 0) > 0
+        )
+        win_rate_weighted = weighted_win_sum / total_w
+
+        # Weighted Expectancy: Σ(weight * fwd_30) / Σ(weight)
+        weighted_exp = sum(
+            f * w for f, w in zip(f30s, weights)
+        ) / total_w
+
+        weighted_n = round(total_w, 2)
+    else:
+        win_rate_weighted = win_rate
+        weighted_exp      = float(np.mean(f30s))
+        weighted_n        = float(n)
+
+    # Regime match stats
+    current_regime  = analogs[0].get("_meta", {}).get("current_regime", 0) if analogs else 0
+    same_regime_n   = sum(
+        1 for a in analogs
+        if a.get("sample_regime", 0) == current_regime and current_regime > 0
+    )
+    regime_match_pct = same_regime_n / len(analogs) if analogs and current_regime > 0 else None
+
+    # Return/Vol ratio 30D
     return_vol_ratio = (median_ret / std_ret) if std_ret > 0 else 0.0
 
-    # Expectancy = mean của TẤT CẢ forward return 30D (lãi + lỗ)
-    # Đây là forward return của analog, không phải per-trade riêng lẻ
-    # → dùng mean trực tiếp, không cần tách Win/Loss
-    expectancy = round(float(np.mean(f30s)), 2)
+    # Expectancy = weighted nếu có, unweighted nếu không
+    expectancy = round(weighted_exp, 2)
 
-    # Profit Factor = Σ(return dương) / |Σ(return âm)|
-    # Nếu không có lần âm → PF = 99 (tránh inf gây lỗi format/JSON)
+    # Profit Factor
     pos_sum = sum(x for x in f30s if x > 0)
     neg_sum = abs(sum(x for x in f30s if x < 0))
     profit_factor = round(pos_sum / neg_sum, 2) if neg_sum > 0 else 99.0
 
-    # P25 / P75 để hiển thị confidence interval
+    # P25 / P75
     p25 = float(np.percentile(f30s, 25)) if n >= 4 else None
     p75 = float(np.percentile(f30s, 75)) if n >= 4 else None
 
-    # Recency: % mẫu trong 12 tháng gần nhất
+    # Recency
     from datetime import date, timedelta
     cutoff_12m    = (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
     n_recent      = sum(1 for a in analogs if a.get("date", "") >= cutoff_12m)
     recency_ratio = n_recent / len(analogs) if analogs else 0
 
     return {
-        "valid":            True,
-        "n":                n,
-        "median_ret":       round(median_ret, 2),
-        "std_ret":          round(std_ret, 2),
-        "win_rate":         round(win_rate, 4),
-        "return_vol_ratio": round(return_vol_ratio, 3),
-        "median_mdd":       round(median_mdd, 2),
-        "expectancy":       expectancy,
-        "profit_factor":    profit_factor,
-        "p25_ret":          round(p25, 2) if p25 is not None else None,
-        "p75_ret":          round(p75, 2) if p75 is not None else None,
-        "recency_ratio":    round(recency_ratio, 3),
-        "close":            close,
-        "median_60":        round(float(np.median(
-                                [a["fwd_60"] for a in analogs if a.get("fwd_60") is not None]
-                            )), 2) if any(a.get("fwd_60") for a in analogs) else None,
-        "median_90":        round(float(np.median(
-                                [a["fwd_90"] for a in analogs if a.get("fwd_90") is not None]
-                            )), 2) if any(a.get("fwd_90") for a in analogs) else None,
-        # MAE/MFE từ price journey (max_drawdown = MAE, max_gain = MFE trong 90D)
-        # Đây là excursion thực tế của từng analog — tương đương MAE/MFE backtest
+        "valid":              True,
+        "n":                  n,
+        "median_ret":         round(median_ret, 2),
+        "std_ret":            round(std_ret, 2),
+        # win_rate: dùng weighted nếu có regime filter
+        "win_rate":           round(win_rate_weighted, 4),
+        "win_rate_raw":       round(win_rate, 4),          # unweighted — để compare
+        "weighted_n":         weighted_n,                  # effective sample count
+        "regime_filter_active": regime_filter_active,
+        "regime_match_pct":   round(regime_match_pct, 2) if regime_match_pct is not None else None,
+        "return_vol_ratio":   round(return_vol_ratio, 3),
+        "median_mdd":         round(median_mdd, 2),
+        "expectancy":         expectancy,                  # weighted expectancy
+        "profit_factor":      profit_factor,
+        "p25_ret":            round(p25, 2) if p25 is not None else None,
+        "p75_ret":            round(p75, 2) if p75 is not None else None,
+        "recency_ratio":      round(recency_ratio, 3),
+        "close":              close,
+        "median_60":          round(float(np.median(
+                                  [a["fwd_60"] for a in analogs if a.get("fwd_60") is not None]
+                              )), 2) if any(a.get("fwd_60") for a in analogs) else None,
+        "median_90":          round(float(np.median(
+                                  [a["fwd_90"] for a in analogs if a.get("fwd_90") is not None]
+                              )), 2) if any(a.get("fwd_90") for a in analogs) else None,
         "mae_avg":    round(float(np.mean(
                           [a["max_drawdown"] for a in analogs if a.get("max_drawdown") is not None]
                       )), 2) if any(a.get("max_drawdown") for a in analogs) else None,
@@ -167,14 +204,12 @@ def compute_base_stats(analogs: list) -> dict:
         "mfe_best":   round(float(np.max(
                           [a["max_gain"] for a in analogs if a.get("max_gain") is not None]
                       )), 2) if any(a.get("max_gain") for a in analogs) else None,
-        # Hold duration: số ngày TB đến khi đạt max_gain (proxy cho holding period)
         "hold_avg":   round(float(np.mean(
                           [a["max_gain_day"] for a in analogs if a.get("max_gain_day") is not None]
                       )), 1) if any(a.get("max_gain_day") for a in analogs) else None,
         "hold_median":round(float(np.median(
                           [a["max_gain_day"] for a in analogs if a.get("max_gain_day") is not None]
                       )), 1) if any(a.get("max_gain_day") for a in analogs) else None,
-        # MFE capture rate: fwd_30 / max_gain = % MFE thực thu được trong 30D
         "mfe_capture_rate": round(float(np.mean(
                           [a["fwd_30"] / a["max_gain"] * 100
                            for a in analogs
@@ -389,6 +424,28 @@ def format_symbol_entry(
     em = "🏆" if rank == 1 else "🥈" if rank == 2 else "🥉" if rank == 3 else f"#{rank}"
 
     lines = [f"{em} #{rank} — {symbol} (Giá: {close:,.0f})"]
+
+    # Regime filter info — hiển thị nếu đang active
+    regime_filter = stats.get("regime_filter_active", False)
+    weighted_n    = stats.get("weighted_n", float(n))
+    regime_match  = stats.get("regime_match_pct")
+    win_rate_raw  = stats.get("win_rate_raw")
+
+    if regime_filter:
+        regime_names = {1: "R1 Bull Quiet", 2: "R2 Bull Volatile",
+                        3: "R3 Bear Quiet",  4: "R4 Bear Volatile"}
+        cur_r = 0
+        # Lấy current_regime từ _meta của analog đầu tiên (nếu có)
+        cur_r_name = regime_names.get(cur_r, "")
+        match_str  = f" | Khop regime: {regime_match:.0%}" if regime_match is not None else ""
+        lines.append(
+            f"🎯 Regime Filter: ON | Weighted N: {weighted_n:.1f}{match_str}"
+        )
+        if win_rate_raw is not None and abs(win_rate_raw - win_rate) > 0.03:
+            lines.append(
+                f"   WR co trong so: {win_rate:.0%} "
+                f"(raw khong loc: {win_rate_raw:.0%})"
+            )
 
     # Sample info — hiển thị mẫu độc lập (sau Minimum Distance Sampling)
     n_ind = n_independent if n_independent > 0 else n

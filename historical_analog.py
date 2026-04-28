@@ -49,6 +49,119 @@ MIN_SAMPLE_WARNING       = 5
 MIN_SAMPLE_DISTANCE_DAYS = 30
 MIN_SAMPLE_DISTANCE_FB   = 20
 
+# ── Regime Filter Constants ───────────────────────────────────────────────────
+# Soft weight — không loại bỏ sample, chỉ giảm "trọng số" khi tính WR/Expectancy
+# R1↔R2 và R3↔R4 là "gần nhau" (cùng bull/bear, khác volatility)
+# R1↔R3, R1↔R4, R2↔R3, R2↔R4 là "xa nhau" (khác bull/bear)
+REGIME_WEIGHT_SAME    = 1.00   # cùng regime
+REGIME_WEIGHT_CLOSE   = 0.50   # regime gần (cùng bull/bear, khác volatility)
+REGIME_WEIGHT_FAR     = 0.15   # regime xa (bull vs bear)
+REGIME_MIN_WEIGHTED   = 5.0    # weighted sample count tối thiểu (tránh too few)
+REGIME_AUTO_EXPAND    = 8      # nếu weighted_n < này → tự mở rộng years lên 8
+
+# Map: (current_regime, sample_regime) → weight
+_REGIME_WEIGHT_MAP: dict[tuple[int, int], float] = {}
+for _r in range(1, 5):
+    _REGIME_WEIGHT_MAP[(_r, _r)] = REGIME_WEIGHT_SAME
+# R1↔R2 gần (đều Bull)
+_REGIME_WEIGHT_MAP[(1, 2)] = _REGIME_WEIGHT_MAP[(2, 1)] = REGIME_WEIGHT_CLOSE
+# R3↔R4 gần (đều Bear)
+_REGIME_WEIGHT_MAP[(3, 4)] = _REGIME_WEIGHT_MAP[(4, 3)] = REGIME_WEIGHT_CLOSE
+# Còn lại là xa
+for _a in range(1, 5):
+    for _b in range(1, 5):
+        if (_a, _b) not in _REGIME_WEIGHT_MAP:
+            _REGIME_WEIGHT_MAP[(_a, _b)] = REGIME_WEIGHT_FAR
+
+
+def _get_regime_weight(current_regime: int, sample_regime: int) -> float:
+    """Trả về weight cho 1 sample dựa trên regime match."""
+    if current_regime <= 0 or sample_regime <= 0:
+        return 1.0   # không có regime info → không filter
+    return _REGIME_WEIGHT_MAP.get((current_regime, sample_regime), REGIME_WEIGHT_FAR)
+
+
+def _get_current_regime() -> int:
+    """
+    Lấy market regime hiện tại (1-4).
+    Returns 0 nếu không xác định được.
+    """
+    try:
+        from market_regime import get_market_regime
+        mr = get_market_regime()
+        return int(mr.get("regime", 0)) if mr else 0
+    except Exception as e:
+        logger.debug(f"_get_current_regime fail: {e}")
+        return 0
+
+
+def _classify_date_regime(date_str: str, vnindex_regime_cache: dict) -> int:
+    """
+    Lookup regime của một ngày lịch sử từ cache VNINDEX regime history.
+
+    vnindex_regime_cache: dict {date_str: regime_int} được build 1 lần
+    Returns 0 nếu không tìm thấy.
+    """
+    if not vnindex_regime_cache:
+        return 0
+    return vnindex_regime_cache.get(date_str, 0)
+
+
+def _build_vnindex_regime_cache(years: int = 8) -> dict[str, int]:
+    """
+    Build cache {date_str: regime_int} cho VNINDEX trong N năm qua.
+    Dùng rolling computation từ market_regime module.
+    Gọi 1 lần trong find_similar, kết quả dùng cho tất cả samples.
+
+    Returns {} nếu không build được (graceful fallback).
+    """
+    try:
+        from vn_loader import load_vn_ohlcv
+        from market_regime import compute_regime
+        days = years * 365 + 90
+        df   = load_vn_ohlcv("VNINDEX", days=days, min_bars=60)
+        if df is None or len(df) < 60:
+            return {}
+
+        # compute_regime trả về history_90d — nhưng chỉ 90 ngày
+        # Ta cần full history → dùng rolling window tự tính
+        result   = compute_regime(df)
+        history  = result.get("history_90d", [])
+
+        # Với history_90d chỉ có 90 ngày gần nhất — không đủ cho 5-8 năm
+        # Giải pháp: dùng history_90d làm base, sau đó extend bằng cách
+        # recompute toàn bộ rolling (market_regime._compute_regime_history)
+        try:
+            from market_regime import _compute_regime_history
+            import numpy as np
+            close  = df["close"].values.astype(float)
+            dates  = df["date"] if "date" in df.columns else df.index
+            full_h = _compute_regime_history(close, dates, days=years * 252)
+            cache  = {}
+            for entry in full_h:
+                d = entry.get("date", "")
+                r = entry.get("regime", 0)
+                if d:
+                    cache[str(d)[:10]] = int(r)
+            logger.info(f"[RegimeCache] Built {len(cache)} date→regime entries")
+            return cache
+        except Exception as e:
+            logger.debug(f"_build_vnindex_regime_cache full history fail: {e}")
+
+        # Fallback: chỉ dùng 90 ngày từ history_90d
+        cache = {}
+        for entry in history:
+            d = entry.get("date", "")
+            r = entry.get("regime", 0)
+            if d:
+                cache[str(d)[:10]] = int(r)
+        logger.info(f"[RegimeCache] Fallback: {len(cache)} entries (90D only)")
+        return cache
+
+    except Exception as e:
+        logger.warning(f"_build_vnindex_regime_cache error: {e}")
+        return {}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CACHE PATH
@@ -203,14 +316,24 @@ def find_similar(
     years:         int  = 5,
     exclude_days:  int  = 90,
     min_results:   int  = MIN_RESULTS,
+    current_regime: int = -1,   # -1 = auto-detect, 0 = disable filter
 ) -> list | None:
     """
     Tìm mẫu tương đồng với:
     1. Bậc thang ngưỡng: 80% → 75% → 70% cho đến khi đủ min_results
     2. Minimum Distance Sampling 30D (fallback 20D) → mẫu độc lập
-    3. _calc_price_journey đầy đủ cho mỗi mẫu
+    3. Regime Soft Filter: weight samples theo regime match (1.0/0.5/0.15)
+       - Cùng regime          → weight 1.0 (full)
+       - Regime gần (Bull/Bear group) → weight 0.5
+       - Regime khác xa       → weight 0.15
+       - current_regime=-1    → tự động detect từ market_regime
+       - current_regime=0     → tắt filter (backward compatible)
+    4. Auto-expand years 5→8 nếu weighted_n < REGIME_AUTO_EXPAND
+    5. _calc_price_journey đầy đủ cho mỗi mẫu
+
     _meta: total_matches, independent_n, search_bars,
-           avg_similarity, threshold_used, min_distance_used
+           avg_similarity, threshold_used, min_distance_used,
+           current_regime, weighted_n, regime_filter_active
     """
     symbol = symbol.upper()
     if not cache_exists(symbol):
@@ -222,6 +345,69 @@ def find_similar(
     if len(cache_df) < exclude_days + 90 + 10:
         return None
 
+    # ── Regime setup ──────────────────────────────────────────────────────────
+    if current_regime == -1:
+        current_regime = _get_current_regime()
+
+    regime_filter_active = (current_regime > 0)
+
+    # Build VNINDEX regime cache 1 lần (dùng cho tất cả samples)
+    vnindex_regime_cache: dict[str, int] = {}
+    if regime_filter_active:
+        vnindex_regime_cache = _build_vnindex_regime_cache(years=max(years, 8))
+
+    # ── Auto-expand years nếu cần ─────────────────────────────────────────────
+    # Thử years gốc trước, nếu weighted_n quá thấp thì expand
+    years_to_try = [years, 8] if years < 8 else [years]
+
+    for years_attempt in years_to_try:
+        result = _find_similar_inner(
+            symbol               = symbol,
+            cache_df             = cache_df,
+            target_vector        = target_vector,
+            top_n                = top_n,
+            years                = years_attempt,
+            exclude_days         = exclude_days,
+            min_results          = min_results,
+            current_regime       = current_regime,
+            regime_filter_active = regime_filter_active,
+            vnindex_regime_cache = vnindex_regime_cache,
+        )
+        if result is None:
+            continue
+
+        # Kiểm tra weighted_n đủ chưa
+        weighted_n = result[0].get("_meta", {}).get("weighted_n", 999) if result else 999
+        if weighted_n >= REGIME_AUTO_EXPAND or years_attempt == years_to_try[-1]:
+            if years_attempt > years and result:
+                # Gắn flag đã auto-expand
+                for r in result:
+                    r["_meta"]["years_expanded"] = True
+                    r["_meta"]["years_used"]      = years_attempt
+                logger.info(f"find_similar({symbol}): auto-expanded to {years_attempt}Y "
+                            f"(weighted_n={weighted_n:.1f})")
+            return result
+
+    return None
+
+
+def _find_similar_inner(
+    symbol:               str,
+    cache_df:             "pd.DataFrame",
+    target_vector:        dict,
+    top_n:                int,
+    years:                int,
+    exclude_days:         int,
+    min_results:          int,
+    current_regime:       int,
+    regime_filter_active: bool,
+    vnindex_regime_cache: dict,
+) -> list | None:
+    """
+    Core search logic — tách ra để find_similar có thể retry với years khác nhau.
+    """
+
+    """
     cutoff_start = (datetime.now() - timedelta(days=years * 365)).strftime("%Y-%m-%d")
     cutoff_end   = (datetime.now() - timedelta(days=exclude_days)).strftime("%Y-%m-%d")
     search_df    = cache_df[
@@ -244,7 +430,7 @@ def find_similar(
     norms = np.where(norms == 0, 1e-9, norms)
     sims  = (mat @ tarr) / (norms * tnorm)
 
-    # Bậc thang ngưỡng
+    # ── Bậc thang ngưỡng ─────────────────────────────────────────────────────
     thresh_used = SIMILARITY_THRESHOLDS[0]
     raw_idx     = np.array([], dtype=int)
     for thresh in SIMILARITY_THRESHOLDS:
@@ -258,6 +444,23 @@ def find_similar(
 
     total_matches = len(raw_idx)
     search_bars   = len(search_df)
+
+    # ── Gắn regime weight cho từng sample ────────────────────────────────────
+    # regime_weights[i] = weight của candidate i trong raw_idx
+    regime_weights: dict[int, float] = {}
+    sample_regimes: dict[int, int]   = {}
+
+    if regime_filter_active and vnindex_regime_cache:
+        for idx in raw_idx:
+            date_str = str(search_df.iloc[idx]["date"])[:10]
+            sample_r = _classify_date_regime(date_str, vnindex_regime_cache)
+            w        = _get_regime_weight(current_regime, sample_r)
+            regime_weights[idx] = w
+            sample_regimes[idx] = sample_r
+    else:
+        for idx in raw_idx:
+            regime_weights[idx] = 1.0
+            sample_regimes[idx] = 0
 
     # Sort theo thời gian → Minimum Distance Sampling
     pairs_time = sorted(
@@ -289,13 +492,18 @@ def find_similar(
     ind_n   = len(kept_s)
     avg_sim = float(np.mean([sims[i] for _, i in kept_s]))
 
+    # Tính weighted_n — effective sample count sau regime weighting
+    weighted_n = sum(regime_weights.get(i, 1.0) for _, i in kept_s)
+
     results = []
     for date_str, idx in kept_s:
-        row       = search_df.iloc[idx]
-        close_val = float(row.get("close", 0))
-        j         = _calc_price_journey(cache_df, date_str, close_val)
-        # Lấy vector values từ row CSV — dùng cho _format_big_wave
-        vec_vals  = {k: float(row[k]) for k in VECTOR_KEYS if k in row and pd.notna(row[k])}
+        row        = search_df.iloc[idx]
+        close_val  = float(row.get("close", 0))
+        j          = _calc_price_journey(cache_df, date_str, close_val)
+        vec_vals   = {k: float(row[k]) for k in VECTOR_KEYS if k in row and pd.notna(row[k])}
+        r_weight   = regime_weights.get(idx, 1.0)
+        r_regime   = sample_regimes.get(idx, 0)
+
         results.append({
             "date":             date_str,
             "similarity":       round(float(sims[idx]), 4),
@@ -312,14 +520,21 @@ def find_similar(
             "conclusion":       j["conclusion"],
             "recovery_days":    j.get("recovery_days"),
             "outcome":          _classify_outcome(j["fwd_30"]),
-            **vec_vals,   # unpack 15 vector dimensions vào top-level dict
+            "regime_weight":    round(r_weight, 2),   # field mới
+            "sample_regime":    r_regime,              # field mới
+            **vec_vals,
             "_meta": {
-                "total_matches":     total_matches,
-                "independent_n":     ind_n,
-                "search_bars":       search_bars,
-                "avg_similarity":    round(avg_sim, 4),
-                "threshold_used":    thresh_used,
-                "min_distance_used": min_dist,
+                "total_matches":        total_matches,
+                "independent_n":        ind_n,
+                "search_bars":          search_bars,
+                "avg_similarity":       round(avg_sim, 4),
+                "threshold_used":       thresh_used,
+                "min_distance_used":    min_dist,
+                "current_regime":       current_regime,
+                "weighted_n":           round(weighted_n, 2),
+                "regime_filter_active": regime_filter_active,
+                "years_expanded":       False,
+                "years_used":           years,
             },
         })
     return results if results else None
