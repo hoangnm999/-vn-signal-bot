@@ -1,12 +1,12 @@
 """
-historical_analog.py — Phân tích tương đồng lịch sử (Historical Analog).
+historical_analog.py - Phân tích tương đồng lịch sử (Historical Analog).
 
 FLOW:
-  1. Lần đầu: build_vector_cache(symbol) → tính vector cho từng ngày lịch sử,
+  1. Lần đầu: build_vector_cache(symbol) -> tính vector cho từng ngày lịch sử,
      lưu vào data/{symbol}_vectors.csv.
-  2. Hàng ngày (cron 18:00): append_today_vector(symbol) → nối dòng mới.
+  2. Hàng ngày (cron 18:00): append_today_vector(symbol) -> nối dòng mới.
   3. Khi cần tìm: find_similar(symbol, target_vector, top_n=3, years=5)
-     → load CSV, cosine similarity, trả về top N ngày kèm forward returns.
+     -> load CSV, cosine similarity, trả về top N ngày kèm forward returns.
 
 CSV FORMAT (data/VCB_vectors.csv):
   date, rsi_norm, macd_sign, ..., [14 more cols], close
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR         = pathlib.Path("data")
 CACHE_SUFFIX     = "_vectors.csv"
 MIN_HISTORY_BARS = 200    # tối thiểu để build cache có ý nghĩa
-BUILD_TIMEOUT    = 60     # giây — tối đa chờ build cache lần đầu
+BUILD_TIMEOUT    = 60     # giây - tối đa chờ build cache lần đầu
 FORWARD_DAYS             = [30, 60, 90]
 SIMILARITY_THRESHOLDS    = [0.80, 0.75, 0.70]
 MIN_RESULTS              = 3
@@ -50,16 +50,16 @@ MIN_SAMPLE_DISTANCE_DAYS = 30
 MIN_SAMPLE_DISTANCE_FB   = 20
 
 # ── Regime Filter Constants ───────────────────────────────────────────────────
-# Soft weight — không loại bỏ sample, chỉ giảm "trọng số" khi tính WR/Expectancy
+# Soft weight - không loại bỏ sample, chỉ giảm "trọng số" khi tính WR/Expectancy
 # R1↔R2 và R3↔R4 là "gần nhau" (cùng bull/bear, khác volatility)
 # R1↔R3, R1↔R4, R2↔R3, R2↔R4 là "xa nhau" (khác bull/bear)
 REGIME_WEIGHT_SAME    = 1.00   # cùng regime
 REGIME_WEIGHT_CLOSE   = 0.50   # regime gần (cùng bull/bear, khác volatility)
 REGIME_WEIGHT_FAR     = 0.15   # regime xa (bull vs bear)
 REGIME_MIN_WEIGHTED   = 5.0    # weighted sample count tối thiểu (tránh too few)
-REGIME_AUTO_EXPAND    = 8      # nếu weighted_n < này → tự mở rộng years lên 8
+REGIME_AUTO_EXPAND    = 8      # nếu weighted_n < này -> tự mở rộng years lên 8
 
-# Map: (current_regime, sample_regime) → weight
+# Map: (current_regime, sample_regime) -> weight
 _REGIME_WEIGHT_MAP: dict[tuple[int, int], float] = {}
 for _r in range(1, 5):
     _REGIME_WEIGHT_MAP[(_r, _r)] = REGIME_WEIGHT_SAME
@@ -77,7 +77,7 @@ for _a in range(1, 5):
 def _get_regime_weight(current_regime: int, sample_regime: int) -> float:
     """Trả về weight cho 1 sample dựa trên regime match."""
     if current_regime <= 0 or sample_regime <= 0:
-        return 1.0   # không có regime info → không filter
+        return 1.0   # không có regime info -> không filter
     return _REGIME_WEIGHT_MAP.get((current_regime, sample_regime), REGIME_WEIGHT_FAR)
 
 
@@ -123,12 +123,12 @@ def _build_vnindex_regime_cache(years: int = 8) -> dict[str, int]:
         if df is None or len(df) < 60:
             return {}
 
-        # compute_regime trả về history_90d — nhưng chỉ 90 ngày
-        # Ta cần full history → dùng rolling window tự tính
+        # compute_regime trả về history_90d - nhưng chỉ 90 ngày
+        # Ta cần full history -> dùng rolling window tự tính
         result   = compute_regime(df)
         history  = result.get("history_90d", [])
 
-        # Với history_90d chỉ có 90 ngày gần nhất — không đủ cho 5-8 năm
+        # Với history_90d chỉ có 90 ngày gần nhất - không đủ cho 5-8 năm
         # Giải pháp: dùng history_90d làm base, sau đó extend bằng cách
         # recompute toàn bộ rolling (market_regime._compute_regime_history)
         try:
@@ -143,7 +143,7 @@ def _build_vnindex_regime_cache(years: int = 8) -> dict[str, int]:
                 r = entry.get("regime", 0)
                 if d:
                     cache[str(d)[:10]] = int(r)
-            logger.info(f"[RegimeCache] Built {len(cache)} date→regime entries")
+            logger.info(f"[RegimeCache] Built {len(cache)} date->regime entries")
             return cache
         except Exception as e:
             logger.debug(f"_build_vnindex_regime_cache full history fail: {e}")
@@ -246,7 +246,7 @@ def build_vector_cache(
 def append_today_vector(symbol: str, df: pd.DataFrame = None) -> bool:
     """
     Nối vector của ngày hôm nay vào cache (gọi từ cron 18:00).
-    Nếu cache chưa tồn tại → build toàn bộ.
+    Nếu cache chưa tồn tại -> build toàn bộ.
 
     Args:
         symbol:  Mã CK
@@ -258,7 +258,7 @@ def append_today_vector(symbol: str, df: pd.DataFrame = None) -> bool:
     symbol = symbol.upper()
 
     if not cache_exists(symbol):
-        logger.info(f"append_today_vector({symbol}): cache chưa có → build full")
+        logger.info(f"append_today_vector({symbol}): cache chưa có -> build full")
         ok, msg = build_vector_cache(symbol)
         logger.info(msg)
         return ok
@@ -286,7 +286,7 @@ def append_today_vector(symbol: str, df: pd.DataFrame = None) -> bool:
     try:
         existing = pd.read_csv(_cache_path(symbol), usecols=["date"])
         if today_str in existing["date"].values:
-            logger.debug(f"append_today_vector({symbol}): {today_str} đã có → skip")
+            logger.debug(f"append_today_vector({symbol}): {today_str} đã có -> skip")
             return True
     except Exception:
         pass
@@ -320,15 +320,15 @@ def find_similar(
 ) -> list | None:
     """
     Tìm mẫu tương đồng với:
-    1. Bậc thang ngưỡng: 80% → 75% → 70% cho đến khi đủ min_results
-    2. Minimum Distance Sampling 30D (fallback 20D) → mẫu độc lập
+    1. Bậc thang ngưỡng: 80% -> 75% -> 70% cho đến khi đủ min_results
+    2. Minimum Distance Sampling 30D (fallback 20D) -> mẫu độc lập
     3. Regime Soft Filter: weight samples theo regime match (1.0/0.5/0.15)
-       - Cùng regime          → weight 1.0 (full)
-       - Regime gần (Bull/Bear group) → weight 0.5
-       - Regime khác xa       → weight 0.15
-       - current_regime=-1    → tự động detect từ market_regime
-       - current_regime=0     → tắt filter (backward compatible)
-    4. Auto-expand years 5→8 nếu weighted_n < REGIME_AUTO_EXPAND
+       - Cùng regime          -> weight 1.0 (full)
+       - Regime gần (Bull/Bear group) -> weight 0.5
+       - Regime khác xa       -> weight 0.15
+       - current_regime=-1    -> tự động detect từ market_regime
+       - current_regime=0     -> tắt filter (backward compatible)
+    4. Auto-expand years 5->8 nếu weighted_n < REGIME_AUTO_EXPAND
     5. _calc_price_journey đầy đủ cho mỗi mẫu
 
     _meta: total_matches, independent_n, search_bars,
@@ -404,10 +404,9 @@ def _find_similar_inner(
     vnindex_regime_cache: dict,
 ) -> list | None:
     """
-    Core search logic — tách ra để find_similar có thể retry với years khác nhau.
+    Core search logic - tách ra để find_similar có thể retry với years khác nhau.
     """
 
-    """
     cutoff_start = (datetime.now() - timedelta(days=years * 365)).strftime("%Y-%m-%d")
     cutoff_end   = (datetime.now() - timedelta(days=exclude_days)).strftime("%Y-%m-%d")
     search_df    = cache_df[
@@ -462,7 +461,7 @@ def _find_similar_inner(
             regime_weights[idx] = 1.0
             sample_regimes[idx] = 0
 
-    # Sort theo thời gian → Minimum Distance Sampling
+    # Sort theo thời gian -> Minimum Distance Sampling
     pairs_time = sorted(
         [(str(search_df.iloc[i]["date"]), i) for i in raw_idx],
         key=lambda x: x[0]
@@ -492,7 +491,7 @@ def _find_similar_inner(
     ind_n   = len(kept_s)
     avg_sim = float(np.mean([sims[i] for _, i in kept_s]))
 
-    # Tính weighted_n — effective sample count sau regime weighting
+    # Tính weighted_n - effective sample count sau regime weighting
     weighted_n = sum(regime_weights.get(i, 1.0) for _, i in kept_s)
 
     results = []
@@ -541,7 +540,7 @@ def _find_similar_inner(
 
 
 def _apply_min_distance_filter(sorted_dates: list, min_days: int) -> list:
-    """Minimum Distance Sampling — chỉ giữ ngày cách nhau >= min_days."""
+    """Minimum Distance Sampling - chỉ giữ ngày cách nhau >= min_days."""
     if not sorted_dates:
         return []
     kept = [sorted_dates[0]]; last = sorted_dates[0]
@@ -565,7 +564,7 @@ def _calc_price_journey(cache_df, from_date: str, from_close: float,
         "fwd_30": None, "fwd_60": None, "fwd_90": None,
         "max_gain": None, "max_gain_day": None,
         "max_drawdown": None, "max_dd_day": None,
-        "max_drawdown_30d": None,   # MAE trong 30D đầu — nhất quán với TP1/TP2
+        "max_drawdown_30d": None,   # MAE trong 30D đầu - nhất quán với TP1/TP2
         "daily_volatility": None, "conclusion": "CHUA RO",
     }
     if from_close <= 0:
@@ -592,7 +591,7 @@ def _calc_price_journey(cache_df, from_date: str, from_close: float,
     result["max_drawdown"] = round(float(dd[md_idx]), 2)
     result["max_dd_day"]   = int(md_idx + 1)
 
-    # MAE trong 30D đầu — dùng cho SL (nhất quán khung thời gian với TP1/TP2)
+    # MAE trong 30D đầu - dùng cho SL (nhất quán khung thời gian với TP1/TP2)
     # Tính từ entry price (min của pct trong 30D), không dùng running peak
     # Đây là MAE chuẩn: mức xuống tệ nhất so với điểm vào lệnh
     pct_30 = pct[:30] if len(pct) >= 30 else pct
@@ -685,10 +684,10 @@ def _best_holding(analogs: list) -> str:
 
 def _format_big_wave(analogs: list) -> list[str]:
     """
-    Big Wave Analysis — Đặc điểm Sóng Lớn (top 30% fwd_90).
+    Big Wave Analysis - Đặc điểm Sóng Lớn (top 30% fwd_90).
 
     Thiết kế:
-    - Lấy tất cả analogs có fwd_90 không None → tính ngưỡng p70 (top 30%)
+    - Lấy tất cả analogs có fwd_90 không None -> tính ngưỡng p70 (top 30%)
     - Nhóm "Sóng Lớn" = analogs có fwd_90 >= p70
     - So sánh phân phối vector của Sóng Lớn vs phần còn lại
     - Highlight top 3-5 dimension phân kỳ rõ nhất
@@ -712,7 +711,7 @@ def _format_big_wave(analogs: list) -> list[str]:
     if len(pool) < MIN_BIG_WAVE + 2:   # cần đủ cả 2 nhóm
         return []
 
-    # ── Bước 2: Tính ngưỡng p70 → top 30% = Sóng Lớn ────────────────────
+    # ── Bước 2: Tính ngưỡng p70 -> top 30% = Sóng Lớn ────────────────────
     fwd90_vals = np.array([e["fwd_90"] for e in pool])
     p70 = float(np.percentile(fwd90_vals, 70))
 
@@ -823,7 +822,7 @@ def _format_big_wave(analogs: list) -> list[str]:
         "═" * 38,
         f"SONG LON: TOP 30% FWD90 ({nb} mau, nguong >= {p70:+.1f}%)",
         "═" * 38,
-        f"⚠️  Chi {nb} mau Song Lon — mau rat nho, chi mang tinh tham khao.",
+        f"⚠️  Chi {nb} mau Song Lon - mau rat nho, chi mang tinh tham khao.",
         "    Khong su dung de ra quyet dinh giao dich.",
         "─" * 38,
         f"Song Lon ({nb} mau): fwd90 TB = {bw_fwd90_mean:+.1f}%",
@@ -874,10 +873,10 @@ def format_analog_report(
     analogs:       list,
     current_vec:   dict,
     max_chars:     int   = 4000,
-    current_price: float = 0.0,   # gia hien tai thuc te — PHAI TRUYEN TU CALLER
+    current_price: float = 0.0,   # gia hien tai thuc te - PHAI TRUYEN TU CALLER
 ) -> str:
     """
-    Bao cao 4 phan — KHONG liet ke tung ngay.
+    Bao cao 4 phan - KHONG liet ke tung ngay.
     1. Tom tat nhanh (mau doc lap, MDS, nguong)
     2. Tom tat hanh trinh gia (MFE/MAE, capture rate, hold)
     3. Thong ke day du dong bo scan_watchlist
@@ -952,7 +951,7 @@ def format_analog_report(
     if cap_rate > 0:
         cap_note = " ⚠️ Exit som" if cap_rate < 40 else " ✅ Hieu qua" if cap_rate > 80 else ""
 
-    # Wave summary — load từ wave_pattern nếu có
+    # Wave summary - load từ wave_pattern nếu có
     wave_lines = []
     try:
         from wave_pattern import analyze_wave
