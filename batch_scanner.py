@@ -574,27 +574,26 @@ def run_dual_scan(
 
     def _run_a():
         try:
-            # Scan A: dùng regime filter ON — truyền current_regime trực tiếp
-            # để không pre-load lại VNINDEX
             result_a.update(_run_batch_scan_internal(
                 symbols        = symbols,
                 current_regime = current_regime,
                 progress_cb    = _progress_a,
             ))
         except Exception as e:
-            logger.error(f"[DualScan-ON] error: {e}")
+            import traceback
+            logger.error(f"[DualScan-ON] error: {e}\n{traceback.format_exc()}")
             err_a.append(str(e))
 
     def _run_b():
         try:
-            # Scan B: regime filter OFF (current_regime=0)
             result_b.update(_run_batch_scan_internal(
                 symbols        = symbols,
                 current_regime = 0,   # disable regime filter
                 progress_cb    = _progress_b,
             ))
         except Exception as e:
-            logger.error(f"[DualScan-OFF] error: {e}")
+            import traceback
+            logger.error(f"[DualScan-OFF] error: {e}\n{traceback.format_exc()}")
             err_b.append(str(e))
 
     # Chạy song song
@@ -677,53 +676,61 @@ def _run_batch_scan_internal(
     # Stats + guardrails
     all_stats    = []
     valid_results = {}
-    for sym, res in raw_results.items():
-        if res.get("gate") not in ("REJECT", "TIMEOUT", "ERROR", "UNKNOWN") \
-                and res.get("analogs"):
-            from guardrails import compute_base_stats
-            stats = compute_base_stats(res["analogs"])
-            if stats.get("valid"):
-                all_stats.append(stats)
-                valid_results[sym] = res
+    try:
+        for sym, res in raw_results.items():
+            if res.get("gate") not in ("REJECT", "TIMEOUT", "ERROR", "UNKNOWN") \
+                    and res.get("analogs"):
+                from guardrails import compute_base_stats
+                stats = compute_base_stats(res["analogs"])
+                if stats.get("valid"):
+                    all_stats.append(stats)
+                    valid_results[sym] = res
+    except Exception as _gse:
+        import traceback
+        logger.error(f"[BatchScanInternal] compute_base_stats loop ERROR: {_gse}\n{traceback.format_exc()}")
 
     ranked   = []
     excluded = []
     rejected = []
     errors   = []
 
-    for sym, res in raw_results.items():
-        if res.get("gate") in ("TIMEOUT", "ERROR"):
-            errors.append(f"{sym}: {res.get('reason', '?')}")
-            continue
-        if res.get("gate") == "REJECT":
-            rejected.append({"symbol": sym, "reason": res.get("reason", "Gate reject")})
-            continue
-        if sym not in valid_results:
-            rejected.append({"symbol": sym, "reason": "Khong co analogs hop le"})
-            continue
+    try:
+        for sym, res in raw_results.items():
+            if res.get("gate") in ("TIMEOUT", "ERROR"):
+                errors.append(f"{sym}: {res.get('reason', '?')}")
+                continue
+            if res.get("gate") == "REJECT":
+                rejected.append({"symbol": sym, "reason": res.get("reason", "Gate reject")})
+                continue
+            if sym not in valid_results:
+                rejected.append({"symbol": sym, "reason": "Khong co analogs hop le"})
+                continue
 
-        from guardrails import run_guardrails_for_symbol
-        gr = run_guardrails_for_symbol(
-            symbol          = sym,
-            analogs         = res["analogs"],
-            all_stats       = all_stats,
-            volume_avg_bill = res.get("volume_avg_bill"),
-            cache_days      = res.get("cache_days"),
-            check_age_hours = res.get("check_age_hours"),
-        )
+            from guardrails import run_guardrails_for_symbol
+            gr = run_guardrails_for_symbol(
+                symbol          = sym,
+                analogs         = res["analogs"],
+                all_stats       = all_stats,
+                volume_avg_bill = res.get("volume_avg_bill"),
+                cache_days      = res.get("cache_days"),
+                check_age_hours = res.get("check_age_hours"),
+            )
 
-        if gr["gate"] == "REJECT":
-            rejected.append({"symbol": sym, "reason": gr.get("reason", "Gate reject")})
-            continue
+            if gr["gate"] == "REJECT":
+                rejected.append({"symbol": sym, "reason": gr.get("reason", "Gate reject")})
+                continue
 
-        pen = gr.get("penalties", [])
-        pen_str = pen[0][:80] if pen else "score=0"
-        gr["_exclude_reason"] = pen_str
+            pen = gr.get("penalties", [])
+            pen_str = pen[0][:80] if pen else "score=0"
+            gr["_exclude_reason"] = pen_str
 
-        if gr["risk_tier"] == "EXCLUDED":
-            excluded.append(gr)
-        else:
-            ranked.append(gr)
+            if gr["risk_tier"] == "EXCLUDED":
+                excluded.append(gr)
+            else:
+                ranked.append(gr)
+    except Exception as _gre:
+        import traceback
+        logger.error(f"[BatchScanInternal] guardrails loop ERROR at sym={sym}: {_gre}\n{traceback.format_exc()}")
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
     excluded.sort(key=lambda x: x["score"], reverse=True)
