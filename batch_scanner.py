@@ -574,26 +574,27 @@ def run_dual_scan(
 
     def _run_a():
         try:
+            # Scan A: dùng regime filter ON — truyền current_regime trực tiếp
+            # để không pre-load lại VNINDEX
             result_a.update(_run_batch_scan_internal(
                 symbols        = symbols,
                 current_regime = current_regime,
                 progress_cb    = _progress_a,
             ))
         except Exception as e:
-            import traceback
-            logger.error(f"[DualScan-ON] error: {e}\n{traceback.format_exc()}")
+            logger.error(f"[DualScan-ON] error: {e}")
             err_a.append(str(e))
 
     def _run_b():
         try:
+            # Scan B: regime filter OFF (current_regime=0)
             result_b.update(_run_batch_scan_internal(
                 symbols        = symbols,
                 current_regime = 0,   # disable regime filter
                 progress_cb    = _progress_b,
             ))
         except Exception as e:
-            import traceback
-            logger.error(f"[DualScan-OFF] error: {e}\n{traceback.format_exc()}")
+            logger.error(f"[DualScan-OFF] error: {e}")
             err_b.append(str(e))
 
     # Chạy song song
@@ -676,61 +677,53 @@ def _run_batch_scan_internal(
     # Stats + guardrails
     all_stats    = []
     valid_results = {}
-    try:
-        for sym, res in raw_results.items():
-            if res.get("gate") not in ("REJECT", "TIMEOUT", "ERROR", "UNKNOWN") \
-                    and res.get("analogs"):
-                from guardrails import compute_base_stats
-                stats = compute_base_stats(res["analogs"])
-                if stats.get("valid"):
-                    all_stats.append(stats)
-                    valid_results[sym] = res
-    except Exception as _gse:
-        import traceback
-        logger.error(f"[BatchScanInternal] compute_base_stats loop ERROR: {_gse}\n{traceback.format_exc()}")
+    for sym, res in raw_results.items():
+        if res.get("gate") not in ("REJECT", "TIMEOUT", "ERROR", "UNKNOWN") \
+                and res.get("analogs"):
+            from guardrails import compute_base_stats
+            stats = compute_base_stats(res["analogs"])
+            if stats.get("valid"):
+                all_stats.append(stats)
+                valid_results[sym] = res
 
     ranked   = []
     excluded = []
     rejected = []
     errors   = []
 
-    try:
-        for sym, res in raw_results.items():
-            if res.get("gate") in ("TIMEOUT", "ERROR"):
-                errors.append(f"{sym}: {res.get('reason', '?')}")
-                continue
-            if res.get("gate") == "REJECT":
-                rejected.append({"symbol": sym, "reason": res.get("reason", "Gate reject")})
-                continue
-            if sym not in valid_results:
-                rejected.append({"symbol": sym, "reason": "Khong co analogs hop le"})
-                continue
+    for sym, res in raw_results.items():
+        if res.get("gate") in ("TIMEOUT", "ERROR"):
+            errors.append(f"{sym}: {res.get('reason', '?')}")
+            continue
+        if res.get("gate") == "REJECT":
+            rejected.append({"symbol": sym, "reason": res.get("reason", "Gate reject")})
+            continue
+        if sym not in valid_results:
+            rejected.append({"symbol": sym, "reason": "Khong co analogs hop le"})
+            continue
 
-            from guardrails import run_guardrails_for_symbol
-            gr = run_guardrails_for_symbol(
-                symbol          = sym,
-                analogs         = res["analogs"],
-                all_stats       = all_stats,
-                volume_avg_bill = res.get("volume_avg_bill"),
-                cache_days      = res.get("cache_days"),
-                check_age_hours = res.get("check_age_hours"),
-            )
+        from guardrails import run_guardrails_for_symbol
+        gr = run_guardrails_for_symbol(
+            symbol          = sym,
+            analogs         = res["analogs"],
+            all_stats       = all_stats,
+            volume_avg_bill = res.get("volume_avg_bill"),
+            cache_days      = res.get("cache_days"),
+            check_age_hours = res.get("check_age_hours"),
+        )
 
-            if gr["gate"] == "REJECT":
-                rejected.append({"symbol": sym, "reason": gr.get("reason", "Gate reject")})
-                continue
+        if gr["gate"] == "REJECT":
+            rejected.append({"symbol": sym, "reason": gr.get("reason", "Gate reject")})
+            continue
 
-            pen = gr.get("penalties", [])
-            pen_str = pen[0][:80] if pen else "score=0"
-            gr["_exclude_reason"] = pen_str
+        pen = gr.get("penalties", [])
+        pen_str = pen[0][:80] if pen else "score=0"
+        gr["_exclude_reason"] = pen_str
 
-            if gr["risk_tier"] == "EXCLUDED":
-                excluded.append(gr)
-            else:
-                ranked.append(gr)
-    except Exception as _gre:
-        import traceback
-        logger.error(f"[BatchScanInternal] guardrails loop ERROR at sym={sym}: {_gre}\n{traceback.format_exc()}")
+        if gr["risk_tier"] == "EXCLUDED":
+            excluded.append(gr)
+        else:
+            ranked.append(gr)
 
     ranked.sort(key=lambda x: x["score"], reverse=True)
     excluded.sort(key=lambda x: x["score"], reverse=True)
@@ -822,37 +815,6 @@ def format_dual_scan_report(dual_result: dict) -> list[str]:
     total_scan = (len(ranked_on) + len(excl_on) +
                   len(rej_on) + len(err_on))
 
-    # Mã đã có trong bảng ON (ranked + excluded) → không hiện lại bảng OFF
-    syms_in_on = {r["symbol"] for r in ranked_on} | {r["symbol"] for r in excl_on}
-
-    # Lọc bảng OFF: chỉ lấy mã mới, raw_n >= 3, Exp > 0, WR >= 40%
-    off_extras = []
-    for r in ranked_off + excl_off:
-        sym = r["symbol"]
-        if sym in syms_in_on:
-            continue
-        s          = r.get("stats", {})
-        raw_n      = s.get("n", 0)
-        exp        = s.get("expectancy", 0)
-        wr         = s.get("win_rate_raw", s.get("win_rate", 0))
-        weighted_n = s.get("weighted_n", 0)
-        if raw_n < DUAL_SCAN_MIN_RAW_N:
-            continue
-        if exp <= 0 or wr < 0.40:
-            continue
-        off_extras.append({
-            "symbol":     sym,
-            "score_off":  r.get("score", 0),
-            "wr_raw":     wr,
-            "exp":        exp,
-            "mae":        s.get("median_mdd", 0),
-            "raw_n":      raw_n,
-            "weighted_n": weighted_n,
-        })
-
-    # Sort OFF extras theo exp desc
-    off_extras.sort(key=lambda x: x["exp"], reverse=True)
-
     # ── Build messages ────────────────────────────────────────────────────────
     lines = []
 
@@ -919,27 +881,46 @@ def format_dual_scan_report(dual_result: dict) -> list[str]:
 
     lines.append("─" * 38)
 
-    # ── BẢNG B: REGIME FILTER OFF ─────────────────────────────────────────────
-    lines.append("BANG B — REGIME FILTER OFF (raw, khong loc regime):")
-    lines.append("(Ma moi xuat hien o day — chua du mau cung regime)")
-    lines.append("Trader tu quyet dinh muc tin tuong.")
+    # ── BẢNG B: REGIME FILTER OFF — độc lập hoàn toàn với Bảng A ────────────
+    lines.append("BANG B — REGIME FILTER OFF (khong loc regime):")
+    lines.append("(Ket qua doc lap — trader tu quyet dinh)")
     lines.append("")
 
-    if not off_extras:
-        lines.append("  Khong co ma nao them khi tat regime filter")
-        lines.append("  (tat ca da xuat hien o Bang A hoac khong du tieu chi)")
+    ranked_off_all = ranked_off  # toàn bộ, không lọc theo Bảng A
+
+    if not ranked_off_all:
+        lines.append("  Khong co ma nao du dieu kien.")
         lines.append("")
     else:
-        lines.append(f"  {'Ma':<6} {'WR':>5}  {'Exp':>6}  {'MAE':>7}  {'rawN':>5}  {'wN':>4}")
-        lines.append("  " + "-" * 40)
-        for x in off_extras[:10]:   # giới hạn 10 mã
-            lines.append(
-                f"  {x['symbol']:<6} {x['wr_raw']:>4.0%}  "
-                f"{x['exp']:>+5.1f}%  {x['mae']:>+6.1f}%  "
-                f"{x['raw_n']:>5}  {x['weighted_n']:>4.1f}"
-            )
-        lines.append("")
-        lines.append("Goi y: /analog <MA> --raw  de xem chi tiet khong loc regime")
+        # Group theo score giống Bảng A
+        grp_b_priority  = [r for r in ranked_off_all if r["score"] >= 5.0]
+        grp_b_potential = [r for r in ranked_off_all if 4.0 <= r["score"] < 5.0]
+        grp_b_ref       = [r for r in ranked_off_all if r["score"] < 4.0]
+
+        def _render_b(title, items):
+            if not items:
+                return
+            lines.append(title)
+            lines.append(f"  {'Ma':<6} {'Score':>5}  {'WR':>5}  {'Exp':>6}  {'MAE':>7}  {'rawN':>5}")
+            lines.append("  " + "-" * 42)
+            for x in items:
+                s     = x.get("stats", {})
+                wr    = s.get("win_rate_raw", s.get("win_rate", 0))
+                exp   = s.get("expectancy", 0)
+                mae   = s.get("median_mdd", 0)
+                raw_n = s.get("n", 0)
+                score = x.get("score", 0)
+                lines.append(
+                    f"  {x['symbol']:<6} {score:>5.1f}  "
+                    f"{wr:>4.0%}  {exp:>+5.1f}%  {mae:>+6.1f}%  {raw_n:>5}"
+                )
+            lines.append("")
+
+        _render_b("UU TIEN (Score >= 5.0):", grp_b_priority)
+        _render_b("TIEM NANG (4.0 - 4.9):", grp_b_potential)
+        _render_b("THAM KHAO (< 4.0):",     grp_b_ref[:8])  # giới hạn 8 mã ref
+
+        lines.append("Goi y: /analog <MA> --raw  de xem chi tiet")
         lines.append("")
 
     # Mã không đủ điều kiện (thanh khoản, cache...)
