@@ -67,7 +67,7 @@ except ImportError:
     logger.warning("analog_cmd.py chua co — /analog bi tat")
 
 try:
-    from batch_scanner import scan_watchlist_cmd, _start_scan_cron, _start_hose_cron
+    from batch_scanner import scan_watchlist_cmd, _start_scan_cron, _start_hose_cron, scan_hose_cmd
     _BATCH_SCANNER = True
 except ImportError:
     _BATCH_SCANNER = False
@@ -1506,6 +1506,7 @@ def main():
             app.add_handler(CommandHandler("analog", analog_cmd))
     if _BATCH_SCANNER:
         app.add_handler(CommandHandler("scan_watchlist", scan_watchlist_cmd))
+        app.add_handler(CommandHandler("scan_hose",      scan_hose_cmd))
     if _WAVE_PATTERN:
         app.add_handler(CommandHandler("wave", wave_cmd))
     if _MARKET_REGIME:
