@@ -346,18 +346,13 @@ def compute_reference_score(
             f"MaxDD median {median_mdd:.1f}% < {MAXDD_EXCLUDE_THRESH}% — rui ro qua cao, reject"
         ], "EXCLUDED"
 
-    # Gate 5: Weighted N quá thấp sau regime filter
-    # Nếu regime filter active và weighted_n < ngưỡng → mẫu thực sự quá ít
-    # để có ý nghĩa thống kê, dù raw n có vẻ đủ.
-    # Ngưỡng REGIME_MIN_WEIGHTED = 5.0 (từ historical_analog.py)
+    # Gate 5: Weighted N quá thấp sau regime filter → penalty thay vì EXCLUDE
+    # Mã vẫn có thể có edge thực, chỉ là ít mẫu cùng regime.
+    # Penalty score x0.7 để hạ ưu tiên nhưng không loại khỏi kết quả.
     weighted_n = stats.get("weighted_n", float(n))
     regime_filter_active = stats.get("regime_filter_active", False)
     REGIME_MIN_WEIGHTED = 5.0   # phải khớp với historical_analog.REGIME_MIN_WEIGHTED
-    if regime_filter_active and weighted_n < REGIME_MIN_WEIGHTED:
-        return 0.0, [
-            f"Weighted N {weighted_n:.1f} < {REGIME_MIN_WEIGHTED} sau regime filter "
-            f"— khong du mau tuong dong cung regime, reject"
-        ], "EXCLUDED"
+    _low_regime_n = regime_filter_active and weighted_n < REGIME_MIN_WEIGHTED
 
     # ══════════════════════════════════════════════════════════════════
     # Z-SCORE NORMALIZATION trên toàn watchlist
@@ -427,18 +422,26 @@ def compute_reference_score(
             f"Mau nho ({n} < {MIN_SAMPLE_FOR_RANK}) → score x{SMALL_SAMPLE_PENALTY}"
         )
 
-    # Soft 5: Outlier risk từ Layer 2
+    # Soft 5: Weighted N thấp sau regime filter (Gate 5 hạ cấp từ hard→soft)
+    if _low_regime_n:
+        score *= 0.7
+        penalties.append(
+            f"Weighted N {weighted_n:.1f} < {REGIME_MIN_WEIGHTED} "
+            f"— it mau cung regime, score x0.7"
+        )
+
+    # Soft 6: Outlier risk từ Layer 2
     if any("OUTLIER_RISK" in f for f in flags):
         score *= 0.6
         penalties.append("Outlier risk → score x0.6")
 
-    # Soft 6: High dispersion — bỏ z_rvr khỏi tính toán
+    # Soft 7: High dispersion — bỏ z_rvr khỏi tính toán
     if any("HIGH_DISPERSION" in f for f in flags):
         raw2  = z_exp * 0.50 + z_pf * 0.35 + z_mdd * 0.15
         score = float(np.clip((raw2 + 3.0) / 6.0 * 10, 0, 10))
         penalties.append("High dispersion → bo Return/Vol khoi cong thuc")
 
-    # Soft 7: Dead cat — cảnh báo xu hướng dài hạn yếu
+    # Soft 8: Dead cat — cảnh báo xu hướng dài hạn yếu
     if any("DEAD_CAT" in f for f in flags):
         score *= 0.85
         penalties.append("Dead cat pattern — xu huong dai han yeu, score x0.85")
