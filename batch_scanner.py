@@ -119,45 +119,47 @@ def build_hose_watchlist(
 
     total = len(all_symbols)
 
-    # ── Bước 2: Load OHLCV song song, tính thanh khoản ĐÚNG 20 phiên cuối ────
+    # ── Bước 2: Load OHLCV tuần tự, tính thanh khoản đúng 20 phiên cuối ──────
+    # Sequential thay vì ThreadPoolExecutor để tránh deadlock với asyncio.to_thread
+    # analyzer.get_price_data() rất nhanh (~0.1-0.2s/mã) → sequential OK
     from vn_loader import load_vn_ohlcv
-    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
 
-    vol_map: dict[str, float] = {}   # symbol → avg_vol_billion
-    done_count = 0
+    vol_map: dict[str, float] = {}
 
-    def _check_vol(sym: str) -> tuple[str, float]:
+    def _check_vol(sym: str) -> float:
         try:
-            # Load đủ buffer, lấy đúng `days` phiên cuối cùng
             df = load_vn_ohlcv(sym, days=days + 10, min_bars=days)
             if df is None or len(df) < days:
-                return sym, 0.0
-            # Lấy đúng 20 phiên giao dịch cuối
+                return 0.0
             close_arr = df["close"].values[-days:]
             vol_arr   = df["volume"].values[-days:]
-            # close từ vn_loader đơn vị nghìn đồng → nhân 1000 để ra VND
             avg_vnd   = float((vol_arr * close_arr).mean()) * 1000
-            return sym, round(avg_vnd / 1e9, 3)
-        except Exception:
-            return sym, 0.0
+            return round(avg_vnd / 1e9, 3)
+        except SystemExit:
+            # vnai/vnstock gọi sys.exit() khi rate limit — bắt ở đây để không crash bot
+            logger.warning(f"[HoseWatchlist] {sym}: rate limit hit (SystemExit) — skip")
+            time.sleep(60)   # chờ 60s rồi tiếp tục
+            return 0.0
+        except BaseException as e:
+            logger.warning(f"[HoseWatchlist] {sym}: {type(e).__name__}: {e}")
+            return 0.0
 
-    # Dùng 4 workers — đủ nhanh, không quá tải API
-    MAX_WORKERS_HOSE = 4
     _progress(f"Buoc 2/3: Kiem tra thanh khoan {total} ma ({days} phien cuoi, min={min_vol_billion}ty)...")
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS_HOSE) as pool:
-        futures = {pool.submit(_check_vol, s): s for s in all_symbols}
-        for fut in _as_completed(futures):
-            sym, vol = fut.result()
+    try:
+        for i, sym in enumerate(all_symbols, 1):
+            vol = _check_vol(sym)
             if vol >= min_vol_billion:
                 vol_map[sym] = vol
-            done_count += 1
-            # Báo tiến độ mỗi 25 mã
-            if done_count % 25 == 0 or done_count == total:
+            if i % 25 == 0 or i == total:
                 _progress(
-                    f"Buoc 2/3: {done_count}/{total} ma "
+                    f"Buoc 2/3: {i}/{total} ma "
                     f"({len(vol_map)} dat nguong {min_vol_billion}ty)"
                 )
+    except SystemExit:
+        logger.warning(f"[HoseWatchlist] SystemExit trong vol loop sau {len(vol_map)} ma — dung lai, dung ket qua tam")
+    except BaseException as e:
+        logger.error(f"[HoseWatchlist] BaseException trong vol loop: {type(e).__name__}: {e}")
 
     # ── Bước 3: Sort và lấy top_n ────────────────────────────────────────────
     sorted_syms = sorted(vol_map.items(), key=lambda x: x[1], reverse=True)
@@ -945,7 +947,7 @@ def format_dual_scan_report(dual_result: dict) -> list[str]:
         if not items:
             return
         lines.append(title)
-        hdr = f"  {'Ma':<6} {'Score':>5}  {'WR':>5}  {'Exp':>6}  {'MAE':>7}"
+        hdr = f"  {'Ma':<6} {'Score':>5}  {'WR':>5}  {'Exp':>6}  {'MAE30':>7}"
         if show_wn:
             hdr += f"  {'wN':>4}"
         lines.append(hdr)
@@ -954,7 +956,8 @@ def format_dual_scan_report(dual_result: dict) -> list[str]:
             s      = x.get("stats", {})
             wr     = s.get("win_rate", 0)
             exp    = s.get("expectancy", 0)
-            mae    = s.get("median_mdd", 0)
+            # MAE 30D — nhất quán với Exp 30D, fallback median_mdd nếu chưa có
+            mae    = s.get("median_mdd_30d", s.get("median_mdd", 0))
             wn     = s.get("weighted_n", 0)
             score  = x.get("score", 0)
             row = (f"  {x['symbol']:<6} {score:>5.1f}  "
@@ -1009,13 +1012,13 @@ def format_dual_scan_report(dual_result: dict) -> list[str]:
             if not items:
                 return
             lines.append(title)
-            lines.append(f"  {'Ma':<6} {'Score':>5}  {'WR':>5}  {'Exp':>6}  {'MAE':>7}  {'rawN':>5}")
+            lines.append(f"  {'Ma':<6} {'Score':>5}  {'WR':>5}  {'Exp':>6}  {'MAE30':>7}  {'rawN':>5}")
             lines.append("  " + "-" * 42)
             for x in items:
                 s     = x.get("stats", {})
                 wr    = s.get("win_rate_raw", s.get("win_rate", 0))
                 exp   = s.get("expectancy", 0)
-                mae   = s.get("median_mdd", 0)
+                mae   = s.get("median_mdd_30d", s.get("median_mdd", 0))
                 raw_n = s.get("n", 0)
                 score = x.get("score", 0)
                 lines.append(
@@ -1460,37 +1463,50 @@ async def scan_hose_cmd(update, context):
         symbols = await asyncio.to_thread(
             build_hose_watchlist, top_n, min_vol, 20, _progress_sync
         )
-
-        if not symbols:
+    except (SystemExit, BaseException) as e:
+        import traceback
+        logger.error(f"scan_hose_cmd build_watchlist ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        try:
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=msg.message_id,
-                text="❌ Khong lay duoc danh sach HOSE. Thu lai sau."
+                text=f"❌ Loi lay danh sach HOSE: {type(e).__name__}\n(Bot van hoat dong binh thuong)"
             )
-            return
+        except Exception:
+            pass
+        return
 
-        await _progress_async(
-            f"✅ Got {len(symbols)} ma HOSE\n"
-            f"Buoc 3/3: Dang dual scan...\n"
-            f"(Bang A: Regime ON | Bang B: Regime OFF)"
+    if not symbols:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=msg.message_id,
+            text="❌ Khong lay duoc danh sach HOSE. Thu lai sau."
         )
+        return
 
+    await _progress_async(
+        f"✅ Got {len(symbols)} ma HOSE\n"
+        f"Buoc 3/3: Dang dual scan...\n"
+        f"(Bang A: Regime ON | Bang B: Regime OFF)"
+    )
+
+    try:
         # Bước 3: dual scan với progress hiện (X/N)
         dual_result = await asyncio.to_thread(
             run_dual_scan, symbols, _progress_sync
         )
-
-        # Bước 3: format và gửi
+        # Format và gửi
         messages_out = format_dual_scan_report(dual_result)
         header = f"🏢 HOSE SCAN (top {top_n}, vol>={min_vol}ty)\n"
         messages_out[0] = header + messages_out[0]
-
-    except Exception as e:
+    except (SystemExit, BaseException) as e:
         import traceback
-        logger.error(f"scan_hose_cmd ERROR: {e}\n{traceback.format_exc()}")
-        await context.bot.edit_message_text(
-            chat_id=chat_id, message_id=msg.message_id,
-            text=f"❌ Loi scan HOSE: {str(e)[:200]}"
-        )
+        logger.error(f"scan_hose_cmd dual_scan ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg.message_id,
+                text=f"❌ Loi scan HOSE: {type(e).__name__}\n(Bot van hoat dong binh thuong)"
+            )
+        except Exception:
+            pass
         return
 
     # Gửi kết quả
