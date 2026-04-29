@@ -101,8 +101,15 @@ def compute_base_stats(analogs: list) -> dict:
     Regime Filter: nếu analogs có trường regime_weight → tính weighted WR,
     weighted Expectancy song song với unweighted để so sánh và hiển thị.
     """
-    f30s  = [a["fwd_30"]        for a in analogs if a.get("fwd_30")        is not None]
-    mdds  = [a["max_drawdown"]  for a in analogs if a.get("max_drawdown")  is not None]
+    f30s  = [a["fwd_30"] for a in analogs if a.get("fwd_30") is not None]
+    # MAE 30D: dùng max_drawdown_30d để nhất quán với Exp 30D
+    # Fallback về max_drawdown nếu max_drawdown_30d chưa có (cache cũ)
+    mdds  = [
+        a["max_drawdown_30d"] if a.get("max_drawdown_30d") is not None
+        else a["max_drawdown"]
+        for a in analogs
+        if a.get("max_drawdown_30d") is not None or a.get("max_drawdown") is not None
+    ]
     close = analogs[0].get("close", 0) if analogs else 0
 
     n = len(f30s)
@@ -196,11 +203,15 @@ def compute_base_stats(analogs: list) -> dict:
                                   [a["fwd_90"] for a in analogs if a.get("fwd_90") is not None]
                               )), 2) if any(a.get("fwd_90") for a in analogs) else None,
         "mae_avg":    round(float(np.mean(
-                          [a["max_drawdown"] for a in analogs if a.get("max_drawdown") is not None]
-                      )), 2) if any(a.get("max_drawdown") for a in analogs) else None,
+                          [a.get("max_drawdown_30d") or a["max_drawdown"]
+                           for a in analogs
+                           if a.get("max_drawdown_30d") is not None or a.get("max_drawdown") is not None]
+                      )), 2) if any(a.get("max_drawdown_30d") or a.get("max_drawdown") for a in analogs) else None,
         "mae_worst":  round(float(np.min(
-                          [a["max_drawdown"] for a in analogs if a.get("max_drawdown") is not None]
-                      )), 2) if any(a.get("max_drawdown") for a in analogs) else None,
+                          [a.get("max_drawdown_30d") or a["max_drawdown"]
+                           for a in analogs
+                           if a.get("max_drawdown_30d") is not None or a.get("max_drawdown") is not None]
+                      )), 2) if any(a.get("max_drawdown_30d") or a.get("max_drawdown") for a in analogs) else None,
         "mfe_avg":    round(float(np.mean(
                           [a["max_gain"] for a in analogs if a.get("max_gain") is not None]
                       )), 2) if any(a.get("max_gain") for a in analogs) else None,
@@ -346,13 +357,18 @@ def compute_reference_score(
             f"MaxDD median {median_mdd:.1f}% < {MAXDD_EXCLUDE_THRESH}% — rui ro qua cao, reject"
         ], "EXCLUDED"
 
-    # Gate 5: Weighted N quá thấp sau regime filter → penalty thay vì EXCLUDE
-    # Mã vẫn có thể có edge thực, chỉ là ít mẫu cùng regime.
-    # Penalty score x0.7 để hạ ưu tiên nhưng không loại khỏi kết quả.
+    # Gate 5: Weighted N quá thấp sau regime filter
+    # Nếu regime filter active và weighted_n < ngưỡng → mẫu thực sự quá ít
+    # để có ý nghĩa thống kê, dù raw n có vẻ đủ.
+    # Ngưỡng REGIME_MIN_WEIGHTED = 5.0 (từ historical_analog.py)
     weighted_n = stats.get("weighted_n", float(n))
     regime_filter_active = stats.get("regime_filter_active", False)
     REGIME_MIN_WEIGHTED = 5.0   # phải khớp với historical_analog.REGIME_MIN_WEIGHTED
-    _low_regime_n = regime_filter_active and weighted_n < REGIME_MIN_WEIGHTED
+    if regime_filter_active and weighted_n < REGIME_MIN_WEIGHTED:
+        return 0.0, [
+            f"Weighted N {weighted_n:.1f} < {REGIME_MIN_WEIGHTED} sau regime filter "
+            f"— khong du mau tuong dong cung regime, reject"
+        ], "EXCLUDED"
 
     # ══════════════════════════════════════════════════════════════════
     # Z-SCORE NORMALIZATION trên toàn watchlist
@@ -422,26 +438,18 @@ def compute_reference_score(
             f"Mau nho ({n} < {MIN_SAMPLE_FOR_RANK}) → score x{SMALL_SAMPLE_PENALTY}"
         )
 
-    # Soft 5: Weighted N thấp sau regime filter (Gate 5 hạ cấp từ hard→soft)
-    if _low_regime_n:
-        score *= 0.7
-        penalties.append(
-            f"Weighted N {weighted_n:.1f} < {REGIME_MIN_WEIGHTED} "
-            f"— it mau cung regime, score x0.7"
-        )
-
-    # Soft 6: Outlier risk từ Layer 2
+    # Soft 5: Outlier risk từ Layer 2
     if any("OUTLIER_RISK" in f for f in flags):
         score *= 0.6
         penalties.append("Outlier risk → score x0.6")
 
-    # Soft 7: High dispersion — bỏ z_rvr khỏi tính toán
+    # Soft 6: High dispersion — bỏ z_rvr khỏi tính toán
     if any("HIGH_DISPERSION" in f for f in flags):
         raw2  = z_exp * 0.50 + z_pf * 0.35 + z_mdd * 0.15
         score = float(np.clip((raw2 + 3.0) / 6.0 * 10, 0, 10))
         penalties.append("High dispersion → bo Return/Vol khoi cong thuc")
 
-    # Soft 8: Dead cat — cảnh báo xu hướng dài hạn yếu
+    # Soft 7: Dead cat — cảnh báo xu hướng dài hạn yếu
     if any("DEAD_CAT" in f for f in flags):
         score *= 0.85
         penalties.append("Dead cat pattern — xu huong dai han yeu, score x0.85")
