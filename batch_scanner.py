@@ -63,6 +63,104 @@ def load_watchlist() -> list[str]:
     return unique
 
 
+def build_hose_watchlist(
+    top_n:          int   = 200,
+    min_vol_billion: float = 3.0,
+    days:           int   = 20,
+) -> list[str]:
+    """
+    Tự động lấy top N mã HOSE theo thanh khoản trung bình 20 phiên.
+
+    Dùng vn_loader để load OHLCV từng mã — không dùng vnstock listing
+    vì listing API không ổn định.
+
+    Strategy:
+      1. Lấy danh sách mã từ vnstock listing (HOSE)
+      2. Với mỗi mã, load 20 bars OHLCV → tính avg volume * price
+      3. Lọc >= min_vol_billion tỷ/ngày
+      4. Sort desc, lấy top_n
+
+    Returns:
+        List mã sorted by thanh khoản desc.
+        Trả về [] nếu fail (caller dùng fallback).
+    """
+    logger.info(f"[HoseWatchlist] Building top {top_n} HOSE symbols "
+                f"(min_vol={min_vol_billion}ty, days={days})...")
+    t0 = time.time()
+
+    # ── Bước 1: Lấy danh sách mã HOSE ────────────────────────────────────────
+    all_symbols: list[str] = []
+    try:
+        from vnstock import Vnstock
+        listing = Vnstock().stock(symbol="VCB", source="VCI").listing.symbols_by_exchange()
+        hose_df = listing[listing["exchange"].str.upper() == "HOSE"]
+        all_symbols = hose_df["symbol"].str.upper().tolist()
+        logger.info(f"[HoseWatchlist] Got {len(all_symbols)} HOSE symbols from listing")
+    except Exception as e:
+        logger.warning(f"[HoseWatchlist] vnstock listing fail: {e}, trying fallback...")
+        # Fallback: dùng danh sách cứng các mã lớn nhất
+        try:
+            from vnstock import Vnstock
+            # Thử source khác
+            listing = Vnstock().stock(symbol="VCB", source="KBS").listing.symbols_by_exchange()
+            hose_df = listing[listing["exchange"].str.upper() == "HOSE"]
+            all_symbols = hose_df["symbol"].str.upper().tolist()
+            logger.info(f"[HoseWatchlist] KBS fallback: {len(all_symbols)} symbols")
+        except Exception as e2:
+            logger.error(f"[HoseWatchlist] All listing sources fail: {e2}")
+            return []
+
+    if not all_symbols:
+        logger.error("[HoseWatchlist] Empty symbol list")
+        return []
+
+    # ── Bước 2: Load OHLCV song song, tính thanh khoản ───────────────────────
+    from vn_loader import load_vn_ohlcv
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+
+    vol_map: dict[str, float] = {}   # symbol → avg_vol_billion
+
+    def _check_vol(sym: str) -> tuple[str, float]:
+        try:
+            df = load_vn_ohlcv(sym, days=days + 5, min_bars=10)
+            if df is None or len(df) < 10:
+                return sym, 0.0
+            close_arr = df["close"].values[-days:]
+            vol_arr   = df["volume"].values[-days:]
+            # close từ vn_loader đơn vị nghìn đồng → nhân 1000
+            avg_vnd   = float((vol_arr * close_arr).mean()) * 1000
+            return sym, round(avg_vnd / 1e9, 3)
+        except Exception:
+            return sym, 0.0
+
+    # Dùng 4 workers — đủ nhanh, không quá tải API
+    MAX_WORKERS_HOSE = 4
+    done = 0
+    total = len(all_symbols)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_HOSE) as pool:
+        futures = {pool.submit(_check_vol, s): s for s in all_symbols}
+        for fut in _as_completed(futures):
+            sym, vol = fut.result()
+            if vol >= min_vol_billion:
+                vol_map[sym] = vol
+            done += 1
+            if done % 50 == 0:
+                logger.info(f"[HoseWatchlist] Progress: {done}/{total} "
+                            f"({len(vol_map)} passed filter so far)")
+
+    # ── Bước 3: Sort và lấy top_n ────────────────────────────────────────────
+    sorted_syms = sorted(vol_map.items(), key=lambda x: x[1], reverse=True)
+    result = [s for s, _ in sorted_syms[:top_n]]
+
+    elapsed = round(time.time() - t0, 1)
+    logger.info(
+        f"[HoseWatchlist] Done: {len(vol_map)}/{total} passed filter, "
+        f"returning top {len(result)} | {elapsed}s"
+    )
+    return result
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PER-SYMBOL WORKER (chạy trong thread)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -918,10 +1016,9 @@ def format_dual_scan_report(dual_result: dict) -> list[str]:
 
         _render_b("UU TIEN (Score >= 5.0):", grp_b_priority)
         _render_b("TIEM NANG (4.0 - 4.9):", grp_b_potential)
-        _render_b("THAM KHAO (< 4.0):",     grp_b_ref[:8])  # giới hạn 8 mã ref
-
-        lines.append("Goi y: /analog <MA> --raw  de xem chi tiet")
-        lines.append("")
+        if grp_b_ref:
+            lines.append(f"THAM KHAO (< 4.0): {len(grp_b_ref)} ma — dung /analog <MA> --raw de xem")
+            lines.append("")
 
     # Mã không đủ điều kiện (thanh khoản, cache...)
     non_timeout_rej = [r for r in rej_on
@@ -1273,8 +1370,117 @@ async def scan_watchlist_cmd(update, context):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CRON JOB — 8:00 AM
+# CRON JOB — 4:00 AM — FULL HOSE SCAN
 # ══════════════════════════════════════════════════════════════════════════════
+
+HOSE_CRON_HOUR   = 4
+HOSE_CRON_MINUTE = 0
+HOSE_TOP_N       = int(os.environ.get("HOSE_TOP_N",   "200"))
+HOSE_MIN_VOL     = float(os.environ.get("HOSE_MIN_VOL", "3.0"))
+
+
+async def _start_hose_cron(bot, chat_ids: list[int]):
+    """
+    Cron 4:00 AM — scan toàn bộ HOSE top N mã theo thanh khoản.
+
+    Flow:
+      1. build_hose_watchlist() → top 200 mã HOSE theo vol
+      2. run_dual_scan() với danh sách đó
+      3. Gửi kết quả qua Telegram
+
+    Chạy lúc 4h sáng để tránh rate limit (ít traffic),
+    cache vector sẽ được build sẵn trước khi thị trường mở.
+
+    Env vars:
+      HOSE_TOP_N   (default 200): số mã top lấy
+      HOSE_MIN_VOL (default 5.0): thanh khoản tối thiểu tỷ/ngày
+    """
+    import datetime as _dt
+
+    while True:
+        now    = _dt.datetime.now()
+        target = now.replace(
+            hour=HOSE_CRON_HOUR, minute=HOSE_CRON_MINUTE, second=0, microsecond=0
+        )
+        if now >= target:
+            target += _dt.timedelta(days=1)
+
+        wait_secs = (target - now).total_seconds()
+        logger.info(
+            f"[HoseCron] Next run in {wait_secs/3600:.1f}h "
+            f"({target.strftime('%d/%m %H:%M')}) | "
+            f"top_n={HOSE_TOP_N} min_vol={HOSE_MIN_VOL}ty"
+        )
+        await asyncio.sleep(wait_secs)
+
+        logger.info("[HoseCron] Bat dau build HOSE watchlist...")
+
+        try:
+            # Bước 1: build danh sách mã
+            symbols = await asyncio.to_thread(
+                build_hose_watchlist,
+                HOSE_TOP_N,
+                HOSE_MIN_VOL,
+            )
+
+            if not symbols:
+                err = "❌ [HoseCron] Khong lay duoc danh sach HOSE — skip scan"
+                logger.error(err)
+                for cid in chat_ids:
+                    try:
+                        await bot.send_message(chat_id=cid, text=err)
+                    except Exception:
+                        pass
+                continue
+
+            logger.info(f"[HoseCron] Got {len(symbols)} symbols, starting dual scan...")
+
+            # Notify bắt đầu
+            for cid in chat_ids:
+                try:
+                    await bot.send_message(
+                        chat_id=cid,
+                        text=f"🌙 [4AM] Bat dau scan {len(symbols)} ma HOSE "
+                             f"(top {HOSE_TOP_N} theo thanh khoan)..."
+                    )
+                except Exception:
+                    pass
+
+            # Bước 2: dual scan
+            dual_result = await asyncio.to_thread(run_dual_scan, symbols)
+
+            # Cache cho morning_briefing
+            try:
+                import batch_scanner as _bs_self
+                _bs_self._last_scan_result = dual_result["regime_on"]
+            except Exception:
+                pass
+
+            # Bước 3: gửi kết quả
+            messages = format_dual_scan_report(dual_result)
+            header   = f"🌙 HOSE FULL SCAN ({_dt.datetime.now().strftime('%d/%m %H:%M')})\n"
+            messages[0] = header + messages[0]
+
+            for cid in chat_ids:
+                for m in messages:
+                    try:
+                        await bot.send_message(chat_id=cid, text=m[:4000])
+                        await asyncio.sleep(0.3)
+                    except Exception as _se:
+                        logger.warning(f"[HoseCron] send to {cid} fail: {_se}")
+
+        except Exception as e:
+            import traceback
+            logger.error(f"[HoseCron] ERROR: {e}\n{traceback.format_exc()}")
+            err_msg = (
+                f"❌ HOSE scan lỗi ({_dt.datetime.now().strftime('%H:%M')}): "
+                f"{str(e)[:200]}"
+            )
+            for cid in chat_ids:
+                try:
+                    await bot.send_message(chat_id=cid, text=err_msg)
+                except Exception:
+                    pass
 
 async def _start_scan_cron(bot, chat_ids: list[int]):
     """

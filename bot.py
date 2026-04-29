@@ -67,7 +67,7 @@ except ImportError:
     logger.warning("analog_cmd.py chua co — /analog bi tat")
 
 try:
-    from batch_scanner import scan_watchlist_cmd, _start_scan_cron
+    from batch_scanner import scan_watchlist_cmd, _start_scan_cron, _start_hose_cron
     _BATCH_SCANNER = True
 except ImportError:
     _BATCH_SCANNER = False
@@ -1543,6 +1543,8 @@ def main():
             if _scan_ids:
                 asyncio.create_task(_start_scan_cron(application.bot, _scan_ids))
                 logger.info(f"ScanCron: {len(_scan_ids)} chat_ids, 08:00 daily")
+                asyncio.create_task(_start_hose_cron(application.bot, _scan_ids))
+                logger.info(f"HoseCron: {len(_scan_ids)} chat_ids, 04:00 daily (HOSE top {os.environ.get('HOSE_TOP_N', 200)} ma)")
             else:
                 logger.warning("ScanCron: khong co chat_id nao — set ALLOWED_CHAT_IDS de nhan bao cao sang")
         if _ALERT_AVAILABLE:
