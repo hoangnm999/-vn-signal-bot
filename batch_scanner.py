@@ -490,8 +490,445 @@ def run_batch_scan(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM OUTPUT FORMATTER
+# DUAL SCAN — Regime ON + Regime OFF song song
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Ngưỡng tối thiểu raw_n để hiển thị mã trong bảng "No Filter"
+DUAL_SCAN_MIN_RAW_N = 3   # trader muốn thấy mọi mã có >=3 mẫu raw
+
+
+def run_dual_scan(
+    symbols:    list[str],
+    progress_cb = None,
+) -> dict:
+    """
+    Chạy 2 scan song song:
+      - Scan A: Regime filter ON  (current_regime từ market_regime)
+      - Scan B: Regime filter OFF (current_regime=0)
+
+    Hai scan chạy trong ThreadPoolExecutor — tổng thời gian ≈ max(A, B),
+    không phải A+B.
+
+    Returns:
+        {
+          "regime_on":  dict,   # kết quả scan A (format giống run_batch_scan)
+          "regime_off": dict,   # kết quả scan B
+          "current_regime": int,
+          "regime_label": str,
+          "elapsed": float,
+        }
+    """
+    import threading
+    t0 = time.time()
+
+    # Pre-load regime 1 lần dùng chung
+    current_regime = 0
+    regime_label   = "Khong xac dinh"
+    try:
+        from market_regime import get_market_regime
+        rdata = get_market_regime()
+        if rdata.get("ok"):
+            current_regime = int(rdata.get("regime", 0))
+            regime_label   = rdata.get("label", "")
+    except Exception as e:
+        logger.warning(f"[DualScan] regime load fail: {e}")
+
+    def _progress_a(msg: str):
+        if progress_cb:
+            try: progress_cb(f"[RegimeON]  {msg}")
+            except Exception: pass
+        logger.info(f"[DualScan-ON]  {msg}")
+
+    def _progress_b(msg: str):
+        if progress_cb:
+            try: progress_cb(f"[RegimeOFF] {msg}")
+            except Exception: pass
+        logger.info(f"[DualScan-OFF] {msg}")
+
+    result_a: dict = {}
+    result_b: dict = {}
+    err_a: list   = []
+    err_b: list   = []
+
+    def _run_a():
+        try:
+            # Scan A: dùng regime filter ON — truyền current_regime trực tiếp
+            # để không pre-load lại VNINDEX
+            result_a.update(_run_batch_scan_internal(
+                symbols        = symbols,
+                current_regime = current_regime,
+                progress_cb    = _progress_a,
+            ))
+        except Exception as e:
+            logger.error(f"[DualScan-ON] error: {e}")
+            err_a.append(str(e))
+
+    def _run_b():
+        try:
+            # Scan B: regime filter OFF (current_regime=0)
+            result_b.update(_run_batch_scan_internal(
+                symbols        = symbols,
+                current_regime = 0,   # disable regime filter
+                progress_cb    = _progress_b,
+            ))
+        except Exception as e:
+            logger.error(f"[DualScan-OFF] error: {e}")
+            err_b.append(str(e))
+
+    # Chạy song song
+    t_a = threading.Thread(target=_run_a, daemon=True)
+    t_b = threading.Thread(target=_run_b, daemon=True)
+    t_a.start()
+    t_b.start()
+    t_a.join(timeout=SCAN_TIMEOUT_SECS + 60)
+    t_b.join(timeout=SCAN_TIMEOUT_SECS + 60)
+
+    elapsed = round(time.time() - t0, 1)
+    logger.info(f"[DualScan] Done: {elapsed}s | "
+                f"ON={len(result_a.get('ranked',[]))} ranked | "
+                f"OFF={len(result_b.get('ranked',[]))} ranked")
+
+    return {
+        "regime_on":      result_a if result_a else {"ranked": [], "excluded": [], "rejected": [], "errors": [], "partial": False},
+        "regime_off":     result_b if result_b else {"ranked": [], "excluded": [], "rejected": [], "errors": [], "partial": False},
+        "current_regime": current_regime,
+        "regime_label":   regime_label,
+        "elapsed":        elapsed,
+        "market_warn":    result_a.get("market_warn") or result_b.get("market_warn"),
+    }
+
+
+def _run_batch_scan_internal(
+    symbols:        list[str],
+    current_regime: int,
+    progress_cb     = None,
+) -> dict:
+    """
+    Core scan logic tách ra từ run_batch_scan để dual scan gọi được.
+    Không pre-load regime (đã được caller cung cấp).
+    """
+    t_global    = time.time()
+    raw_results: dict[str, dict] = {}
+    total_syms  = len(symbols)
+    done_count  = 0
+
+    def _progress(msg: str):
+        if progress_cb:
+            try: progress_cb(msg)
+            except Exception: pass
+        logger.debug(f"[BatchScanInternal] {msg}")
+
+    partial = False
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures  = {pool.submit(_scan_one_symbol, sym, current_regime): sym
+                    for sym in symbols}
+        deadline = t_global + SCAN_TIMEOUT_SECS
+
+        try:
+            for future in as_completed(futures, timeout=SCAN_TIMEOUT_SECS):
+                sym = futures[future]
+                try:
+                    res = future.result(timeout=max(1, deadline - time.time()))
+                    raw_results[sym] = res
+                    elapsed = res.get("elapsed", 0)
+                    gate    = res.get("gate", "?")
+                except FuturesTimeout:
+                    raw_results[sym] = {"symbol": sym, "gate": "TIMEOUT",
+                                        "reason": "Timeout"}
+                    partial = True
+                    gate, elapsed = "TIMEOUT", 0
+                except Exception as e:
+                    raw_results[sym] = {"symbol": sym, "gate": "ERROR",
+                                        "reason": str(e)[:100]}
+                    gate, elapsed = "ERROR", 0
+
+                done_count += 1
+                _progress(f"  ({done_count}/{total_syms}) {sym}: {gate} ({elapsed:.0f}s)")
+
+        except Exception:
+            partial = True
+            for sym in symbols:
+                if sym not in raw_results:
+                    raw_results[sym] = {"symbol": sym, "gate": "TIMEOUT",
+                                        "reason": "Global timeout"}
+
+    # Stats + guardrails
+    all_stats    = []
+    valid_results = {}
+    for sym, res in raw_results.items():
+        if res.get("gate") not in ("REJECT", "TIMEOUT", "ERROR", "UNKNOWN") \
+                and res.get("analogs"):
+            from guardrails import compute_base_stats
+            stats = compute_base_stats(res["analogs"])
+            if stats.get("valid"):
+                all_stats.append(stats)
+                valid_results[sym] = res
+
+    ranked   = []
+    excluded = []
+    rejected = []
+    errors   = []
+
+    for sym, res in raw_results.items():
+        if res.get("gate") in ("TIMEOUT", "ERROR"):
+            errors.append(f"{sym}: {res.get('reason', '?')}")
+            continue
+        if res.get("gate") == "REJECT":
+            rejected.append({"symbol": sym, "reason": res.get("reason", "Gate reject")})
+            continue
+        if sym not in valid_results:
+            rejected.append({"symbol": sym, "reason": "Khong co analogs hop le"})
+            continue
+
+        from guardrails import run_guardrails_for_symbol
+        gr = run_guardrails_for_symbol(
+            symbol          = sym,
+            analogs         = res["analogs"],
+            all_stats       = all_stats,
+            volume_avg_bill = res.get("volume_avg_bill"),
+            cache_days      = res.get("cache_days"),
+            check_age_hours = res.get("check_age_hours"),
+        )
+
+        if gr["gate"] == "REJECT":
+            rejected.append({"symbol": sym, "reason": gr.get("reason", "Gate reject")})
+            continue
+
+        pen = gr.get("penalties", [])
+        pen_str = pen[0][:80] if pen else "score=0"
+        gr["_exclude_reason"] = pen_str
+
+        if gr["risk_tier"] == "EXCLUDED":
+            excluded.append(gr)
+        else:
+            ranked.append(gr)
+
+    ranked.sort(key=lambda x: x["score"], reverse=True)
+    excluded.sort(key=lambda x: x["score"], reverse=True)
+
+    elapsed = round(time.time() - t_global, 1)
+
+    # Market warn
+    market_warn = None
+    try:
+        from vn_loader import load_vn_ohlcv
+        from guardrails import check_market_regime
+        df_vni = load_vn_ohlcv("VNINDEX", days=10, min_bars=5)
+        if df_vni is not None and len(df_vni) >= 6:
+            close_5d = df_vni["close"].values
+            chg_5d   = (close_5d[-1] - close_5d[-6]) / close_5d[-6] * 100
+            market_warn = check_market_regime(chg_5d)
+    except Exception:
+        pass
+
+    return {
+        "ranked":      ranked,
+        "excluded":    excluded,
+        "rejected":    rejected,
+        "errors":      errors,
+        "elapsed":     elapsed,
+        "market_warn": market_warn,
+        "partial":     partial,
+    }
+
+
+def format_dual_scan_report(dual_result: dict) -> list[str]:
+    """
+    Format kết quả dual scan thành list messages cho Telegram.
+
+    Layout:
+      MSG 1: Header + Bảng A (Regime ON) + Bảng B excerpt (Regime OFF)
+      MSG 2+: Chi tiết nếu cần
+
+    Bảng B chỉ hiển thị mã:
+      - Không có trong ranked/excluded bảng A (tránh trùng lặp)
+      - raw_n >= DUAL_SCAN_MIN_RAW_N (>= 3 mẫu)
+      - Expectancy > 0 và WR >= 40%
+    """
+    from guardrails import SCORE_OPPORTUNITY_MIN
+
+    regime_on    = dual_result.get("regime_on", {})
+    regime_off   = dual_result.get("regime_off", {})
+    cur_regime   = dual_result.get("current_regime", 0)
+    regime_label = dual_result.get("regime_label", "")
+    elapsed      = dual_result.get("elapsed", 0)
+    market_warn  = dual_result.get("market_warn")
+
+    scan_date    = datetime.now().strftime("%d/%m/%Y %H:%M")
+    regime_names = {1: "R1 Bull Quiet", 2: "R2 Bull Volatile",
+                    3: "R3 Bear Quiet",  4: "R4 Bear Volatile"}
+    r_name       = regime_names.get(cur_regime, f"R{cur_regime}" if cur_regime else "?")
+
+    ranked_on  = regime_on.get("ranked",   [])
+    excl_on    = regime_on.get("excluded", [])
+    rej_on     = regime_on.get("rejected", [])
+    err_on     = regime_on.get("errors",   [])
+    partial_on = regime_on.get("partial",  False)
+
+    ranked_off = regime_off.get("ranked",   [])
+    excl_off   = regime_off.get("excluded", [])
+
+    total_scan = (len(ranked_on) + len(excl_on) +
+                  len(rej_on) + len(err_on))
+
+    # Mã đã có trong bảng ON (ranked + excluded) → không hiện lại bảng OFF
+    syms_in_on = {r["symbol"] for r in ranked_on} | {r["symbol"] for r in excl_on}
+
+    # Lọc bảng OFF: chỉ lấy mã mới, raw_n >= 3, Exp > 0, WR >= 40%
+    off_extras = []
+    for r in ranked_off + excl_off:
+        sym = r["symbol"]
+        if sym in syms_in_on:
+            continue
+        s          = r.get("stats", {})
+        raw_n      = s.get("n", 0)
+        exp        = s.get("expectancy", 0)
+        wr         = s.get("win_rate_raw", s.get("win_rate", 0))
+        weighted_n = s.get("weighted_n", 0)
+        if raw_n < DUAL_SCAN_MIN_RAW_N:
+            continue
+        if exp <= 0 or wr < 0.40:
+            continue
+        off_extras.append({
+            "symbol":     sym,
+            "score_off":  r.get("score", 0),
+            "wr_raw":     wr,
+            "exp":        exp,
+            "mae":        s.get("median_mdd", 0),
+            "raw_n":      raw_n,
+            "weighted_n": weighted_n,
+        })
+
+    # Sort OFF extras theo exp desc
+    off_extras.sort(key=lambda x: x["exp"], reverse=True)
+
+    # ── Build messages ────────────────────────────────────────────────────────
+    lines = []
+
+    # Header
+    partial_tag = " [KET QUA CHUA DAY DU]" if partial_on else ""
+    lines.append(f"SCAN WATCHLIST ({scan_date}){partial_tag}")
+    lines.append(f"Tong: {total_scan} ma | {int(elapsed)}s | Regime: {r_name}")
+    lines.append("=" * 38)
+
+    if market_warn:
+        lines.append(f"CANH BAO: {market_warn}")
+        lines.append("")
+
+    # ── BẢNG A: REGIME FILTER ON ──────────────────────────────────────────────
+    lines.append(f"BANG A — REGIME FILTER ON ({r_name}):")
+    lines.append("(Mau duoc can theo regime hien tai)")
+    lines.append("")
+
+    def _render(title, items, show_wn=True):
+        if not items:
+            return
+        lines.append(title)
+        hdr = f"  {'Ma':<6} {'Score':>5}  {'WR':>5}  {'Exp':>6}  {'MAE':>7}"
+        if show_wn:
+            hdr += f"  {'wN':>4}"
+        lines.append(hdr)
+        lines.append("  " + "-" * (38 if show_wn else 33))
+        for x in items:
+            s      = x.get("stats", {})
+            wr     = s.get("win_rate", 0)
+            exp    = s.get("expectancy", 0)
+            mae    = s.get("median_mdd", 0)
+            wn     = s.get("weighted_n", 0)
+            score  = x.get("score", 0)
+            row = (f"  {x['symbol']:<6} {score:>5.1f}  "
+                   f"{wr:>4.0%}  {exp:>+5.1f}%  {mae:>+6.1f}%")
+            if show_wn:
+                row += f"  {wn:>4.1f}"
+            lines.append(row)
+        lines.append("")
+
+    # Group ranked ON
+    grp_priority  = [r for r in ranked_on if r["score"] >= 5.0]
+    grp_potential = [r for r in ranked_on if 4.0 <= r["score"] < 5.0]
+    grp_ref       = [r for r in ranked_on if r["score"] < 4.0]
+
+    if not ranked_on:
+        lines.append("  Khong co ma nao du dieu kien voi regime filter ON.")
+        lines.append("")
+    else:
+        _render("UU TIEN (Score >= 5.0):", grp_priority)
+        _render("TIEM NANG (4.0 - 4.9):", grp_potential)
+        _render("THAM KHAO (< 4.0):",     grp_ref)
+
+    # Excluded ON — compact
+    if excl_on:
+        lines.append(f"LOAI (Exp am / PF<1 / WR<40% / wN<5): {len(excl_on)} ma")
+        exc_syms = ", ".join(
+            f"{r['symbol']}({r.get('stats',{}).get('weighted_n',0):.1f}wN)"
+            for r in excl_on[:15]
+        )
+        lines.append(f"  {exc_syms}")
+        lines.append("")
+
+    lines.append("─" * 38)
+
+    # ── BẢNG B: REGIME FILTER OFF ─────────────────────────────────────────────
+    lines.append("BANG B — REGIME FILTER OFF (raw, khong loc regime):")
+    lines.append("(Ma moi xuat hien o day — chua du mau cung regime)")
+    lines.append("Trader tu quyet dinh muc tin tuong.")
+    lines.append("")
+
+    if not off_extras:
+        lines.append("  Khong co ma nao them khi tat regime filter")
+        lines.append("  (tat ca da xuat hien o Bang A hoac khong du tieu chi)")
+        lines.append("")
+    else:
+        lines.append(f"  {'Ma':<6} {'WR':>5}  {'Exp':>6}  {'MAE':>7}  {'rawN':>5}  {'wN':>4}")
+        lines.append("  " + "-" * 40)
+        for x in off_extras[:10]:   # giới hạn 10 mã
+            lines.append(
+                f"  {x['symbol']:<6} {x['wr_raw']:>4.0%}  "
+                f"{x['exp']:>+5.1f}%  {x['mae']:>+6.1f}%  "
+                f"{x['raw_n']:>5}  {x['weighted_n']:>4.1f}"
+            )
+        lines.append("")
+        lines.append("Goi y: /analog <MA> --raw  de xem chi tiet khong loc regime")
+        lines.append("")
+
+    # Mã không đủ điều kiện (thanh khoản, cache...)
+    non_timeout_rej = [r for r in rej_on
+                       if "timeout" not in r.get("reason", "").lower()]
+    if non_timeout_rej:
+        lines.append(f"KHONG DU DIEU KIEN ({len(non_timeout_rej)} ma):")
+        for r in non_timeout_rej[:8]:
+            lines.append(f"  {r['symbol']:<6} {r.get('reason','?')[:55]}")
+        lines.append("")
+
+    lines.append("* Score la chi so tham khao, khong phai khuyen nghi mua/ban.")
+    lines.append("* Bang B hien thi raw data — khong co regime weighting.")
+
+    full = "\n".join(lines)
+
+    # Split messages
+    MAX_LEN = 4000
+    if len(full) <= MAX_LEN:
+        return [full]
+
+    # Split tại separator
+    msgs  = []
+    split = full.find("BANG B —")
+    if 0 < split < MAX_LEN:
+        msgs.append(full[:split].strip())
+        msgs.append(full[split:].strip()[:MAX_LEN])
+    else:
+        # Generic split
+        buf = ""
+        for line in full.split("\n"):
+            if len(buf) + len(line) + 1 > MAX_LEN:
+                msgs.append(buf.strip())
+                buf = line + "\n"
+            else:
+                buf += line + "\n"
+        if buf.strip():
+            msgs.append(buf.strip())
+
+    return msgs if msgs else [full[:MAX_LEN]]
 
 def _format_overview_table(
     ranked:   list[dict],
@@ -695,8 +1132,8 @@ def format_scan_report(scan_result: dict) -> list[str]:
 
 async def scan_watchlist_cmd(update, context):
     """
-    /scan_watchlist — Chạy batch scan thủ công.
-    Có cooldown 5 phút giữa các lần gọi.
+    /scan_watchlist        — Dual scan: Regime ON + Regime OFF song song
+    /scan_watchlist --raw  — Chỉ chạy scan đơn (regime OFF, behavior cũ)
     """
     global _last_scan_time
 
@@ -715,75 +1152,92 @@ async def scan_watchlist_cmd(update, context):
     if since < COOLDOWN_SECS:
         wait = int(COOLDOWN_SECS - since)
         await update.message.reply_text(
-            f"⏳ Vui lòng chờ {wait}s trước khi scan lại.\n"
-            f"(Cooldown {COOLDOWN_SECS//60} phút)"
+            f"Vui long cho {wait}s truoc khi scan lai.\n"
+            f"(Cooldown {COOLDOWN_SECS//60} phut)"
         )
         return
 
     _last_scan_time = time.time()
-    chat_id = update.effective_chat.id
+    chat_id  = update.effective_chat.id
+    args     = context.args or []
+    raw_mode = "--raw" in args   # chỉ chạy scan đơn nếu có --raw
 
     symbols = load_watchlist()
-    msg = await update.message.reply_text(
-        f"🔍 Đang scan {len(symbols)} mã trong watchlist...\n"
-        f"Tối đa {SCAN_TIMEOUT_SECS // 60} phút. Vui lòng chờ."
-    )
 
-    # Progress callback (edit message liên tục)
+    if raw_mode:
+        msg = await update.message.reply_text(
+            f"Dang scan {len(symbols)} ma (Regime filter OFF)...\n"
+            f"Toi da {SCAN_TIMEOUT_SECS // 60} phut."
+        )
+    else:
+        msg = await update.message.reply_text(
+            f"Dang dual scan {len(symbols)} ma...\n"
+            f"Bang A: Regime filter ON | Bang B: Regime filter OFF\n"
+            f"(2 scan chay song song — tong thoi gian ~bang 1 scan don)"
+        )
+
+    # Progress callback
     progress_lines: list[str] = [
-        f"🔍 Scan {len(symbols)} mã — đang chạy...\n"
+        f"Scan {len(symbols)} ma — dang chay...\n"
     ]
 
     async def _progress_async(line: str):
         progress_lines.append(line)
         try:
-            preview = "\n".join(progress_lines[-8:])
+            preview = "\n".join(progress_lines[-6:])
             await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg.message_id,
+                chat_id=chat_id, message_id=msg.message_id,
                 text=preview[:4000],
             )
         except Exception:
             pass
 
-    # Wrapper sync → async (ThreadPoolExecutor gọi sync callback)
     loop = asyncio.get_event_loop()
 
     def _progress_sync(line: str):
         asyncio.run_coroutine_threadsafe(_progress_async(line), loop)
 
-    # Chạy scan trong thread
     try:
-        scan_result = await asyncio.to_thread(
-            run_batch_scan, symbols, _progress_sync
-        )
+        if raw_mode:
+            # Scan đơn regime OFF (behavior cũ)
+            scan_result = await asyncio.to_thread(
+                run_batch_scan, symbols, _progress_sync
+            )
+            messages = format_scan_report(scan_result)
+        else:
+            # Dual scan
+            dual_result = await asyncio.to_thread(
+                run_dual_scan, symbols, _progress_sync
+            )
+            # Cache regime_on result cho morning_briefing
+            try:
+                import batch_scanner as _bs_self
+                _bs_self._last_scan_result = dual_result["regime_on"]
+            except Exception:
+                pass
+            messages = format_dual_scan_report(dual_result)
+
     except Exception as e:
         await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=msg.message_id,
-            text=f"❌ Lỗi scan: {str(e)[:300]}",
+            chat_id=chat_id, message_id=msg.message_id,
+            text=f"Loi scan: {str(e)[:300]}",
         )
         return
 
-    # Format và gửi
-    messages = format_scan_report(scan_result)
-
-    # Edit message đầu bằng msg[0]
+    # Gửi messages
     try:
         await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=msg.message_id,
+            chat_id=chat_id, message_id=msg.message_id,
             text=messages[0][:4000],
         )
     except Exception:
         await context.bot.send_message(chat_id=chat_id, text=messages[0][:4000])
 
-    # Gửi thêm nếu có nhiều message
     for extra_msg in messages[1:]:
         try:
             await context.bot.send_message(chat_id=chat_id, text=extra_msg[:4000])
         except Exception as e:
-            logger.warning(f"scan_watchlist_cmd: send extra msg fail: {e}")
+            logger.warning(f"scan_watchlist_cmd: send extra fail: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -816,17 +1270,25 @@ async def _start_scan_cron(bot, chat_ids: list[int]):
         )
         await asyncio.sleep(wait_secs)
 
-        logger.info("[ScanCron] Bắt đầu chạy auto scan...")
+        logger.info("[ScanCron] Bat dau chay auto dual scan...")
         try:
             symbols     = load_watchlist()
-            scan_result = await asyncio.to_thread(run_batch_scan, symbols)
-            messages    = format_scan_report(scan_result)
+            dual_result = await asyncio.to_thread(run_dual_scan, symbols)
+
+            # Cache regime_on cho morning_briefing
+            try:
+                import batch_scanner as _bs_self
+                _bs_self._last_scan_result = dual_result["regime_on"]
+            except Exception:
+                pass
+
+            messages = format_dual_scan_report(dual_result)
 
             for cid in chat_ids:
                 for m in messages:
                     try:
                         await bot.send_message(chat_id=cid, text=m[:4000])
-                        await asyncio.sleep(0.3)   # tránh flood
+                        await asyncio.sleep(0.3)
                     except Exception as _se:
                         logger.warning(f"[ScanCron] send to {cid} fail: {_se}")
 
