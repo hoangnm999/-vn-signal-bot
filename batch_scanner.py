@@ -465,6 +465,28 @@ def run_batch_scan(
     _progress(f"Scan xong: {len(ranked)} mã vào rank, {len(excluded)} excluded, "
               f"{len(rejected)} reject | {elapsed}s")
 
+    # ── DEBUG: log chi tiết để diagnose kết quả rỗng ─────────────────────────
+    logger.info(
+        f"[BatchScan] raw_results summary: total={len(raw_results)} "
+        f"pass={sum(1 for r in raw_results.values() if r.get('gate')=='PASS')} "
+        f"reject={sum(1 for r in raw_results.values() if r.get('gate')=='REJECT')} "
+        f"timeout={sum(1 for r in raw_results.values() if r.get('gate')=='TIMEOUT')} "
+        f"error={sum(1 for r in raw_results.values() if r.get('gate')=='ERROR')}"
+    )
+    logger.info(f"[BatchScan] valid_results={len(valid_results)} all_stats={len(all_stats)}")
+    for sym, res in raw_results.items():
+        if res.get("gate") == "PASS":
+            analogs = res.get("analogs") or []
+            fwd30_none = sum(1 for a in analogs if a.get("fwd_30") is None)
+            logger.info(
+                f"[BatchScan] PASS {sym}: analogs={len(analogs)} "
+                f"fwd30_none={fwd30_none} "
+                f"in_valid={sym in valid_results}"
+            )
+        elif res.get("gate") == "REJECT":
+            logger.info(f"[BatchScan] REJECT {sym}: {res.get('reason','?')[:80]}")
+    # ── END DEBUG ─────────────────────────────────────────────────────────────
+
     # Market regime check — tính ở đây 1 lần, không lặp lại trong formatter
     market_warn = None
     try:
@@ -707,6 +729,28 @@ def _run_batch_scan_internal(
     excluded.sort(key=lambda x: x["score"], reverse=True)
 
     elapsed = round(time.time() - t_global, 1)
+
+    # ── DEBUG: log chi tiết để diagnose kết quả rỗng ─────────────────────────
+    logger.info(
+        f"[BatchScanInternal] raw_results summary: total={len(raw_results)} "
+        f"pass={sum(1 for r in raw_results.values() if r.get('gate')=='PASS')} "
+        f"reject={sum(1 for r in raw_results.values() if r.get('gate')=='REJECT')} "
+        f"timeout={sum(1 for r in raw_results.values() if r.get('gate')=='TIMEOUT')} "
+        f"error={sum(1 for r in raw_results.values() if r.get('gate')=='ERROR')}"
+    )
+    logger.info(f"[BatchScanInternal] valid_results={len(valid_results)} all_stats={len(all_stats)}")
+    for sym, res in raw_results.items():
+        if res.get("gate") == "PASS":
+            analogs = res.get("analogs") or []
+            fwd30_none = sum(1 for a in analogs if a.get("fwd_30") is None)
+            logger.info(
+                f"[BatchScanInternal] PASS {sym}: analogs={len(analogs)} "
+                f"fwd30_none={fwd30_none} "
+                f"in_valid={sym in valid_results}"
+            )
+        elif res.get("gate") == "REJECT":
+            logger.info(f"[BatchScanInternal] REJECT {sym}: {res.get('reason','?')[:80]}")
+    # ── END DEBUG ─────────────────────────────────────────────────────────────
 
     # Market warn
     market_warn = None
