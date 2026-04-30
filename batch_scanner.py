@@ -43,10 +43,58 @@ COOLDOWN_SECS      = 300    # 5 phút giữa 2 lần scan thủ công
 
 _last_scan_time: float = 0.0
 
-# ── HOSE Listing Cache ───────────────────────────────────────────────────────
+# ── Data Directory & Caches ──────────────────────────────────────────────────
 _DATA_DIR              = pathlib.Path("data")
+
+# HOSE Listing Cache
 _HOSE_LISTING_CACHE    = _DATA_DIR / "hose_listing.json"
 _HOSE_LISTING_TTL_SECS = 24 * 3600   # 24h — listing thay đổi rất ít
+
+# Scan Result Cache — persist qua bot restart, Morning Briefing đọc được
+_SCAN_RESULT_CACHE     = _DATA_DIR / "last_scan_result.json"
+_SCAN_RESULT_TTL_SECS  = 26 * 3600   # 26h — đủ cho Morning hôm sau đọc được
+_last_scan_result      = None         # in-memory; set bởi run_dual_scan & cron
+
+
+def _save_scan_result(result: dict) -> None:
+    """Persist scan result ra file để tồn tại qua bot restart."""
+    try:
+        _DATA_DIR.mkdir(exist_ok=True)
+        payload = {"ts": time.time(), "result": result}
+        _SCAN_RESULT_CACHE.write_text(
+            json.dumps(payload, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        logger.info(f"[ScanCache] Saved scan result ({len(result.get('ranked', []))} ranked)")
+    except Exception as e:
+        logger.warning(f"[ScanCache] Save fail: {e}")
+
+
+def get_last_scan_result() -> dict | None:
+    """
+    Trả về kết quả scan mới nhất.
+    Ưu tiên: in-memory → file cache (nếu < 26h).
+    Morning Briefing nên gọi hàm này thay vì đọc _last_scan_result trực tiếp.
+    """
+    global _last_scan_result
+    # 1. In-memory (scan đã chạy trong session hiện tại)
+    if _last_scan_result is not None:
+        return _last_scan_result
+    # 2. File cache (tồn tại qua restart)
+    try:
+        if _SCAN_RESULT_CACHE.exists():
+            age = time.time() - _SCAN_RESULT_CACHE.stat().st_mtime
+            if age < _SCAN_RESULT_TTL_SECS:
+                payload = json.loads(_SCAN_RESULT_CACHE.read_text(encoding="utf-8"))
+                _last_scan_result = payload.get("result")
+                logger.info(f"[ScanCache] Loaded from file ({age/3600:.1f}h old, "
+                            f"{len((_last_scan_result or {}).get('ranked', []))} ranked)")
+                return _last_scan_result
+            else:
+                logger.info(f"[ScanCache] File too old ({age/3600:.1f}h > 26h), ignoring")
+    except Exception as e:
+        logger.warning(f"[ScanCache] Load fail: {e}")
+    return None
 
 
 def _load_hose_listing_cache() -> list[str] | None:
@@ -1494,10 +1542,11 @@ async def scan_watchlist_cmd(update, context):
             dual_result = await asyncio.to_thread(
                 run_dual_scan, symbols, _progress_sync
             )
-            # Cache regime_on result cho morning_briefing
+            # Cache regime_on result cho morning_briefing (in-memory + file)
             try:
                 import batch_scanner as _bs_self
                 _bs_self._last_scan_result = dual_result["regime_on"]
+                _bs_self._save_scan_result(dual_result["regime_on"])
             except Exception:
                 pass
             messages = format_dual_scan_report(dual_result)
@@ -1783,10 +1832,11 @@ async def _start_hose_cron(bot, chat_ids: list[int]):
 
             dual_result = await asyncio.to_thread(run_dual_scan, symbols, _cron_progress)
 
-            # Cache cho morning_briefing
+            # Cache cho morning_briefing (in-memory + file)
             try:
                 import batch_scanner as _bs_self
                 _bs_self._last_scan_result = dual_result["regime_on"]
+                _bs_self._save_scan_result(dual_result["regime_on"])
             except Exception:
                 pass
 
@@ -1850,10 +1900,11 @@ async def _start_scan_cron(bot, chat_ids: list[int]):
             symbols     = load_watchlist()
             dual_result = await asyncio.to_thread(run_dual_scan, symbols)
 
-            # Cache regime_on cho morning_briefing
+            # Cache regime_on cho morning_briefing (in-memory + file)
             try:
                 import batch_scanner as _bs_self
                 _bs_self._last_scan_result = dual_result["regime_on"]
+                _bs_self._save_scan_result(dual_result["regime_on"])
             except Exception:
                 pass
 

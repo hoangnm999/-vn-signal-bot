@@ -77,13 +77,14 @@ def _get_top_symbols_fast(n: int = TOP_N_SCAN) -> tuple[list[dict], bool]:
     Lấy top N mã TỪ CACHE — KHÔNG chạy scan mới.
     has_score=True nếu có cache scan, False nếu chỉ là watchlist thô.
 
-    Nếu chưa có cache → trả về watchlist thô + has_score=False.
+    Đọc qua get_last_scan_result() — hỗ trợ cả in-memory lẫn file cache
+    (tồn tại qua bot restart). Nếu chưa có cache → trả về watchlist thô.
     User cần chạy /scan_watchlist trước để có cache.
     """
-    # Thử cache in-memory từ batch_scanner (_last_scan_result)
+    # Đọc qua get_last_scan_result() — có file fallback qua restart
     try:
-        import batch_scanner as _bs
-        scan_result = getattr(_bs, "_last_scan_result", None)
+        from batch_scanner import get_last_scan_result
+        scan_result = get_last_scan_result()
         if scan_result and isinstance(scan_result, dict):
             ranked = scan_result.get("ranked", [])
             if ranked:
@@ -101,6 +102,8 @@ def _get_top_symbols_fast(n: int = TOP_N_SCAN) -> tuple[list[dict], bool]:
                         "symbol":     r["symbol"],
                         "score":      r.get("score", 0.0),
                         "wr":         s.get("win_rate", 0.0),
+                        "rr":         s.get("rr", 0.0),
+                        "exp":        s.get("weighted_exp", 0.0),
                         "weighted_n": weighted_n,
                     })
                 if skipped:
@@ -116,7 +119,8 @@ def _get_top_symbols_fast(n: int = TOP_N_SCAN) -> tuple[list[dict], bool]:
         from batch_scanner import load_watchlist
         symbols = load_watchlist()[:n]
         logger.info(f"morning: no scan cache, using raw watchlist ({len(symbols)} symbols)")
-        return [{"symbol": s, "score": 0.0, "wr": 0.0, "weighted_n": 0.0}
+        return [{"symbol": s, "score": 0.0, "wr": 0.0, "rr": 0.0,
+                 "exp": 0.0, "weighted_n": 0.0}
                 for s in symbols], False
     except Exception as e:
         logger.warning(f"morning: load_watchlist fail: {e}")
@@ -314,12 +318,15 @@ def build_morning_briefing() -> str:
         sym    = c["symbol"]
         score  = c.get("score", 0.0)
         wr     = c.get("wr", 0.0)
+        rr     = c.get("rr", 0.0)
+        exp    = c.get("exp", 0.0)
         cat    = c["category"]
         prefix = "✅" if cat == "recommend" else "🟡" if cat == "watch" else "⛔"
 
         meta = []
-        if score > 0: meta.append(f"Score {score:.1f}")
+        if rr > 0:    meta.append(f"RR {rr:.1f}x")
         if wr > 0:    meta.append(f"WR {wr:.0%}")
+        if exp != 0:  meta.append(f"Exp {exp:+.1f}%")
         meta_str = " | ".join(meta)
 
         lines.append(f"{prefix} {sym:<5} {meta_str}")
@@ -349,39 +356,6 @@ def build_morning_briefing() -> str:
     elapsed = round(time.time() - t0, 1)
     lines += ["", f"[{elapsed}s | /morning de refresh]"]
     return "\n".join(lines)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MONKEY-PATCH batch_scanner để cache _last_scan_result
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _patch_batch_scanner():
-    """
-    Wrap run_batch_scan để lưu kết quả vào _last_scan_result.
-    Gọi 1 lần khi import — không ảnh hưởng behavior cũ.
-    """
-    try:
-        import batch_scanner as _bs
-        if getattr(_bs, "_patched_for_morning", False):
-            return
-        _orig = _bs.run_batch_scan
-
-        def _wrapped(symbols, progress_cb=None):
-            result = _orig(symbols, progress_cb)
-            _bs._last_scan_result = result
-            logger.info(f"morning: cached scan result "
-                        f"({len(result.get('ranked', []))} ranked)")
-            return result
-
-        _bs.run_batch_scan       = _wrapped
-        _bs._last_scan_result    = None
-        _bs._patched_for_morning = True
-        logger.info("morning: batch_scanner patched OK")
-    except Exception as e:
-        logger.warning(f"morning: patch fail (non-critical): {e}")
-
-
-_patch_batch_scanner()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
