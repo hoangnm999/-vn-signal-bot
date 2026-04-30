@@ -75,12 +75,20 @@ def _regime_gate(regime: int) -> tuple[bool, str]:
 def _get_top_symbols_fast(n: int = TOP_N_SCAN) -> tuple[list[dict], bool]:
     """
     Lấy top N mã TỪ CACHE — KHÔNG chạy scan mới.
-    has_score=True nếu có cache scan, False nếu chỉ là watchlist thô.
-
-    Đọc qua get_last_scan_result() — hỗ trợ cả in-memory lẫn file cache
-    (tồn tại qua bot restart). Nếu chưa có cache → trả về watchlist thô.
-    User cần chạy /scan_watchlist trước để có cache.
+    - Ưu tiên UU TIEN (RR >= 2.0) → TIEM NANG (RR >= 1.0) → THAM KHAO
+    - Sort theo RR giảm dần trong mỗi nhóm
+    - has_score=True nếu có cache scan, False nếu chỉ là watchlist thô.
     """
+    def _rr_from_stats(s: dict) -> float:
+        """Tính RR từ stats dict — nhất quán với _get_rr() trong batch_scanner."""
+        exp = s.get("expectancy", 0.0)
+        mae = s.get("median_mdd_30d", s.get("median_mdd", 0.0))
+        if exp <= 0:
+            return 0.0
+        if mae >= 0:
+            return 99.0
+        return round(exp / abs(mae), 2)
+
     # Đọc qua get_last_scan_result() — PostgreSQL backend, tồn tại qua Render deploy
     try:
         from batch_scanner import get_last_scan_result
@@ -91,28 +99,38 @@ def _get_top_symbols_fast(n: int = TOP_N_SCAN) -> tuple[list[dict], bool]:
         if scan_result and isinstance(scan_result, dict):
             ranked = scan_result.get("ranked", [])
             if ranked:
-                top = []
-                skipped = []
+                # Build danh sách với đầy đủ thông tin, tính RR đúng
+                candidates = []
                 for r in ranked:
-                    if len(top) >= n:
-                        break
                     s          = r.get("stats", {})
                     weighted_n = s.get("weighted_n", float(s.get("n", 0)))
                     if weighted_n < MORNING_MIN_WEIGHTED_N:
-                        skipped.append(f"{r['symbol']}(wN={weighted_n:.1f})")
                         continue
-                    top.append({
+                    rr = _rr_from_stats(s)
+                    candidates.append({
                         "symbol":     r["symbol"],
                         "score":      r.get("score", 0.0),
                         "wr":         s.get("win_rate", 0.0),
-                        "rr":         s.get("rr", 0.0),
-                        "exp":        s.get("weighted_exp", 0.0),
+                        "rr":         rr,
+                        "exp":        s.get("expectancy", 0.0),
+                        "mae":        s.get("median_mdd_30d", s.get("median_mdd", 0.0)),
                         "weighted_n": weighted_n,
                     })
-                if skipped:
-                    logger.info(f"morning: loai {len(skipped)} ma wN<5: {', '.join(skipped)}")
-                if top:
-                    logger.info(f"morning: {len(top)} symbols from scan cache")
+
+                if candidates:
+                    # Sort: UU TIEN (RR>=2) → TIEM NANG (1<=RR<2) → THAM KHAO — nhất quán scan
+                    priority  = sorted([c for c in candidates if c["rr"] >= 2.0],
+                                       key=lambda x: x["rr"], reverse=True)
+                    potential = sorted([c for c in candidates if 1.0 <= c["rr"] < 2.0],
+                                       key=lambda x: x["rr"], reverse=True)
+                    ref       = sorted([c for c in candidates if c["rr"] < 1.0],
+                                       key=lambda x: x["rr"], reverse=True)
+                    top = (priority + potential + ref)[:n]
+
+                    logger.info(
+                        f"morning: {len(top)} symbols from scan cache "
+                        f"(priority={len(priority)}, potential={len(potential)}, ref={len(ref)})"
+                    )
                     return top, True
     except Exception as e:
         logger.debug(f"morning: scan cache miss: {e}")
@@ -123,7 +141,7 @@ def _get_top_symbols_fast(n: int = TOP_N_SCAN) -> tuple[list[dict], bool]:
         symbols = load_watchlist()[:n]
         logger.info(f"morning: no scan cache, using raw watchlist ({len(symbols)} symbols)")
         return [{"symbol": s, "score": 0.0, "wr": 0.0, "rr": 0.0,
-                 "exp": 0.0, "weighted_n": 0.0}
+                 "exp": 0.0, "mae": 0.0, "weighted_n": 0.0}
                 for s in symbols], False
     except Exception as e:
         logger.warning(f"morning: load_watchlist fail: {e}")
@@ -317,19 +335,50 @@ def build_morning_briefing() -> str:
 
     lines += ["TOP MA HOM NAY:", "─" * 38]
 
-    for c in (recommend + watch + skip)[:TOP_N_RECOMMEND]:
+    # Phân nhóm theo RR (nhất quán với scan_watchlist)
+    priority  = [c for c in classified if c.get("rr", 0) >= 2.0]
+    potential = [c for c in classified if 1.0 <= c.get("rr", 0) < 2.0]
+    ref_watch = [c for c in classified if c.get("rr", 0) < 1.0 and c["category"] != "skip"]
+    skipped   = [c for c in classified if c["category"] == "skip"]
+
+    # Header nhóm + display — tối đa TOP_N_RECOMMEND mã
+    display_order = priority + potential + ref_watch + skipped
+    shown = 0
+    last_group = None
+
+    for c in display_order:
+        if shown >= TOP_N_RECOMMEND:
+            break
+        rr  = c.get("rr", 0.0)
+        cat = c["category"]
+
+        # Header nhóm khi chuyển sang nhóm mới
+        if has_score:
+            if rr >= 2.0 and last_group != "priority":
+                lines.append("UU TIEN (RR >= 2.0):")
+                last_group = "priority"
+            elif 1.0 <= rr < 2.0 and last_group != "potential":
+                lines.append("TIEM NANG (RR 1.0-2.0):")
+                last_group = "potential"
+            elif rr < 1.0 and cat != "skip" and last_group not in ("ref", "skip"):
+                lines.append("THAM KHAO:")
+                last_group = "ref"
+            elif cat == "skip" and last_group != "skip":
+                lines.append("BO QUA (Wave giam):")
+                last_group = "skip"
+
         sym    = c["symbol"]
-        score  = c.get("score", 0.0)
         wr     = c.get("wr", 0.0)
-        rr     = c.get("rr", 0.0)
         exp    = c.get("exp", 0.0)
-        cat    = c["category"]
-        prefix = "✅" if cat == "recommend" else "🟡" if cat == "watch" else "⛔"
+        prefix = "✅" if cat == "recommend" else "⛔" if cat == "skip" else "🟡"
 
         meta = []
-        if rr > 0:    meta.append(f"RR {rr:.1f}x")
-        if wr > 0:    meta.append(f"WR {wr:.0%}")
-        if exp != 0:  meta.append(f"Exp {exp:+.1f}%")
+        if rr > 0 and has_score:
+            meta.append(f"RR {rr:.1f}x" if rr < 90 else "RR 99x")
+        if wr > 0 and has_score:
+            meta.append(f"WR {wr:.0%}")
+        if exp != 0 and has_score:
+            meta.append(f"Exp {exp:+.1f}%")
         meta_str = " | ".join(meta)
 
         lines.append(f"{prefix} {sym:<5} {meta_str}")
@@ -337,14 +386,15 @@ def build_morning_briefing() -> str:
         if cat != "skip":
             lines.append(f"   → {c['action']}")
         lines.append("")
+        shown += 1
 
     # Action summary
     lines += ["─" * 38, "BUOC TIEP THEO:"]
-    if recommend:
-        cmds = " | ".join(f"/analog {c['symbol']}" for c in recommend[:2])
+    best = priority or potential or ref_watch
+    if best:
+        top2 = best[:2]
+        cmds = " | ".join(f"/analog {c['symbol']}" for c in top2)
         lines.append(f"  Chay: {cmds}")
-    elif watch:
-        lines.append(f"  Xem them: /wave {watch[0]['symbol']} roi /analog {watch[0]['symbol']}")
     else:
         lines.append("  Khong co ma uu tien hom nay.")
 
