@@ -416,30 +416,44 @@ def _find_similar_inner(
     if len(search_df) < 3:
         return None
 
-    tarr  = np.array(vector_to_list(target_vector), dtype=float)
-    tnorm = np.linalg.norm(tarr)
-    if tnorm == 0:
-        return None
-
     avail = [c for c in VECTOR_KEYS if c in search_df.columns]
     if len(avail) < VECTOR_DIM - 2:
         return None
+
+    # Chỉ dùng dimensions có mặt trong cả target vector và cache
+    # fillna(0) gây underestimate similarity khi dimension bị thiếu
+    # → loại dimension thiếu ra khỏi cả 2 vectors trước khi tính cosine
+    tarr_avail = np.array([vector_to_list(target_vector)[VECTOR_KEYS.index(k)]
+                           for k in avail], dtype=float)
+    tnorm = np.linalg.norm(tarr_avail)
+    if tnorm == 0:
+        return None
+
     mat   = search_df[avail].fillna(0.0).values.astype(float)
     norms = np.linalg.norm(mat, axis=1)
     norms = np.where(norms == 0, 1e-9, norms)
-    sims  = (mat @ tarr) / (norms * tnorm)
+    sims  = (mat @ tarr_avail) / (norms * tnorm)
 
     # ── Bậc thang ngưỡng ─────────────────────────────────────────────────────
-    thresh_used = SIMILARITY_THRESHOLDS[0]
-    raw_idx     = np.array([], dtype=int)
+    # Primary: chỉ lấy mẫu sim >= 0.80 (chất lượng cao)
+    # Fallback: 0.75 → 0.70 chỉ khi không đủ min_results, kèm flag cảnh báo
+    thresh_used   = SIMILARITY_THRESHOLDS[0]
+    below_80_warn = False   # flag: phải dùng ngưỡng thấp hơn 0.80
+    raw_idx       = np.array([], dtype=int)
     for thresh in SIMILARITY_THRESHOLDS:
         cands = np.where(sims >= thresh)[0]
         if len(cands) >= min_results:
-            raw_idx = cands; thresh_used = thresh; break
-        raw_idx = cands; thresh_used = thresh
+            raw_idx     = cands
+            thresh_used = thresh
+            if thresh < 0.80:
+                below_80_warn = True
+            break
+        raw_idx     = cands
+        thresh_used = thresh
     if len(raw_idx) == 0:
-        raw_idx     = np.argsort(-sims)[:max(top_n, 3)]
-        thresh_used = float(sims[raw_idx[-1]]) if len(raw_idx) else 0.0
+        raw_idx       = np.argsort(-sims)[:max(top_n, 3)]
+        thresh_used   = float(sims[raw_idx[-1]]) if len(raw_idx) else 0.0
+        below_80_warn = True
 
     total_matches = len(raw_idx)
     search_bars   = len(search_df)
@@ -462,26 +476,37 @@ def _find_similar_inner(
             sample_regimes[idx] = 0
 
     # Sort theo thời gian -> Minimum Distance Sampling
-    pairs_time = sorted(
+    # Sort by sim DESC trước để _mds giữ sample có sim cao nhất trong mỗi cluster
+    pairs_sim_desc = sorted(
         [(str(search_df.iloc[i]["date"]), i) for i in raw_idx],
-        key=lambda x: x[0]
+        key=lambda x: -sims[x[1]]   # sim cao nhất trước
     )
 
-    def _mds(pairs, md):
-        kept = [pairs[0]]; last = pairs[0][0]
-        for d, i in pairs[1:]:
+    def _mds(pairs_by_sim, md):
+        """
+        Minimum Distance Sampling — giữ mẫu có similarity CAO NHẤT trong mỗi cluster.
+        pairs_by_sim: đã sorted by sim DESC → mẫu đầu tiên không bị loại là mẫu tốt nhất.
+        """
+        kept      = []
+        kept_dates = []
+        for d, i in pairs_by_sim:
             try:
-                if (datetime.strptime(d, "%Y-%m-%d") -
-                        datetime.strptime(last, "%Y-%m-%d")).days >= md:
-                    kept.append((d, i)); last = d
+                dt_cur = datetime.strptime(d, "%Y-%m-%d")
+                too_close = any(
+                    abs((dt_cur - datetime.strptime(ld, "%Y-%m-%d")).days) < md
+                    for ld in kept_dates
+                )
+                if not too_close:
+                    kept.append((d, i))
+                    kept_dates.append(d)
             except Exception:
                 continue
         return kept
 
     min_dist = MIN_SAMPLE_DISTANCE_DAYS
-    kept     = _mds(pairs_time, min_dist)
+    kept     = _mds(pairs_sim_desc, min_dist)
     if len(kept) < min_results:
-        kept_fb = _mds(pairs_time, MIN_SAMPLE_DISTANCE_FB)
+        kept_fb = _mds(pairs_sim_desc, MIN_SAMPLE_DISTANCE_FB)
         if len(kept_fb) >= min_results:
             kept = kept_fb; min_dist = MIN_SAMPLE_DISTANCE_FB
         else:
@@ -493,6 +518,20 @@ def _find_similar_inner(
 
     # Tính weighted_n - effective sample count sau regime weighting
     weighted_n = sum(regime_weights.get(i, 1.0) for _, i in kept_s)
+
+    # Regime breakdown — đếm số mẫu theo từng nhóm để hiển thị rõ
+    regime_breakdown = {"same": 0, "close": 0, "far": 0, "unknown": 0}
+    if regime_filter_active:
+        for _, idx in kept_s:
+            w = regime_weights.get(idx, 1.0)
+            if w >= 1.0:
+                regime_breakdown["same"]  += 1
+            elif w >= 0.5:
+                regime_breakdown["close"] += 1
+            elif w > 0:
+                regime_breakdown["far"]   += 1
+            else:
+                regime_breakdown["unknown"] += 1
 
     results = []
     for date_str, idx in kept_s:
@@ -528,10 +567,12 @@ def _find_similar_inner(
                 "search_bars":          search_bars,
                 "avg_similarity":       round(avg_sim, 4),
                 "threshold_used":       thresh_used,
+                "below_80_warn":        below_80_warn,
                 "min_distance_used":    min_dist,
                 "current_regime":       current_regime,
                 "weighted_n":           round(weighted_n, 2),
                 "regime_filter_active": regime_filter_active,
+                "regime_breakdown":     regime_breakdown,
                 "years_expanded":       False,
                 "years_used":           years,
             },
@@ -573,9 +614,10 @@ def _calc_price_journey(cache_df, from_date: str, from_close: float,
     if len(future) < 5:
         return result
 
+    # future.iloc[0] = T+1, future.iloc[29] = T+30 → dùng iloc[days-1] để lấy đúng T+days
     for days, key in [(30, "fwd_30"), (60, "fwd_60"), (90, "fwd_90")]:
-        if len(future) > days:
-            fc = float(future.iloc[days]["close"])
+        if len(future) >= days:
+            fc = float(future.iloc[days - 1]["close"])
             result[key] = round((fc - from_close) / from_close * 100, 2)
 
     closes = future.head(horizon)["close"].values.astype(float)
@@ -602,11 +644,12 @@ def _calc_price_journey(cache_df, from_date: str, from_close: float,
         result["daily_volatility"] = round(
             float(np.mean(np.abs(np.diff(closes) / closes[:-1] * 100))), 2)
 
-    # CHANGE 4: tinh so ngay hoi phuc ve hoa von sau MAE
+    # Tính số ngày hồi phục về hoà vốn sau MAE
+    # max_dd_day là 1-indexed (ngày 1 = closes[0]) → convert sang 0-indexed
     result["recovery_days"] = None
     if result["max_drawdown"] is not None and result["max_drawdown"] < 0 and result["max_dd_day"] is not None:
-        dd_idx = result["max_dd_day"]  # 1-indexed, so slice from dd_idx onward
-        post_dd = closes[dd_idx:]
+        dd_idx_0 = result["max_dd_day"] - 1   # convert 1-indexed → 0-indexed
+        post_dd  = closes[dd_idx_0 + 1:]       # slice từ ngày SAU điểm drawdown
         for k, c in enumerate(post_dd):
             if from_close > 0 and c >= from_close:
                 result["recovery_days"] = k + 1
@@ -633,8 +676,9 @@ def _calc_forward_returns(
     future = cache_df[cache_df["date"] > from_date].reset_index(drop=True)
 
     for days in FORWARD_DAYS:
-        if len(future) > days:
-            future_close = float(future.iloc[days]["close"])
+        # future.iloc[0] = T+1, future.iloc[days-1] = T+days → đúng convention
+        if len(future) >= days:
+            future_close = float(future.iloc[days - 1]["close"])
             if from_close > 0:
                 result[days] = round((future_close - from_close) / from_close * 100, 2)
             else:
@@ -902,14 +946,15 @@ def format_analog_report(
     n     = len(vf30)
 
     # ── Stats ─────────────────────────────────────────────────────────
-    wr      = len([x for x in vf30 if x > 0]) / len(vf30) if vf30 else 0.0
+    _WIN_THRESH = 1.0   # +1% tối thiểu để tính là "thắng" sau phí
+    wr      = len([x for x in vf30 if x >= _WIN_THRESH]) / len(vf30) if vf30 else 0.0
     med30   = float(np.median(vf30))      if vf30  else 0.0
     med60   = float(np.median(vf60))      if vf60  else 0.0
     med90   = float(np.median(vf90))      if vf90  else 0.0
     p75_30  = float(np.percentile(vf30, 75)) if n >= 4 else med30
     exp30   = float(np.mean(vf30))        if vf30  else 0.0
-    pos_s   = sum(x for x in vf30 if x > 0)
-    neg_s   = abs(sum(x for x in vf30 if x < 0))
+    pos_s   = sum(x for x in vf30 if x >= _WIN_THRESH)
+    neg_s   = abs(sum(x for x in vf30 if x < _WIN_THRESH))
     pf      = round(pos_s / neg_s, 2)     if neg_s > 0 else 99.0
     mae_30  = float(np.median(vmdd30))    if vmdd30 else (float(np.mean(vmdd)) if vmdd else 0.0)
     mfe_avg = float(np.mean(vmg))         if vmg   else 0.0
@@ -925,6 +970,9 @@ def format_analog_report(
     # Entry/SL/TP
     entry_price = float(current_price) if current_price and current_price > 0 else 0.0
     sl_pct   = mae_30 - 2.0
+    # Sanity check: SL phải luôn dưới entry (sl_pct âm). Nếu MAE = 0, dùng -2% mặc định.
+    if sl_pct >= 0:
+        sl_pct = -2.0
     sl_price = entry_price * (1 + sl_pct / 100)  if entry_price else 0.0
     tp1_price= entry_price * (1 + med30 / 100)   if entry_price else 0.0
     tp2_price= entry_price * (1 + p75_30 / 100)  if entry_price else 0.0

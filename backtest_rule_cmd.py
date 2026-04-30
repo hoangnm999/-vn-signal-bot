@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 BACKTEST_RULE_COOLDOWN = 120   # 2 phút per user
 _last_backtest_rule: dict[str, float] = {}
+# Đếm số lần run per (user, symbol) để cảnh báo overfitting
+_backtest_run_count: dict[str, int] = {}   # key = f"{user_id}:{symbol}"
+OVERFIT_WARN_THRESHOLD = 3   # cảnh báo sau 3 lần run cùng symbol
 
 # ── Helpers tái sử dụng từ bot.py (import lúc runtime để tránh circular) ──────
 def _plain(text: str) -> str:
@@ -185,7 +188,12 @@ def _calc_trade_analytics(trades: list, df) -> dict:
         if i0 is None or i1 is None or i1 <= i0:
             continue
         holds.append(i1 - i0)
-        win = df_r.iloc[i0:i1+1]
+        # MAE/MFE: chỉ tính trong holding period (bar SAU entry đến TRƯỚC bar exit)
+        # Không bao gồm bar entry (giá đã biết lúc mua) và bar exit (đã thoát)
+        win = df_r.iloc[i0 + 1: i1]
+        if len(win) == 0:
+            # Trade mở và đóng trong 1-2 bars — không đủ data cho MAE/MFE
+            continue
         if "low" in win.columns and "high" in win.columns:
             lows  = win["low"].values.astype(float)
             highs = win["high"].values.astype(float)
@@ -463,7 +471,15 @@ def _run_rule_backtest_sync(
         }
 
     # 2. Parse & compile rules → signals
-    signals, entry_ec, exit_ec, ctx = generate_rule_signals(df, entry_rule, exit_rule)
+    # Wrap riêng để ParseError cho message rõ ràng hơn là generic exception
+    try:
+        signals, entry_ec, exit_ec, ctx = generate_rule_signals(df, entry_rule, exit_rule)
+    except Exception as pe:
+        return {
+            "status": "error",
+            "error":  f"Loi parse/compile rule: {str(pe)[:200]}\n"
+                      f"ENTRY: {entry_rule[:80]}\nEXIT: {exit_rule[:80]}"
+        }
 
     n_buy  = int((signals == 1).sum())
     n_sell = int((signals == -1).sum())
@@ -725,7 +741,8 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
                 from vn_loader import load_vn_ohlcv
                 _df_price = load_vn_ohlcv(symbol, days=5, min_bars=1)
                 if _df_price is not None and len(_df_price) > 0:
-                    _current_price = float(_df_price["close"].iloc[-1]) * 1000
+                    # Lưu theo nghìn đồng — nhất quán với analogs["close"] từ cache
+                    _current_price = float(_df_price["close"].iloc[-1])
             except Exception as _pe:
                 logger.warning(f"backtest_rule: lay gia hien tai {symbol} fail: {_pe}")
             # format_analog_report đã có header riêng — không cần wrapper
@@ -841,6 +858,19 @@ async def backtest_rule_cmd(update, context):
         await update.message.reply_text(f"Vui long cho {wait}s truoc khi /backtest_rule tiep."); return
     _last_backtest_rule[user_id] = time.time()
 
+    # Đếm số lần run để cảnh báo overfitting
+    symbol_for_count = (args[0].upper() if args else "?")
+    run_key  = f"{user_id}:{symbol_for_count}"
+    run_count = _backtest_run_count.get(run_key, 0) + 1
+    _backtest_run_count[run_key] = run_count
+    overfit_warning = ""
+    if run_count >= OVERFIT_WARN_THRESHOLD:
+        overfit_warning = (
+            f"⚠️ Ban da chay backtest {run_count} lan cho {symbol_for_count}.\n"
+            f"   Ket qua co the bi overfit neu ban dang tune rule de maximize performance.\n"
+            f"   Hay test rule tren du lieu chua tung xem truoc khi su dung that.\n"
+        )
+
     chat_id = update.effective_chat.id
 
     # Gửi loading message
@@ -913,6 +943,13 @@ async def backtest_rule_cmd(update, context):
                 chat_id=chat_id, message_id=msg.message_id,
                 text=plain(summary)[:4096],
             )
+
+            # Gửi overfit warning nếu user đã run nhiều lần
+            if overfit_warning:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=plain(overfit_warning)[:500],
+                )
 
             # Gửi chart
             chart_path = result.get("chart_path", "")

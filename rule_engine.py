@@ -293,15 +293,17 @@ def build_indicator_context(df: pd.DataFrame) -> dict:
         "volume_sma20":  _sma(volume, 20),
         "volume_sma":    _sma(volume, 20),
 
-        # Rolling high/low (breakout)
-        "high5":   high.rolling(5).max(),
-        "high10":  high.rolling(10).max(),
-        "high20":  high.rolling(20).max(),
-        "high52":  high.rolling(52).max(),
-        "low5":    low.rolling(5).min(),
-        "low10":   low.rolling(10).min(),
-        "low20":   low.rolling(20).min(),
-        "low52":   low.rolling(52).min(),
+        # Rolling high/low (breakout) — dùng .shift(1) để không bao gồm ngày hôm nay
+        # Không shift → high20[T] bao gồm high[T] → close > high20 gần như không trigger
+        # khi giá đóng cửa ở đỉnh ngày (close = high), vì high20[T] >= high[T] = close[T]
+        "high5":   high.rolling(5).max().shift(1),
+        "high10":  high.rolling(10).max().shift(1),
+        "high20":  high.rolling(20).max().shift(1),
+        "high52":  high.rolling(52).max().shift(1),
+        "low5":    low.rolling(5).min().shift(1),
+        "low10":   low.rolling(10).min().shift(1),
+        "low20":   low.rolling(20).min().shift(1),
+        "low52":   low.rolling(52).min().shift(1),
 
         # Stochastic
         "stoch_k":  _stoch_k(df, 14),

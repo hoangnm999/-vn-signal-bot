@@ -32,6 +32,15 @@ ANALOG_COOLDOWN = 60   # giây giữa 2 lần gọi per user
 _last_analog: dict[str, float] = {}
 
 
+def _regime_neighbor_label(cur_regime: int) -> str:
+    """Trả về tên regime 'gần' (cùng Bull hoặc cùng Bear) để hiển thị trong breakdown."""
+    if cur_regime == 1: return "R2 Bull Vol"
+    if cur_regime == 2: return "R1 Bull Quiet"
+    if cur_regime == 3: return "R4 Bear Vol"
+    if cur_regime == 4: return "R3 Bear Quiet"
+    return "regime gan"
+
+
 def _plain(text: str) -> str:
     import re
     text = re.sub(r"[*`]", "", text)
@@ -80,15 +89,17 @@ def _format_analog_result(
 
     # Meta từ _meta của analog đầu tiên
     meta = analogs[0].get("_meta", {}) if analogs else {}
-    threshold  = meta.get("threshold_used", 0)
-    sim_avg    = meta.get("avg_similarity", 0)
-    total_raw  = meta.get("total_matches", 0)
-    ind_n      = meta.get("independent_n", n)
-    yr_used    = meta.get("years_used", 5)
-    yr_exp     = meta.get("years_expanded", False)
-    cur_regime = meta.get("current_regime", 0)
-    regime_names = {1: "R1 Bull Quiet", 2: "R2 Bull Volatile",
-                    3: "R3 Bear Quiet",  4: "R4 Bear Volatile"}
+    threshold     = meta.get("threshold_used", 0)
+    below_80_warn = meta.get("below_80_warn", False)
+    sim_avg       = meta.get("avg_similarity", 0)
+    total_raw     = meta.get("total_matches", 0)
+    ind_n         = meta.get("independent_n", n)
+    yr_used       = meta.get("years_used", 5)
+    yr_exp        = meta.get("years_expanded", False)
+    cur_regime    = meta.get("current_regime", 0)
+    breakdown     = meta.get("regime_breakdown", {})
+    regime_names  = {1: "R1 Bull Quiet", 2: "R2 Bull Volatile",
+                     3: "R3 Bear Quiet",  4: "R4 Bear Volatile"}
 
     # ── Header ────────────────────────────────────────────────────────────────
     sep = "═" * 32
@@ -111,16 +122,33 @@ def _format_analog_result(
         lines.append("Ket qua can than hon — mau tu nhieu regime khac nhau")
     elif regime_on:
         r_name = regime_names.get(cur_regime, f"R{cur_regime}")
-        match_str = f" | Khop: {match_pct:.0%}" if match_pct is not None else ""
-        lines.append(
-            f"Regime: {r_name} | Weighted N: {weighted_n:.1f}{match_str}"
-        )
+        # Hiển thị breakdown: cùng / gần / xa regime
+        same_n  = breakdown.get("same",  0)
+        close_n = breakdown.get("close", 0)
+        far_n   = breakdown.get("far",   0)
+        if same_n + close_n + far_n > 0:
+            lines.append(
+                f"Regime: {r_name} | Weighted N: {weighted_n:.1f}"
+            )
+            lines.append(
+                f"  Cung regime: {same_n} mau [w=1.0]  "
+                f"Gan ({_regime_neighbor_label(cur_regime)}): {close_n} mau [w=0.5]  "
+                f"Xa: {far_n} mau [w=0.15]"
+            )
+        else:
+            lines.append(f"Regime: {r_name} | Weighted N: {weighted_n:.1f}")
         if abs(wr_raw - wr) > 0.03:
             lines.append(
                 f"WR co trong so: {wr:.0%}  (raw: {wr_raw:.0%})"
             )
     else:
         lines.append("Regime filter: OFF")
+
+    # Cảnh báo ngưỡng similarity thấp
+    if below_80_warn:
+        lines.append(
+            f"⚠️  Do tuong dong thap ({threshold:.0%} < 80%) — mau co the it lien quan"
+        )
 
     lines.append(sep)
 
@@ -147,17 +175,14 @@ def _format_analog_result(
         lines.append(f"P25: {p25:+.1f}%  |  P75: {p75:+.1f}%")
 
     # ── Ke hoach hanh dong ────────────────────────────────────────────────────
-    # SL dùng median_mdd (median max drawdown của các mẫu) thay vì mae_avg
-    # vì mae_avg là max drawdown trong toàn hành trình — quá rộng cho SL thực tế
-    # median_mdd phản ánh drawdown điển hình trước khi giá phục hồi
-    sl_from_mdd = med_mdd - 1.0   # median MDD + buffer 1%
-    # Nếu median_mdd quá nhỏ (gần 0) → fallback sang mae_avg / 2
-    if sl_from_mdd > -2.0 and mae_avg < -2.0:
-        sl_from_mdd = mae_avg / 2.0
+    # SL = median MAE 30D - 2% buffer (nhất quán với format_analog_report)
+    # med_mdd là số âm (ví dụ -6%) → sl_pct = -8%
+    sl_pct = med_mdd - 2.0
+    if sl_pct >= 0:
+        sl_pct = -2.0   # sanity check: SL phải luôn dưới entry
 
-    if close_px and sl_from_mdd < 0 and mfe_avg:
+    if close_px and sl_pct < 0 and mfe_avg:
         lines.append("─" * 32)
-        sl_pct  = sl_from_mdd
         tp1_pct = med_ret
         tp2_pct = mfe_avg * 0.7   # 70% MFE làm TP2
 
@@ -308,11 +333,13 @@ def _run_analog_sync(symbol: str, use_regime: bool = True) -> dict:
         analogs, stats, message (nếu error/warn)
     """
     # ── 1. Load state vector ──────────────────────────────────────────────────
+    # Thứ tự: auto_context → DB → compute trực tiếp
+    # Nhất quán với batch_scanner._scan_one_symbol để kết quả /analog và /scan giống nhau
     state_vec  = None
     close_px   = 0.0
     sv_source  = "none"
 
-    # 1a. auto_context (cùng logic với backtest_rule)
+    # 1a. auto_context
     try:
         from auto_context import load_auto_context
         ctx = load_auto_context(symbol)
@@ -322,20 +349,7 @@ def _run_analog_sync(symbol: str, use_regime: bool = True) -> dict:
     except Exception as e:
         logger.debug(f"analog auto_context fail: {e}")
 
-    # 1b. Fallback: compute trực tiếp từ OHLCV
-    if state_vec is None:
-        try:
-            from vn_loader import load_vn_ohlcv
-            from state_vector import compute_state_vector_from_df
-            df = load_vn_ohlcv(symbol, days=120, min_bars=60)
-            if df is not None and len(df) >= 60:
-                state_vec = compute_state_vector_from_df(df)
-                sv_source = "computed"
-                close_px  = float(df["close"].iloc[-1]) * 1000   # vn_loader unit: nghìn đồng
-        except Exception as e:
-            logger.debug(f"analog compute sv fail: {e}")
-
-    # 1c. Fallback: DB
+    # 1b. DB query trực tiếp (trước compute để ưu tiên vector đã được lưu)
     if state_vec is None:
         try:
             import json as _json
@@ -362,6 +376,19 @@ def _run_analog_sync(symbol: str, use_regime: bool = True) -> dict:
             conn.close()
         except Exception as e:
             logger.debug(f"analog db sv fail: {e}")
+
+    # 1c. Fallback cuối: compute trực tiếp từ OHLCV (luôn là vector mới nhất)
+    if state_vec is None:
+        try:
+            from vn_loader import load_vn_ohlcv
+            from state_vector import compute_state_vector_from_df
+            df = load_vn_ohlcv(symbol, days=120, min_bars=60)
+            if df is not None and len(df) >= 60:
+                state_vec = compute_state_vector_from_df(df)
+                sv_source = "computed"
+                close_px  = float(df["close"].iloc[-1]) * 1000   # nghìn đồng → đồng
+        except Exception as e:
+            logger.debug(f"analog compute sv fail: {e}")
 
     if state_vec is None:
         return {

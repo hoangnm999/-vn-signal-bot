@@ -116,9 +116,11 @@ def compute_base_stats(analogs: list) -> dict:
     if n == 0:
         return {"valid": False, "n": 0}
 
+    WIN_THRESHOLD = 1.0   # +1% tối thiểu để tính là "thắng" sau phí giao dịch
+
     median_ret = float(np.median(f30s))
     std_ret    = float(np.std(f30s, ddof=1)) if n > 1 else 0.0
-    win_rate   = sum(1 for x in f30s if x > 0) / n
+    win_rate   = sum(1 for x in f30s if x >= WIN_THRESHOLD) / n
     median_mdd = float(np.median(mdds)) if mdds else 0.0
 
     # ── Regime-weighted statistics ────────────────────────────────────────────
@@ -133,7 +135,7 @@ def compute_base_stats(analogs: list) -> dict:
             w for a, w in zip(
                 [a for a in analogs if a.get("fwd_30") is not None],
                 weights
-            ) if a.get("fwd_30", 0) > 0
+            ) if a.get("fwd_30", 0) >= WIN_THRESHOLD
         )
         win_rate_weighted = weighted_win_sum / total_w
 
@@ -189,7 +191,7 @@ def compute_base_stats(analogs: list) -> dict:
         "regime_filter_active": regime_filter_active,
         "regime_match_pct":   round(regime_match_pct, 2) if regime_match_pct is not None else None,
         "return_vol_ratio":   round(return_vol_ratio, 3),
-        "median_mdd":         round(median_mdd, 2),
+        "median_mdd_30d":     round(median_mdd, 2),
         "expectancy":         expectancy,                  # weighted expectancy
         "profit_factor":      profit_factor,
         "p25_ret":            round(p25, 2) if p25 is not None else None,
@@ -321,7 +323,7 @@ def compute_reference_score(
     expectancy  = stats.get("expectancy", median_ret)  # fallback median_ret nếu chưa có
     pf          = stats.get("profit_factor", 99.0)     # fallback 99 nếu chưa có (no loss = good)
     rvr         = stats.get("return_vol_ratio", 0.0)
-    median_mdd  = stats["median_mdd"]
+    median_mdd  = stats.get("median_mdd_30d", stats.get("median_mdd", 0))  # backward compat
     penalties   = []
     risk_tier   = "NORMAL"
 
@@ -392,7 +394,7 @@ def compute_reference_score(
     z_exp = _z("expectancy",        expectancy)
     z_pf  = _z("profit_factor",     pf)
     z_rvr = _z("return_vol_ratio",  rvr)
-    z_mdd = _z("median_mdd",        median_mdd, invert=True)
+    z_mdd = _z("median_mdd_30d",    median_mdd, invert=True)
 
     # ══════════════════════════════════════════════════════════════════
     # FORMULA MỚI — Expectancy + PF làm chủ đạo
@@ -496,7 +498,7 @@ def format_symbol_entry(
     """Format một mã trong output top 5."""
     win_rate   = stats["win_rate"]
     median_ret = stats["median_ret"]
-    median_mdd = stats["median_mdd"]
+    median_mdd = stats.get("median_mdd_30d", stats.get("median_mdd", 0))  # backward compat
     rvr        = stats.get("return_vol_ratio", 0)
     expectancy = stats.get("expectancy", 0)
     pf         = stats.get("profit_factor", 0)

@@ -57,6 +57,11 @@ MIN_BARS_REQUIRED    = 60         # tối thiểu để tính regime
 # Vùng (-0.0005, +0.0005) → Neutral (chỉ dùng trong 3-regime, không dùng ở 4-regime)
 TREND_BULL_THRESH    = +0.0005    # slope > này → Bull
 TREND_BEAR_THRESH    = -0.0005    # slope < này → Bear
+# Hysteresis: yêu cầu slope vượt ngưỡng thêm HYSTERESIS_FACTOR để confirm Bull/Bear
+# Tránh flip liên tục khi slope dao động quanh threshold
+# VD: HYSTERESIS_FACTOR=0.3 → Bull cần slope > 0.0005 × 1.3 = 0.00065 để confirm
+#     Bear cần slope < -0.00065; vùng (-0.00065, +0.00065) = "neutral" → giữ nguyên regime
+TREND_HYSTERESIS_FACTOR = 0.30   # 30% buffer quanh threshold
 
 # ── Regime definitions ────────────────────────────────────────────────────────
 REGIME_LABELS = {
@@ -201,27 +206,42 @@ def _classify_regime(
     trend_slope: float,
     current_vol: float,
     vol_median:  float,
+    prev_regime: int = 0,   # regime kỳ trước để áp dụng hysteresis (0 = không có)
 ) -> int:
     """
     Phân loại regime dựa trên trend và volatility.
 
     Logic:
-      Bull = trend_slope > TREND_BULL_THRESH
-      Bear = trend_slope < TREND_BEAR_THRESH
-      Neutral (slope giữa 2 threshold) → gán theo momentum gần nhất
-        (tức là giữ regime Bull/Bear, không có R_Neutral ở 4-regime model)
+      Bull CONFIRM = trend_slope > TREND_BULL_THRESH × (1 + HYSTERESIS_FACTOR)
+      Bear CONFIRM = trend_slope < TREND_BEAR_THRESH × (1 + HYSTERESIS_FACTOR)
+      Neutral zone: nếu đang Bull → cần slope < Bear_confirm để đổi sang Bear (và ngược lại)
+      → Tránh flip liên tục khi slope dao động quanh threshold
 
       Quiet    = current_vol <= vol_median
       Volatile = current_vol > vol_median
 
     Returns: 1, 2, 3, hoặc 4
     """
-    is_bull    = trend_slope >= TREND_BULL_THRESH
-    is_bear    = trend_slope <= TREND_BEAR_THRESH
-    is_quiet   = current_vol <= vol_median
+    bull_confirm = TREND_BULL_THRESH * (1 + TREND_HYSTERESIS_FACTOR)  # +0.000650
+    bear_confirm = TREND_BEAR_THRESH * (1 + TREND_HYSTERESIS_FACTOR)  # -0.000650
 
-    # Vùng neutral: gán Bear (conservative) khi không rõ ràng
-    if not is_bull and not is_bear:
+    is_quiet = current_vol <= vol_median
+
+    # Xác định Bull/Bear với hysteresis
+    if prev_regime in (1, 2):
+        # Đang Bull → cần slope xuống dưới bear_confirm mới đổi Bear
+        is_bull = trend_slope > bear_confirm
+    elif prev_regime in (3, 4):
+        # Đang Bear → cần slope lên trên bull_confirm mới đổi Bull
+        is_bull = trend_slope >= bull_confirm
+    else:
+        # Không có prev_regime → dùng threshold thường (lần đầu tiên)
+        is_bull = trend_slope >= TREND_BULL_THRESH
+
+    # Fallback: nếu slope mạnh rõ ràng, bỏ qua hysteresis
+    if trend_slope >= bull_confirm:
+        is_bull = True
+    elif trend_slope <= bear_confirm:
         is_bull = False
 
     if is_bull and is_quiet:     return 1   # Bull Quiet
@@ -258,6 +278,11 @@ def compute_regime(df: pd.DataFrame) -> dict:
 
     trend_slope = _compute_trend_slope(close)
     current_vol = _compute_realized_vol(close)
+    # vol_median: median của 252 vol values gần nhất (rolling 252 ngày)
+    # NHẤT QUÁN với _compute_regime_history() khi i=n-1:
+    #   _compute_vol_history(close[:n]) = _compute_vol_history(close) → cùng kết quả
+    # File gốc bị inconsistent: history dùng global median (toàn bộ 600 ngày)
+    # trong khi compute_regime dùng 252 ngày cuối → đã fix ở _compute_regime_history
     vol_history = _compute_vol_history(close)
     vol_median  = float(np.median(vol_history)) if len(vol_history) > 0 else current_vol
 
@@ -299,21 +324,25 @@ def _compute_regime_history(
     Tính regime cho mỗi ngày trong `days` ngày gần nhất.
     Dùng rolling window — mỗi ngày chỉ dùng data đến ngày đó (no lookahead).
 
+    FIX: vol_median tính rolling tại mỗi ngày i thay vì dùng global median
+    (global median có subtle lookahead vì dùng data tương lai của ngày i).
+
     Returns list of dicts sorted chronologically.
     """
     n       = len(close)
     results = []
     min_idx = max(TREND_WINDOW + 20 + 1, n - days)
 
-    # Tính vol_median một lần dùng toàn bộ lịch sử (không lookahead về vol threshold)
-    vol_history_all = _compute_vol_history(close)
-    vol_median_global = float(np.median(vol_history_all)) if len(vol_history_all) > 0 else 0.20
-
     for i in range(min_idx, n):
         close_slice = close[:i + 1]
         trend  = _compute_trend_slope(close_slice)
         vol    = _compute_realized_vol(close_slice)
-        regime = _classify_regime(trend, vol, vol_median_global)
+        # Rolling vol_median: chỉ dùng data đến ngày i → không lookahead
+        vol_history_i  = _compute_vol_history(close_slice)
+        vol_median_i   = float(np.median(vol_history_i)) if len(vol_history_i) > 0 else vol
+        # Hysteresis: truyền regime của ngày trước để tránh flip liên tục
+        prev_r = results[-1]["regime"] if results else 0
+        regime = _classify_regime(trend, vol, vol_median_i, prev_regime=prev_r)
 
         try:
             date_str = dates[i].strftime("%Y-%m-%d") if hasattr(dates[i], 'strftime') else str(i)
@@ -341,8 +370,14 @@ def _load_regime_cache() -> Optional[dict]:
     try:
         with open(REGIME_CACHE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        built = datetime.fromisoformat(data.get("built_at", "2000-01-01"))
-        age_hours = (datetime.now() - built).total_seconds() / 3600
+        built_str = data.get("built_at", "2000-01-01")
+        built = datetime.fromisoformat(built_str)
+        # Dùng UTC để tránh vấn đề DST / server timezone thay đổi
+        now = datetime.utcnow()
+        if built.tzinfo is not None:
+            from datetime import timezone as _tz
+            now = datetime.now(_tz.utc).replace(tzinfo=None)
+        age_hours = (now - built.replace(tzinfo=None)).total_seconds() / 3600
         if age_hours > CACHE_MAX_AGE_HOURS:
             logger.info(f"Regime cache: {age_hours:.1f}h → rebuild")
             return None
@@ -721,8 +756,14 @@ def apply_regime_weight(
     r          = regime_data.get("regime", 3)
     label      = REGIME_LABELS[r].split("—")[1].strip()
 
-    adj_up   = round(min(1.0, score_up   * w_bull), 3)
-    adj_down = round(min(1.0, score_down * w_bear), 3)
+    # Áp dụng weight — normalize relative thay vì hard clip tại 1.0
+    # Hard clip mất phân biệt: score 0.8 và 0.9 đều → 1.0 trong R4 (bear×1.4)
+    # Normalize: scale cả 2 scores để max không vượt 1.0, giữ tỷ lệ tương đối
+    raw_up   = score_up   * w_bull
+    raw_down = score_down * w_bear
+    scale    = max(raw_up, raw_down, 1.0)   # nếu cả 2 < 1.0 thì không scale xuống
+    adj_up   = round(raw_up   / scale, 3)
+    adj_down = round(raw_down / scale, 3)
 
     note_up   = f"×{w_bull:.2f} (R{r} {label})"
     note_down = f"×{w_bear:.2f} (R{r} {label})"

@@ -23,8 +23,10 @@ Guard Rails:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import pathlib
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta, timezone
@@ -35,11 +37,56 @@ logger = logging.getLogger(__name__)
 # ── Constants ────────────────────────────────────────────────────────────────
 SCAN_TIMEOUT_SECS  = 1800   # 30 phút — đủ cho ~50 mã / 3 workers (~60s/mã)
 MAX_WORKERS        = 3      # parallel workers
-CRON_HOUR          = 8      # 8:00 AM
+CRON_HOUR          = 1      # 01:00 UTC = 08:00 VN (trước giờ mở cửa HOSE 9:00 VN)
 CRON_MINUTE        = 0
 COOLDOWN_SECS      = 300    # 5 phút giữa 2 lần scan thủ công
 
 _last_scan_time: float = 0.0
+
+# ── HOSE Listing Cache ───────────────────────────────────────────────────────
+_DATA_DIR              = pathlib.Path("data")
+_HOSE_LISTING_CACHE    = _DATA_DIR / "hose_listing.json"
+_HOSE_LISTING_TTL_SECS = 24 * 3600   # 24h — listing thay đổi rất ít
+
+
+def _load_hose_listing_cache() -> list[str] | None:
+    """Load cached HOSE listing nếu còn mới (< 24h)."""
+    try:
+        if not _HOSE_LISTING_CACHE.exists():
+            return None
+        age = time.time() - _HOSE_LISTING_CACHE.stat().st_mtime
+        if age > _HOSE_LISTING_TTL_SECS:
+            return None
+        data = json.loads(_HOSE_LISTING_CACHE.read_text(encoding="utf-8"))
+        if isinstance(data, list) and len(data) > 100:
+            logger.info(f"[HoseCache] Listing cache hit: {len(data)} symbols ({age/3600:.1f}h old)")
+            return data
+    except Exception as e:
+        logger.debug(f"[HoseCache] Load fail: {e}")
+    return None
+
+
+def _save_hose_listing_cache(symbols: list[str]):
+    """Lưu HOSE listing vào cache."""
+    try:
+        _DATA_DIR.mkdir(exist_ok=True)
+        _HOSE_LISTING_CACHE.write_text(
+            json.dumps(symbols, ensure_ascii=False), encoding="utf-8"
+        )
+        logger.info(f"[HoseCache] Saved {len(symbols)} symbols")
+    except Exception as e:
+        logger.debug(f"[HoseCache] Save fail: {e}")
+
+
+def _is_warrant(symbol: str) -> bool:
+    """
+    Filter chứng quyền VN.
+    Chứng quyền thường có pattern: bắt đầu bằng 'C', độ dài > 3, có số ở cuối.
+    VD: CACB2101, CMBB2201, CVNM2301
+    """
+    return (len(symbol) > 3 and
+            symbol[0] == 'C' and
+            symbol[-1].isdigit())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -95,27 +142,44 @@ def build_hose_watchlist(
     # ── Bước 1: Lấy danh sách mã HOSE ────────────────────────────────────────
     all_symbols: list[str] = []
     _progress("Buoc 1/3: Lay danh sach ma HOSE tu vnstock...")
-    try:
-        from vnstock import Vnstock
-        listing = Vnstock().stock(symbol="VCB", source="VCI").listing.symbols_by_exchange()
-        hose_df = listing[listing["exchange"].str.upper() == "HOSE"]
-        all_symbols = hose_df["symbol"].str.upper().tolist()
-        _progress(f"Buoc 1/3: Got {len(all_symbols)} ma HOSE (VCI)")
-    except Exception as e:
-        logger.warning(f"[HoseWatchlist] VCI listing fail: {e}, trying KBS...")
+
+    # Thử load từ cache trước (tránh gọi API mỗi lần)
+    cached_listing = _load_hose_listing_cache()
+    if cached_listing:
+        all_symbols = cached_listing
+        _progress(f"Buoc 1/3: Got {len(all_symbols)} ma HOSE (cache)")
+    else:
         try:
             from vnstock import Vnstock
-            listing = Vnstock().stock(symbol="VCB", source="KBS").listing.symbols_by_exchange()
+            listing = Vnstock().stock(symbol="VCB", source="VCI").listing.symbols_by_exchange()
             hose_df = listing[listing["exchange"].str.upper() == "HOSE"]
             all_symbols = hose_df["symbol"].str.upper().tolist()
-            _progress(f"Buoc 1/3: Got {len(all_symbols)} ma HOSE (KBS fallback)")
-        except Exception as e2:
-            logger.error(f"[HoseWatchlist] All listing sources fail: {e2}")
-            return []
+            _progress(f"Buoc 1/3: Got {len(all_symbols)} ma HOSE (VCI)")
+        except Exception as e:
+            logger.warning(f"[HoseWatchlist] VCI listing fail: {e}, trying KBS...")
+            try:
+                from vnstock import Vnstock
+                listing = Vnstock().stock(symbol="VCB", source="KBS").listing.symbols_by_exchange()
+                hose_df = listing[listing["exchange"].str.upper() == "HOSE"]
+                all_symbols = hose_df["symbol"].str.upper().tolist()
+                _progress(f"Buoc 1/3: Got {len(all_symbols)} ma HOSE (KBS fallback)")
+            except Exception as e2:
+                logger.error(f"[HoseWatchlist] All listing sources fail: {e2}")
+                return []
+
+        # Lưu cache nếu lấy được listing mới
+        if all_symbols:
+            _save_hose_listing_cache(all_symbols)
 
     if not all_symbols:
         logger.error("[HoseWatchlist] Empty symbol list")
         return []
+
+    # Filter chứng quyền explicit (mặc dù vol filter thường loại, không guaranteed)
+    n_before = len(all_symbols)
+    all_symbols = [s for s in all_symbols if not _is_warrant(s)]
+    if len(all_symbols) < n_before:
+        logger.info(f"[HoseWatchlist] Filtered {n_before - len(all_symbols)} warrants")
 
     total = len(all_symbols)
 
@@ -146,6 +210,11 @@ def build_hose_watchlist(
 
     _progress(f"Buoc 2/3: Kiem tra thanh khoan {total} ma ({days} phien cuoi, min={min_vol_billion}ty)...")
 
+    # Rate limiting nhẹ: vnstock Community 60 req/phút → sleep 1s mỗi 50 mã (~50 req/phút)
+    # Tránh hit limit gây SystemExit làm mất kết quả giữa chừng
+    _RATE_LIMIT_SLEEP  = 1.0   # giây
+    _RATE_LIMIT_EVERY  = 50    # sleep sau mỗi N mã
+
     try:
         for i, sym in enumerate(all_symbols, 1):
             vol = _check_vol(sym)
@@ -156,6 +225,9 @@ def build_hose_watchlist(
                     f"Buoc 2/3: {i}/{total} ma "
                     f"({len(vol_map)} dat nguong {min_vol_billion}ty)"
                 )
+            # Throttle nhẹ để tránh rate limit
+            if i % _RATE_LIMIT_EVERY == 0:
+                time.sleep(_RATE_LIMIT_SLEEP)
     except SystemExit:
         logger.warning(f"[HoseWatchlist] SystemExit trong vol loop sau {len(vol_map)} ma — dung lai, dung ket qua tam")
     except BaseException as e:
@@ -206,14 +278,14 @@ def _scan_one_symbol(symbol: str, current_regime: int = 0) -> dict:
             if df is not None and len(df) >= 20:
                 close_arr  = df["close"].values[-20:]
                 vol_arr    = df["volume"].values[-20:]
-                # close tu vn_loader don vi NGHIN DONG (VD: 41.9 = 41,900d)
-                # → nhan them 1000 de doi ra dong truoc khi tinh thanh tien
+                # close từ vn_loader đơn vị NGHÌN ĐỒNG (VD: 41.9 = 41,900đ)
                 avg_vol_vnd = float((vol_arr * close_arr).mean()) * 1000
                 volume_avg_bill = round(avg_vol_vnd / 1e9, 2)
-                # current_price nhan 1000 → don vi dong (dung cho ke hoach hanh dong)
-                current_price   = float(df["close"].iloc[-1]) * 1000
+                # Lưu current_price theo NGHÌN ĐỒNG — nhất quán với analogs["close"] từ cache
+                # KHÔNG nhân 1000 để tránh lệch đơn vị khi gán vào analogs
+                current_price   = float(df["close"].iloc[-1])   # nghìn đồng
                 logger.info(f"[{symbol}] volume_avg_bill={volume_avg_bill:.2f}ty "
-                            f"current_price={current_price:.1f}k")
+                            f"current_price={current_price:.1f}k (nghin dong)")
         except Exception as _ve:
             logger.debug(f"[{symbol}] volume load fail: {_ve}")
 
@@ -278,11 +350,12 @@ def _scan_one_symbol(symbol: str, current_regime: int = 0) -> dict:
             logger.warning(f"[{symbol}] cache check fail: {_ce}")
 
         # ── 5. Load state vector ─────────────────────────────────────────
-        # Ưu tiên: load_auto_context (hàm chính thống) → DB query → compute trực tiếp
+        # Thứ tự: auto_context → DB → compute trực tiếp
+        # Đặc biệt: nếu vector từ DB cũ > MAX_CHECK_AGE_HOURS, override bằng compute mới
         state_vec = None
         sv_source = "none"
 
-        # 5a. Thử load_auto_context — dùng cùng logic với backtest_rule
+        # 5a. Thử load_auto_context
         try:
             from auto_context import load_auto_context
             ctx = load_auto_context(symbol)
@@ -293,7 +366,7 @@ def _scan_one_symbol(symbol: str, current_regime: int = 0) -> dict:
         except Exception as _ace:
             logger.debug(f"[{symbol}] auto_context fail: {_ace}")
 
-        # 5b. Fallback: query DB trực tiếp (thử nhiều column names)
+        # 5b. Fallback: query DB trực tiếp
         if state_vec is None:
             try:
                 import json as _json
@@ -334,6 +407,24 @@ def _scan_one_symbol(symbol: str, current_regime: int = 0) -> dict:
                     logger.info(f"[{symbol}] state_vec computed directly")
             except Exception as _fbe:
                 logger.warning(f"[{symbol}] compute state_vec fail: {_fbe}")
+
+        # 5d. Nếu vector từ auto_context/DB cũ hơn MAX_CHECK_AGE_HOURS
+        # → override bằng compute trực tiếp (vector mới nhất) để tránh dùng data lỗi thời
+        from guardrails import MAX_CHECK_AGE_HOURS as _MAX_AGE
+        if state_vec is not None and sv_source in ("auto_context", "db.state_vector",
+                                                     "db.state_vec", "db.vector_json"):
+            if (check_age_hours or 0) > _MAX_AGE:
+                try:
+                    from state_vector import compute_state_vector_from_df
+                    from vn_loader import load_vn_ohlcv
+                    df_sv_fresh = load_vn_ohlcv(symbol, days=120, min_bars=60)
+                    sv_fresh    = compute_state_vector_from_df(df_sv_fresh) if df_sv_fresh is not None else None
+                    if sv_fresh is not None:
+                        state_vec = sv_fresh
+                        sv_source = "computed_fresh"
+                        logger.info(f"[{symbol}] state_vec refreshed (DB was {check_age_hours:.0f}h old)")
+                except Exception as _re:
+                    logger.debug(f"[{symbol}] refresh state_vec fail: {_re}")  # giữ vector cũ
 
         if state_vec is None:
             reason = f"Không lấy được state vector (tried: auto_context, db, compute)"
@@ -629,6 +720,23 @@ def run_batch_scan(
 DUAL_SCAN_MIN_RAW_N = 3   # trader muốn thấy mọi mã có >=3 mẫu raw
 
 
+def _get_rr(r: dict) -> float:
+    """
+    Risk/Reward ratio = Exp / |MAE30|.
+    - MAE = 0 và Exp > 0 → RR = 99 (no-drawdown case, rất tốt)
+    - Exp <= 0 → RR = 0 (không có edge)
+    Dùng chung cho cả Bảng A (weighted) và Bảng B (raw).
+    """
+    s   = r.get("stats", {})
+    exp = s.get("expectancy", 0)
+    mae = s.get("median_mdd_30d", s.get("median_mdd", 0))
+    if exp <= 0:
+        return 0.0
+    if mae >= 0:
+        return 99.0  # không có drawdown = best case
+    return round(exp / abs(mae), 2)
+
+
 def run_dual_scan(
     symbols:    list[str],
     progress_cb = None,
@@ -684,28 +792,48 @@ def run_dual_scan(
 
     def _run_a():
         try:
-            # Scan A: dùng regime filter ON — truyền current_regime trực tiếp
-            # để không pre-load lại VNINDEX
             result_a.update(_run_batch_scan_internal(
                 symbols        = symbols,
                 current_regime = current_regime,
                 progress_cb    = _progress_a,
             ))
         except Exception as e:
-            logger.error(f"[DualScan-ON] error: {e}")
+            import traceback
+            logger.error(f"[DualScan-ON] Exception: {e}\n{traceback.format_exc()}")
             err_a.append(str(e))
+            # Partial result: đảm bảo result_a có đủ keys để format không crash
+            if not result_a:
+                result_a.update({"ranked": [], "excluded": [], "rejected": [],
+                                  "errors": [f"Scan A crashed: {e}"], "partial": True})
+        except BaseException as e:
+            import traceback
+            logger.error(f"[DualScan-ON] BaseException ({type(e).__name__}): {e}\n{traceback.format_exc()}")
+            err_a.append(f"{type(e).__name__}: {e}")
+            if not result_a:
+                result_a.update({"ranked": [], "excluded": [], "rejected": [],
+                                  "errors": [f"Scan A crashed ({type(e).__name__}): {e}"], "partial": True})
 
     def _run_b():
         try:
-            # Scan B: regime filter OFF (current_regime=0)
             result_b.update(_run_batch_scan_internal(
                 symbols        = symbols,
-                current_regime = 0,   # disable regime filter
+                current_regime = 0,
                 progress_cb    = _progress_b,
             ))
         except Exception as e:
-            logger.error(f"[DualScan-OFF] error: {e}")
+            import traceback
+            logger.error(f"[DualScan-OFF] Exception: {e}\n{traceback.format_exc()}")
             err_b.append(str(e))
+            if not result_b:
+                result_b.update({"ranked": [], "excluded": [], "rejected": [],
+                                  "errors": [f"Scan B crashed: {e}"], "partial": True})
+        except BaseException as e:
+            import traceback
+            logger.error(f"[DualScan-OFF] BaseException ({type(e).__name__}): {e}\n{traceback.format_exc()}")
+            err_b.append(f"{type(e).__name__}: {e}")
+            if not result_b:
+                result_b.update({"ranked": [], "excluded": [], "rejected": [],
+                                  "errors": [f"Scan B crashed ({type(e).__name__}): {e}"], "partial": True})
 
     # Chạy song song
     t_a = threading.Thread(target=_run_a, daemon=True)
@@ -773,16 +901,26 @@ def _run_batch_scan_internal(
                     raw_results[sym] = {"symbol": sym, "gate": "ERROR",
                                         "reason": str(e)[:100]}
                     gate, elapsed = "ERROR", 0
+                except BaseException as e:
+                    # MemoryError, SystemExit etc. — log đầy đủ, không crash toàn bộ scan
+                    import traceback
+                    logger.error(f"[BatchScanInternal] BaseException {sym}: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                    raw_results[sym] = {"symbol": sym, "gate": "ERROR",
+                                        "reason": f"{type(e).__name__}: {str(e)[:80]}"}
+                    gate, elapsed = "ERROR", 0
 
                 done_count += 1
                 _progress(f"  ({done_count}/{total_syms}) {sym}: {gate} ({elapsed:.0f}s)")
 
-        except Exception:
+        except BaseException as _outer:
+            # Bắt cả BaseException (MemoryError, SystemExit...) không chỉ Exception
+            import traceback
+            logger.error(f"[BatchScanInternal] Outer crash ({type(_outer).__name__}): {_outer}\n{traceback.format_exc()}")
             partial = True
             for sym in symbols:
                 if sym not in raw_results:
                     raw_results[sym] = {"symbol": sym, "gate": "TIMEOUT",
-                                        "reason": "Global timeout"}
+                                        "reason": f"Outer crash: {type(_outer).__name__}"}
 
     # Stats + guardrails
     all_stats    = []
@@ -942,15 +1080,7 @@ def format_dual_scan_report(dual_result: dict) -> list[str]:
     lines.append(f"BANG A — REGIME FILTER ON ({r_name}):")
     lines.append("(Mau duoc can theo regime hien tai)")
     lines.append("")
-
-    def _get_rr(r):
-        """Risk/Reward ratio = Exp / |MAE30|. Trả về 0 nếu không tính được."""
-        s   = r.get("stats", {})
-        exp = s.get("expectancy", 0)
-        mae = s.get("median_mdd_30d", s.get("median_mdd", 0))
-        if mae >= 0 or exp <= 0:
-            return 0.0
-        return round(exp / abs(mae), 2)
+    # _get_rr: dùng module-level function (đã merge với _get_rr_raw)
 
     def _render(title, items, show_wn=True):
         if not items:
@@ -1023,13 +1153,7 @@ def format_dual_scan_report(dual_result: dict) -> list[str]:
         lines.append("  Khong co ma nao du dieu kien.")
         lines.append("")
     else:
-        def _get_rr_raw(r):
-            s   = r.get("stats", {})
-            exp = s.get("expectancy", 0)
-            mae = s.get("median_mdd_30d", s.get("median_mdd", 0))
-            if mae >= 0 or exp <= 0:
-                return 0.0
-            return round(exp / abs(mae), 2)
+        # _get_rr_raw: dùng module-level _get_rr (đã merge)
 
         def _render_b(title, items):
             if not items:
@@ -1043,18 +1167,18 @@ def format_dual_scan_report(dual_result: dict) -> list[str]:
                 exp   = s.get("expectancy", 0)
                 mae   = s.get("median_mdd_30d", s.get("median_mdd", 0))
                 raw_n = s.get("n", 0)
-                rr    = _get_rr_raw(x)
+                rr    = _get_rr(x)
                 lines.append(
                     f"  {x['symbol']:<6} "
                     f"{wr:>4.0%}  {exp:>+5.1f}%  {mae:>+6.1f}%  {rr:>4.1f}x  {raw_n:>5}"
                 )
             lines.append("")
 
-        grp_b_priority  = sorted([r for r in ranked_off_all if _get_rr_raw(r) >= 2.0],
-                                   key=_get_rr_raw, reverse=True)
-        grp_b_potential = sorted([r for r in ranked_off_all if 1.0 <= _get_rr_raw(r) < 2.0],
-                                   key=_get_rr_raw, reverse=True)
-        grp_b_ref       = [r for r in ranked_off_all if _get_rr_raw(r) < 1.0]
+        grp_b_priority  = sorted([r for r in ranked_off_all if _get_rr(r) >= 2.0],
+                                   key=_get_rr, reverse=True)
+        grp_b_potential = sorted([r for r in ranked_off_all if 1.0 <= _get_rr(r) < 2.0],
+                                   key=_get_rr, reverse=True)
+        grp_b_ref       = [r for r in ranked_off_all if _get_rr(r) < 1.0]
 
         _render_b("UU TIEN (RR >= 2.0):", grp_b_priority)
         _render_b("TIEM NANG (1.0 <= RR < 2.0):", grp_b_potential)
@@ -1109,75 +1233,65 @@ def _format_overview_table(
     partial:  bool,
 ) -> str:
     """
-    Tạo bảng tổng quan TẤT CẢ mã, phân nhóm theo score.
-    Dùng monospace-friendly format cho Telegram plain text.
+    Tạo bảng tổng quan TẤT CẢ mã, phân nhóm theo RR (nhất quán với dual scan).
     """
-    # Gom tất cả mã có score vào 1 list để sort
-    all_scored = []
+    all_items = []
     for r in ranked:
         s = r.get("stats", {})
-        all_scored.append({
-            "symbol":   r["symbol"],
-            "score":    r["score"],
-            "wr":       s.get("win_rate", 0),
-            "mae_med":  s.get("median_mdd", 0),   # median_mdd = MAE median trong guardrails
-            "tier":     r["risk_tier"],
-            "group":    "ranked",
+        all_items.append({
+            "symbol":  r["symbol"],
+            "rr":      _get_rr(r),
+            "wr":      s.get("win_rate", 0),
+            "exp":     s.get("expectancy", 0),
+            "mae_med": s.get("median_mdd_30d", s.get("median_mdd", 0)),
+            "wn":      s.get("weighted_n", 0),
+            "group":   "ranked",
+            "obj":     r,
         })
     for r in excluded:
         s = r.get("stats", {})
-        all_scored.append({
-            "symbol":   r["symbol"],
-            "score":    r["score"],
-            "wr":       s.get("win_rate", 0),
-            "mae_med":  s.get("median_mdd", 0),
-            "tier":     "EXCLUDED",
-            "group":    "excluded",
+        all_items.append({
+            "symbol":  r["symbol"],
+            "rr":      _get_rr(r),
+            "wr":      s.get("win_rate", 0),
+            "exp":     s.get("expectancy", 0),
+            "mae_med": s.get("median_mdd_30d", s.get("median_mdd", 0)),
+            "wn":      s.get("weighted_n", 0),
+            "group":   "excluded",
+            "obj":     r,
         })
 
-    # Sort theo score giảm dần
-    all_scored.sort(key=lambda x: x["score"], reverse=True)
+    all_items.sort(key=lambda x: x["rr"], reverse=True)
 
-    # Phân nhóm
-    grp_priority  = [x for x in all_scored if x["score"] >= 5.0 and x["group"] == "ranked"]
-    grp_potential = [x for x in all_scored if 4.0 <= x["score"] < 5.0 and x["group"] == "ranked"]
-    grp_ref       = [x for x in all_scored if x["score"] < 4.0 and x["group"] == "ranked"]
-    grp_excluded  = [x for x in all_scored if x["group"] == "excluded"]
+    grp_priority  = [x for x in all_items if x["rr"] >= 2.0  and x["group"] == "ranked"]
+    grp_potential = [x for x in all_items if 1.0 <= x["rr"] < 2.0 and x["group"] == "ranked"]
+    grp_ref       = [x for x in all_items if x["rr"] < 1.0   and x["group"] == "ranked"]
+    grp_excluded  = [x for x in all_items if x["group"] == "excluded"]
 
     lines = []
 
-    def _render_group(title: str, items: list, show_excluded: bool = False):
+    def _render_group(title: str, items: list):
         if not items:
             return
         lines.append(title)
-        lines.append(f"  {'Ma':<6} {'Score':>5}  {'WR':>5}  {'MAE 90D':>8}")
-        lines.append("  " + "-" * 32)
+        lines.append(f"  {'Ma':<6} {'WR':>5}  {'Exp':>6}  {'MAE30':>7}  {'RR':>5}  {'wN':>4}")
+        lines.append("  " + "-" * 40)
         for x in items:
-            exc_note = " [RR cao]" if show_excluded else ""
+            rr_str = f"{x['rr']:.1f}x" if x["rr"] < 90 else "99x"
             lines.append(
-                f"  {x['symbol']:<6} {x['score']:>5.1f}  "
-                f"{x['wr']:>4.0%}  {x['mae_med']:>+7.1f}%{exc_note}"
+                f"  {x['symbol']:<6} {x['wr']:>4.0%}  {x['exp']:>+5.1f}%  "
+                f"{x['mae_med']:>+6.1f}%  {rr_str:>5}  {x['wn']:>4.1f}"
             )
         lines.append("")
 
-    _render_group("UU TIEN (Score >= 5.0):", grp_priority)
-    _render_group("TIEM NANG (4.0 - 4.9):", grp_potential)
-    _render_group("THAM KHAO (< 4.0):", grp_ref)
-    _render_group("RUI RO CAO (Excluded):", grp_excluded, show_excluded=True)
+    _render_group("UU TIEN (RR >= 2.0 | Exp > 2x MAE):", grp_priority)
+    _render_group("TIEM NANG (1.0 <= RR < 2.0):", grp_potential)
+    _render_group("THAM KHAO (RR < 1.0):", grp_ref)
 
-    # Debug: lý do từng mã bị excluded — giúp tune threshold
     if grp_excluded:
-        lines.append("  Chi tiet excluded:")
-        for r in excluded[:15]:
-            s      = r.get("stats", {})
-            exp    = s.get("expectancy", 0)
-            pf     = s.get("profit_factor", 0)
-            wr     = s.get("win_rate", 0)
-            reason = r.get("_exclude_reason", "?")[:50]
-            lines.append(
-                f"  {r['symbol']:<6} Exp:{exp:+.1f}% "
-                f"PF:{pf:.1f} WR:{wr:.0%} | {reason}"
-            )
+        lines.append(f"LOAI (Exp am / PF<1 / WR<40%): {len(grp_excluded)} ma")
+        exc_syms = ", ".join(f"{x['symbol']}({x['wn']:.1f}wN)" for x in grp_excluded[:15])
+        lines.append(f"  {exc_syms}")
         lines.append("")
 
     # Mã không có kết quả
@@ -1555,10 +1669,10 @@ async def scan_hose_cmd(update, context):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CRON JOB — 4:00 AM — FULL HOSE SCAN
+# CRON JOB — 4:00 AM VN — FULL HOSE SCAN
 # ══════════════════════════════════════════════════════════════════════════════
 
-HOSE_CRON_HOUR   = 4
+HOSE_CRON_HOUR   = 21     # 21:00 UTC = 04:00 VN hôm sau (UTC+7). Server Railway/Render dùng UTC.
 HOSE_CRON_MINUTE = 0
 HOSE_TOP_N       = int(os.environ.get("HOSE_TOP_N",   "200"))
 HOSE_MIN_VOL     = float(os.environ.get("HOSE_MIN_VOL", "3.0"))
@@ -1569,16 +1683,17 @@ async def _start_hose_cron(bot, chat_ids: list[int]):
     Cron 4:00 AM — scan toàn bộ HOSE top N mã theo thanh khoản.
 
     Flow:
-      1. build_hose_watchlist() → top 200 mã HOSE theo vol
-      2. run_dual_scan() với danh sách đó
-      3. Gửi kết quả qua Telegram
+      1. build_hose_watchlist() → top N mã HOSE theo vol
+      2. append_today_vector() cho từng mã → đảm bảo cache vector cập nhật
+      3. run_dual_scan() với danh sách đó
+      4. Gửi kết quả qua Telegram
 
     Chạy lúc 4h sáng để tránh rate limit (ít traffic),
     cache vector sẽ được build sẵn trước khi thị trường mở.
 
     Env vars:
       HOSE_TOP_N   (default 200): số mã top lấy
-      HOSE_MIN_VOL (default 5.0): thanh khoản tối thiểu tỷ/ngày
+      HOSE_MIN_VOL (default 3.0): thanh khoản tối thiểu tỷ/ngày
     """
     import datetime as _dt
 
@@ -1591,9 +1706,11 @@ async def _start_hose_cron(bot, chat_ids: list[int]):
             target += _dt.timedelta(days=1)
 
         wait_secs = (target - now).total_seconds()
+        # Log cả UTC và VN time (UTC+7) để dễ verify
+        vn_target = target + _dt.timedelta(hours=7)
         logger.info(
             f"[HoseCron] Next run in {wait_secs/3600:.1f}h "
-            f"({target.strftime('%d/%m %H:%M')}) | "
+            f"(UTC {target.strftime('%d/%m %H:%M')} = VN {vn_target.strftime('%d/%m %H:%M')}) | "
             f"top_n={HOSE_TOP_N} min_vol={HOSE_MIN_VOL}ty"
         )
         await asyncio.sleep(wait_secs)
@@ -1633,8 +1750,38 @@ async def _start_hose_cron(bot, chat_ids: list[int]):
                 except Exception:
                     pass
 
-            # Bước 2: dual scan
-            dual_result = await asyncio.to_thread(run_dual_scan, symbols)
+            # ── Bước 2: Cập nhật vector cache cho tất cả mã ─────────────────
+            # QUAN TRỌNG: đây là bước cron manual KHÔNG có, gây kết quả khác nhau.
+            # Manual scan dùng cache cũ (từ hôm qua hoặc trước đó).
+            # Cron 4AM phải append vector của ngày hôm nay để scan dùng state vector
+            # mới nhất — nếu không, kết quả tương đương manual scan vào buổi tối.
+            def _update_caches():
+                from historical_analog import append_today_vector
+                ok_count, fail_count = 0, 0
+                for sym in symbols:
+                    try:
+                        if append_today_vector(sym):
+                            ok_count += 1
+                        else:
+                            fail_count += 1
+                    except Exception as _ue:
+                        fail_count += 1
+                        logger.debug(f"[HoseCron] cache update fail {sym}: {_ue}")
+                logger.info(f"[HoseCron] Cache update: {ok_count} OK, {fail_count} fail")
+                return ok_count, fail_count
+
+            try:
+                ok_c, fail_c = await asyncio.to_thread(_update_caches)
+                logger.info(f"[HoseCron] Vector cache updated: {ok_c}/{len(symbols)} OK")
+            except Exception as _uce:
+                logger.warning(f"[HoseCron] Cache update step error: {_uce} — tiep tuc scan voi cache cu")
+
+            # ── Bước 3: dual scan ────────────────────────────────────────────
+            # Thêm progress_cb để log giống manual scan (dễ debug khi kết quả khác nhau)
+            def _cron_progress(msg: str):
+                logger.info(f"[HoseCron] {msg}")
+
+            dual_result = await asyncio.to_thread(run_dual_scan, symbols, _cron_progress)
 
             # Cache cho morning_briefing
             try:
@@ -1645,7 +1792,9 @@ async def _start_hose_cron(bot, chat_ids: list[int]):
 
             # Bước 3: gửi kết quả
             messages = format_dual_scan_report(dual_result)
-            header   = f"🌙 HOSE FULL SCAN ({_dt.datetime.now().strftime('%d/%m %H:%M')})\n"
+            # Hiển thị giờ VN (UTC+7) trong header thay vì UTC
+            vn_now   = _dt.datetime.now() + _dt.timedelta(hours=7)
+            header   = f"🌙 HOSE FULL SCAN ({vn_now.strftime('%d/%m %H:%M')} VN)\n"
             messages[0] = header + messages[0]
 
             for cid in chat_ids:
@@ -1689,9 +1838,10 @@ async def _start_scan_cron(bot, chat_ids: list[int]):
             target += _dt.timedelta(days=1)
 
         wait_secs = (target - now).total_seconds()
+        vn_target = target + _dt.timedelta(hours=7)
         logger.info(
             f"[ScanCron] Next run in {wait_secs/3600:.1f}h "
-            f"({target.strftime('%d/%m %H:%M')})"
+            f"(UTC {target.strftime('%d/%m %H:%M')} = VN {vn_target.strftime('%d/%m %H:%M')})"
         )
         await asyncio.sleep(wait_secs)
 

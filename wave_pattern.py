@@ -129,7 +129,7 @@ DIM_LOW = {
 
 def _find_optimal_zigzag_pct(
     close: np.ndarray,
-    candidates: tuple = (3.0, 5.0, 7.0, 10.0, 12.0, 15.0),
+    candidates: tuple = (3.0, 5.0, 7.0, 10.0),  # MAX_ZIGZAG_PCT=10.0 → 12% và 15% vô dụng
 ) -> float:
     """
     Tự động tìm ngưỡng ZigZag phù hợp nhất cho mã.
@@ -211,11 +211,14 @@ def _zigzag(close: np.ndarray, min_pct: float = ZIGZAG_MIN_PCT) -> list[tuple[in
 
     pivots: list[tuple[int, float, str]] = []
 
-    # Xác định hướng ban đầu
-    direction = "UP"   # giả sử bắt đầu đi lên
+    # Xác định hướng ban đầu từ 10 bars đầu thay vì giả sử "UP"
+    # Tránh lỗi khi chuỗi bắt đầu bằng downtrend (VD: IPO cao rồi giảm)
+    look_ahead   = min(10, n - 1)
+    first_trend  = "UP" if close[look_ahead] > close[0] else "DOWN"
+    direction        = first_trend
     last_pivot_idx   = 0
     last_pivot_price = close[0]
-    pivots.append((0, close[0], "BOT"))
+    pivots.append((0, close[0], "BOT" if first_trend == "UP" else "TOP"))
 
     for i in range(1, n):
         p = close[i]
@@ -325,8 +328,10 @@ def _extract_waves(
             # Pivot tiếp theo (i+2) là BOT[i+1]
             amp = (p2_price - p1_price) / p1_price * 100
             if next_price is not None:
-                # BOT[i+1] < BOT[i] → lower low → đây là relief rally
-                after_lower_low = next_price < p1_price
+                # Lower low: BOT[i+1] thấp hơn BOT[i] ít nhất 2% → relief rally
+                # Dùng threshold 2% để tránh phân loại sai khi giá pivot gần bằng nhau
+                _lower_pct = (p1_price - next_price) / p1_price * 100 if p1_price > 0 else 0
+                after_lower_low = _lower_pct > 2.0
                 sub_type = "RELIEF_RALLY" if after_lower_low else "BOTTOM_REAL"
             else:
                 sub_type   = "UNKNOWN"
@@ -349,8 +354,10 @@ def _extract_waves(
             # Pivot tiếp theo (i+2) là TOP[i+1]
             amp = (p1_price - p2_price) / p1_price * 100
             if next_price is not None:
-                # TOP[i+1] > TOP[i] → higher high → đây là correction
-                after_higher_high = next_price > p1_price
+                # Higher high: TOP[i+1] cao hơn TOP[i] ít nhất 2% → correction
+                # Dùng threshold 2% để tránh phân loại sai khi giá pivot gần bằng nhau
+                _higher_pct = (next_price - p1_price) / p1_price * 100 if p1_price > 0 else 0
+                after_higher_high = _higher_pct > 2.0
                 sub_type = "CORRECTION" if after_higher_high else "PEAK_REAL"
             else:
                 sub_type   = "UNKNOWN"
@@ -432,40 +439,19 @@ def _compare_current_to_subtypes(
     cur_vec:     np.ndarray,
     waves:       list[dict],
     df:          pd.DataFrame,
-    wave_type:   str,   # "UP" hoặc "DOWN"
+    wave_type:   str,        # "UP" hoặc "DOWN"
+    key_dims:    list[str] | None = None,  # dims để so sánh, None = auto-detect
 ) -> dict:
     """
     So sánh vector hiện tại với median của từng subgroup theo KEY_DIMS.
 
-    Không tính score mới — chỉ tính khoảng cách (absolute diff) giữa
-    giá trị hiện tại và median của mỗi subgroup trên 3 key dims.
-
-    Kết quả: subgroup nào "gần" hơn → hiện tại giống loại đó hơn.
-
-    Returns:
-    {
-        "key_dims":  [str],             # 3 dims dùng để so sánh
-        "subtypes":  {
-            sub_type: {
-                "n":        int,
-                "medians":  {dim: float},   # median của subgroup
-                "cur_vals": {dim: float},   # giá trị hiện tại
-                "diffs":    {dim: float},   # |cur - median|
-                "total_dist": float,        # sum of |diffs| → nhỏ hơn = gần hơn
-            }
-        },
-        "closest":   str,   # subtype gần nhất
-        "margin":    float, # khoảng cách giữa closest và second closest
-    }
+    key_dims: nếu None, dùng top discriminant dims giữa 2 subtypes.
+              Fallback về ["trend_slope", "momentum_20d", "price_vs_sma50"] nếu không tính được.
     """
-    KEY_DIMS = ["trend_slope", "momentum_20d", "price_vs_sma50"]
+    # Fallback dims nếu không truyền vào
+    DEFAULT_KEY_DIMS = ["trend_slope", "momentum_20d", "price_vs_sma50"]
 
-    # Map dim name → index trong VECTOR_KEYS
-    dim_indices = {d: VECTOR_KEYS.index(d) for d in KEY_DIMS if d in VECTOR_KEYS}
-    if not dim_indices:
-        return {}
-
-    # Tập hợp vectors theo subtype (chỉ dùng waves có sub_type != UNKNOWN)
+    # Tập hợp vectors theo subtype trước để tính discriminant dims
     sub_vecs: dict[str, list[np.ndarray]] = {}
     for w in waves:
         st = w.get("sub_type", "UNKNOWN")
@@ -482,6 +468,29 @@ def _compare_current_to_subtypes(
             sub_vecs.setdefault(st, []).append(arr.astype(np.float32))
 
     if not sub_vecs:
+        return {}
+
+    # Xác định KEY_DIMS: dùng top discriminant dims giữa 2 subtypes nếu có thể
+    # Tránh hardcode 3 dims có thể không phải dims phân biệt tốt nhất
+    if key_dims is not None:
+        effective_key_dims = [d for d in key_dims if d in VECTOR_KEYS]
+    else:
+        effective_key_dims = []
+        if len(sub_vecs) >= 2:
+            try:
+                st_list = list(sub_vecs.keys())
+                # Tính dist cho 2 subtypes đầu tiên để tìm discriminant dims
+                dist_a = _group_distribution(sub_vecs[st_list[0]])
+                dist_b = _group_distribution(sub_vecs[st_list[1]])
+                top_disc = _top_discriminant_dims(dist_a, dist_b, top_n=3)
+                effective_key_dims = [d[0] for d in top_disc if d[3] > 0.1]  # effect size > 0.1
+            except Exception:
+                pass
+        if not effective_key_dims:
+            effective_key_dims = DEFAULT_KEY_DIMS  # fallback
+
+    dim_indices = {d: VECTOR_KEYS.index(d) for d in effective_key_dims if d in VECTOR_KEYS}
+    if not dim_indices:
         return {}
 
     # Tính median và khoảng cách với cur_vec
@@ -708,7 +717,9 @@ def _zscore_membership(
             dim_zscores.append((dim, float("nan")))
             continue
 
-        z = (float(current_vec[j]) - d["mean"]) / std
+        # Dùng median thay vì mean để robust với phân phối lệch của indicators
+        # Nhất quán với _top_discriminant_dims() cũng dùng median
+        z = (float(current_vec[j]) - d["median"]) / std
         dim_zscores.append((dim, round(z, 2)))
 
         max_possible += 1.5  # chỉ cộng max nếu dim hợp lệ
@@ -1089,23 +1100,9 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
     subtype_compare_up   = _compare_current_to_subtypes(cur_arr, waves_up_cached,   df_full, "UP")
     subtype_compare_down = _compare_current_to_subtypes(cur_arr, waves_down_cached, df_full, "DOWN")
 
-    # Verdict
-    diff = score_up - score_down
-    # Khi cả 2 scores thấp → trung lập, không nên kết luận chiều
-    # Tránh contradiction: vừa SONG GIAM vừa nói "trung lập"
-    if max(score_up, score_down) < MIN_MEANINGFUL_SCORE:
-        verdict = "KHONG RO"
-    elif diff >= 0.08:
-        verdict = "SONG TANG"
-    elif diff <= -0.08:
-        verdict = "SONG GIAM"
-    else:
-        verdict = "KHONG RO"
-
-    # Regime weight — điều chỉnh ĐỊNH HƯỚNG theo Market Regime VNINDEX
+    # Regime weight — áp dụng TRƯỚC khi tính verdict
     # Bull regime → khuếch đại score_up, giảm score_down
     # Bear regime → khuếch đại score_down, giảm score_up
-    # Ví dụ STB ở R3 Bear Quiet: score_up ×0.8=10.7%, score_down ×1.2=61.3%
     regime_data    = None
     score_up_adj   = score_up
     score_down_adj = score_down
@@ -1119,6 +1116,21 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
         )
     except Exception as _re:
         logger.debug(f"regime weight skip: {_re}")
+
+    # Verdict — dùng score_adj để regime thực sự ảnh hưởng kết quả
+    # (trước đây verdict tính từ score gốc → regime chỉ hiển thị, không ảnh hưởng verdict)
+    diff_adj = score_up_adj - score_down_adj
+    if max(score_up_adj, score_down_adj) < MIN_MEANINGFUL_SCORE:
+        verdict = "KHONG RO"
+    elif diff_adj >= 0.08:
+        verdict = "SONG TANG"
+    elif diff_adj <= -0.08:
+        verdict = "SONG GIAM"
+    else:
+        verdict = "KHONG RO"
+
+    # Giữ lại diff gốc (không adj) để debug / confidence display
+    diff = score_up - score_down
 
     # Top discriminant dims
     top_dims = _top_discriminant_dims(dist_up, dist_down)
@@ -1155,7 +1167,8 @@ def analyze_wave(symbol: str, force_rebuild: bool = False) -> dict:
         "n_false_bottom":   cache.get("n_false_bottom", 0),
         "n_false_top":      cache.get("n_false_top",    0),
         "verdict":          verdict,
-        "confidence":       round(abs(diff), 3),
+        "confidence":       round(abs(diff_adj), 3),   # dùng adj diff để nhất quán với verdict
+        "confidence_raw":   round(abs(diff), 3),        # diff gốc để debug
         "top_dims":         top_dims,
         "dist_up":          dist_up,
         "dist_down":        dist_down,

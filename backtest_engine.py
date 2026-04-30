@@ -133,6 +133,7 @@ def _run_backtest_core(
     capital     = float(config["initial_capital"])
     comm_pct    = float(config["commission_pct"])
     slip_pct    = float(config["slippage_pct"])
+    tax_sell    = float(config.get("tax_sell_pct", 0.001))  # thuế bán HOSE 0.1%
     pos_size    = float(config.get("position_size", 1.0))
     allow_short = bool(config.get("allow_short", False))
 
@@ -168,9 +169,10 @@ def _run_backtest_core(
                 "cash_before": round(cash + shares * cost_all, 0),
             })
 
-        # BÁN
+        # BÁN — commission + thuế bán 0.1%
         elif sig == -1 and in_position:
-            proceeds  = shares * exec_p * (1 - comm_pct)
+            total_sell_cost = comm_pct + tax_sell   # commission + thuế
+            proceeds  = shares * exec_p * (1 - total_sell_cost)
             pnl       = proceeds - shares * entry_price * (1 + comm_pct)
             pnl_pct   = pnl / (shares * entry_price * (1 + comm_pct)) * 100
             cash     += proceeds
