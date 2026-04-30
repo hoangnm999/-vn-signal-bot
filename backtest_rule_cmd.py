@@ -1001,3 +1001,588 @@ async def backtest_rule_cmd(update, context):
 
     # Chạy background — không await để bot tiếp tục nhận lệnh khác trong khi backtest chạy
     asyncio.create_task(_bg())
+"""
+PHẦN BỔ SUNG VÀO backtest_rule_cmd.py — TẦNG 1 HOÀN CHỈNH
+=============================================================
+Dán toàn bộ nội dung này vào CUỐI file backtest_rule_cmd.py.
+
+Sau đó đăng ký trong bot.py:
+    from backtest_rule_cmd import backtest_analog_cmd
+    app.add_handler(CommandHandler("backtest_analog", backtest_analog_cmd))
+
+LỆNH SỬ DỤNG:
+    /backtest_analog HPG
+    /backtest_analog VCB 1500
+
+TẦNG 1: 15 combo × 7 ngưỡng = 105 experiments
+  - 12 combo đơn (thiết kế theo ý nghĩa kinh tế)
+  - 3 combo giao thoa (kết hợp 2 nhóm tín hiệu)
+  Metrics: WR, MeanExp, MedianExp, MAE30, MaxDD, Sharpe, PF, n_signals, n_skip
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+
+BACKTEST_ANALOG_COOLDOWN = 300   # 5 phút per user
+_last_backtest_analog: dict[str, float] = {}
+
+# ── 15 combo (12 đơn + 3 giao thoa) ─────────────────────────────────────────
+_ANALOG_COMBOS = [
+    # ── 12 combo đơn ─────────────────────────────────────────────────────────
+    {
+        "name":       "Full Baseline",
+        "group":      "baseline",
+        "dims":       [
+            "rsi_norm", "macd_hist_norm", "bb_position", "volume_spike",
+            "trend_slope", "price_vs_sma20", "price_vs_sma50", "atr_ratio",
+            "stoch_k_norm", "ema_cross", "momentum_5d", "momentum_20d",
+            "high_low_pos", "vol_trend", "candle_body",
+        ],
+        "hypothesis": "Tat ca 15 chieu — dung lam baseline so sanh",
+    },
+    {
+        "name":       "Pure Momentum",
+        "group":      "momentum",
+        "dims":       ["rsi_norm", "stoch_k_norm", "momentum_5d", "momentum_20d", "macd_hist_norm"],
+        "hypothesis": "Chi dong luc ngan/trung han",
+    },
+    {
+        "name":       "Trend Following",
+        "group":      "trend",
+        "dims":       ["trend_slope", "price_vs_sma20", "price_vs_sma50", "ema_cross", "momentum_20d"],
+        "hypothesis": "Xu huong trung han",
+    },
+    {
+        "name":       "Mean Reversion",
+        "group":      "reversion",
+        "dims":       ["bb_position", "high_low_pos", "rsi_norm", "stoch_k_norm", "price_vs_sma20"],
+        "hypothesis": "Hoi phuc ve trung binh",
+    },
+    {
+        "name":       "Volume Confirmed",
+        "group":      "volume",
+        "dims":       ["volume_spike", "vol_trend", "momentum_5d", "momentum_20d", "rsi_norm"],
+        "hypothesis": "Breakout co volume xac nhan",
+    },
+    {
+        "name":       "Oversold Bounce",
+        "group":      "reversion",
+        "dims":       ["rsi_norm", "stoch_k_norm", "bb_position", "high_low_pos", "momentum_5d"],
+        "hypothesis": "Mua vung oversold",
+    },
+    {
+        "name":       "Trend + Volume",
+        "group":      "trend",
+        "dims":       ["trend_slope", "price_vs_sma50", "ema_cross", "volume_spike", "vol_trend"],
+        "hypothesis": "Xu huong + dong tien",
+    },
+    {
+        "name":       "Volatility Aware",
+        "group":      "volatility",
+        "dims":       ["atr_ratio", "bb_position", "candle_body", "rsi_norm", "momentum_20d"],
+        "hypothesis": "Dieu chinh theo bien dong",
+    },
+    {
+        "name":       "No Volume",
+        "group":      "momentum",
+        "dims":       [
+            "rsi_norm", "macd_hist_norm", "bb_position", "trend_slope",
+            "price_vs_sma20", "price_vs_sma50", "stoch_k_norm", "momentum_20d",
+        ],
+        "hypothesis": "Bo qua volume — ky thuat thuan",
+    },
+    {
+        "name":       "Momentum + Trend",
+        "group":      "momentum",
+        "dims":       ["momentum_5d", "momentum_20d", "trend_slope", "ema_cross", "price_vs_sma50"],
+        "hypothesis": "Momentum trong xu huong",
+    },
+    {
+        "name":       "Short-term Signal",
+        "group":      "momentum",
+        "dims":       ["rsi_norm", "momentum_5d", "volume_spike", "candle_body", "bb_position", "stoch_k_norm"],
+        "hypothesis": "Tin hieu ngan han thuan",
+    },
+    {
+        "name":       "Macro Trend",
+        "group":      "trend",
+        "dims":       ["trend_slope", "price_vs_sma50", "momentum_20d", "high_low_pos", "atr_ratio"],
+        "hypothesis": "Buc tranh dai han",
+    },
+    # ── 3 combo giao thoa ────────────────────────────────────────────────────
+    {
+        "name":       "Oversold + Momentum",
+        "group":      "crossover",
+        "dims":       [
+            "rsi_norm", "stoch_k_norm", "bb_position", "high_low_pos",
+            "momentum_5d", "momentum_20d", "macd_hist_norm",
+        ],
+        "hypothesis": "Oversold NHUNG van co momentum tang — pullback trong uptrend",
+    },
+    {
+        "name":       "Trend + Oversold",
+        "group":      "crossover",
+        "dims":       [
+            "trend_slope", "price_vs_sma50", "ema_cross",
+            "rsi_norm", "stoch_k_norm", "bb_position",
+        ],
+        "hypothesis": "Xu huong tang, dang pullback oversold — diem mua tot nhat",
+    },
+    {
+        "name":       "Momentum + Volume",
+        "group":      "crossover",
+        "dims":       [
+            "momentum_5d", "momentum_20d", "macd_hist_norm",
+            "volume_spike", "vol_trend",
+        ],
+        "hypothesis": "Momentum co volume xac nhan — breakout chat luong cao",
+    },
+]
+
+_ANALOG_THRESHOLDS = [0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
+# Tổng: 15 × 7 = 105 experiments
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE RUNNER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_analog_backtest_sync(symbol: str, days: int = 1800) -> dict:
+    """
+    Fetch data → tính vectors → walk-forward 105 experiments.
+    Chạy trong asyncio.to_thread.
+    """
+    import numpy as np
+    import pandas as pd
+    from collections import Counter
+
+    # 1. Fetch data ────────────────────────────────────────────────────────────
+    try:
+        from vn_loader import load_vn_ohlcv
+        df = load_vn_ohlcv(symbol, days=days, min_bars=200)
+    except Exception as e:
+        return {"status": "error", "error": f"Khong lay duoc data {symbol}: {e}"}
+
+    if df is None or len(df) < 200:
+        return {"status": "error", "error": "Khong du du lieu (can >= 200 bars)"}
+
+    n_bars    = len(df)
+    dates     = df["date"].values
+    close_arr = df["close"].values.astype(float)
+    low_arr   = df["low"].values.astype(float)
+
+    # 2. Tính vectors ──────────────────────────────────────────────────────────
+    try:
+        from state_vector import compute_state_vector_for_date
+    except ImportError as e:
+        return {"status": "error", "error": f"Thieu state_vector: {e}"}
+
+    vectors = {}
+    for i in range(59, n_bars):
+        vec = compute_state_vector_for_date(df, i)
+        if vec is not None:
+            vectors[i] = vec
+
+    if len(vectors) < 100:
+        return {"status": "error", "error": f"Chi co {len(vectors)} vectors, can >= 100"}
+
+    vector_indices = sorted(vectors.keys())
+
+    # 3. Walk-forward ──────────────────────────────────────────────────────────
+    WIN_THRESH  = 1.0
+    MIN_SAMPLES = 5
+    MDS_DAYS    = 30
+    FWD_DAYS    = 30
+
+    results = []
+
+    for combo in _ANALOG_COMBOS:
+        combo_name = combo["name"]
+        dims       = combo["dims"]
+        hypothesis = combo["hypothesis"]
+        group      = combo.get("group", "")
+
+        for threshold in _ANALOG_THRESHOLDS:
+
+            signals = []
+            n_skip  = 0
+
+            for t_idx in range(120, n_bars - FWD_DAYS - 1, 7):
+                if t_idx not in vectors:
+                    continue
+
+                target_vec = vectors[t_idx]
+                target_arr = np.array([target_vec.get(d, 0.0) for d in dims], dtype=float)
+                t_norm     = np.linalg.norm(target_arr)
+                if t_norm < 1e-9:
+                    continue
+
+                # Chỉ dùng data trước t_idx - 90 ngày
+                exclude_cutoff = t_idx - 90
+                candidates     = [i for i in vector_indices if i < exclude_cutoff]
+                if len(candidates) < 10:
+                    continue
+
+                # Cosine similarity trên dims được chọn
+                sim_list = []
+                for c_idx in candidates:
+                    c_vec  = vectors[c_idx]
+                    c_arr  = np.array([c_vec.get(d, 0.0) for d in dims], dtype=float)
+                    c_norm = np.linalg.norm(c_arr)
+                    if c_norm < 1e-9:
+                        continue
+                    sim = float(np.dot(target_arr, c_arr) / (t_norm * c_norm))
+                    if sim >= threshold:
+                        sim_list.append((c_idx, sim))
+
+                if not sim_list:
+                    continue
+
+                # Minimum Distance Sampling 30D
+                sim_list.sort(key=lambda x: -x[1])
+                kept = []
+                for c_idx, sim in sim_list:
+                    c_date    = pd.Timestamp(dates[c_idx])
+                    too_close = any(
+                        abs((c_date - pd.Timestamp(dates[k])).days) < MDS_DAYS
+                        for k, _ in kept
+                    )
+                    if not too_close:
+                        kept.append((c_idx, sim))
+
+                if len(kept) < MIN_SAMPLES:
+                    n_skip += 1
+                    continue
+
+                # Forward return 30D và MAE 30D cho từng analog
+                fwd_rets = []
+                mae_vals = []
+                for c_idx, _ in kept:
+                    fwd_idx = c_idx + FWD_DAYS
+                    if fwd_idx >= n_bars:
+                        continue
+                    entry = close_arr[c_idx]
+                    fwd_rets.append((close_arr[fwd_idx] - entry) / entry * 100)
+                    # MAE: mức giảm tệ nhất trong window 30D
+                    win_low = np.min(low_arr[c_idx + 1: fwd_idx + 1]) if fwd_idx > c_idx else entry
+                    mae_vals.append((win_low - entry) / entry * 100)
+
+                if len(fwd_rets) < MIN_SAMPLES:
+                    n_skip += 1
+                    continue
+
+                signals.append({
+                    "fwd_rets": fwd_rets,
+                    "mae_vals": mae_vals,
+                })
+
+            # Tính metrics ─────────────────────────────────────────────────────
+            if len(signals) < 5:
+                results.append({
+                    "combo": combo_name, "group": group,
+                    "hypothesis": hypothesis, "threshold": threshold,
+                    "n_signals": len(signals), "n_skip": n_skip,
+                    "skip": True,
+                })
+                continue
+
+            # Đại diện mỗi tín hiệu bằng median của analog samples
+            sig_rets = [float(np.median(s["fwd_rets"])) for s in signals]
+            sig_maes = [float(np.median(s["mae_vals"])) for s in signals]
+
+            wins     = [x for x in sig_rets if x >= WIN_THRESH]
+            losses   = [x for x in sig_rets if x < WIN_THRESH]
+            wr       = len(wins) / len(sig_rets)
+            mean_exp = float(np.mean(sig_rets))
+            med_exp  = float(np.median(sig_rets))
+            std_ret  = float(np.std(sig_rets)) if len(sig_rets) > 1 else 1e-9
+            sharpe   = mean_exp / std_ret * (52 ** 0.5) if std_ret > 0 else 0.0
+            pos_sum  = sum(wins)
+            neg_sum  = abs(sum(losses)) if losses else 1e-9
+            pf       = pos_sum / neg_sum if neg_sum > 0 else 99.0
+            mae30    = float(np.median(sig_maes))
+
+            # Max Drawdown của equity curve
+            equity   = np.cumprod([1.0 + r / 100.0 for r in sig_rets])
+            peak     = np.maximum.accumulate(equity)
+            max_dd   = float(np.min((equity - peak) / peak * 100))
+
+            results.append({
+                "combo":     combo_name,
+                "group":     group,
+                "hypothesis":hypothesis,
+                "threshold": threshold,
+                "n_signals": len(signals),
+                "n_skip":    n_skip,
+                "wr":        round(wr * 100, 1),
+                "mean_exp":  round(mean_exp, 2),
+                "med_exp":   round(med_exp, 2),
+                "mae30":     round(mae30, 2),
+                "max_dd":    round(max_dd, 1),
+                "sharpe":    round(sharpe, 3),
+                "pf":        round(pf, 2),
+                "skip":      False,
+            })
+
+    # 4. Xếp hạng ──────────────────────────────────────────────────────────────
+    valid = [r for r in results if not r.get("skip")]
+    valid.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    baseline = next(
+        (r for r in results
+         if r["combo"] == "Full Baseline"
+         and abs(r["threshold"] - 0.70) < 0.001
+         and not r.get("skip")),
+        None,
+    )
+
+    return {
+        "status":        "ok",
+        "symbol":        symbol,
+        "n_bars":        n_bars,
+        "n_vectors":     len(vectors),
+        "n_experiments": len(results),
+        "n_valid":       len(valid),
+        "top_results":   valid[:10],
+        "baseline":      baseline,
+        "all_results":   results,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FORMATTER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _format_analog_backtest_result(res: dict) -> str:
+    import numpy as np
+    from collections import Counter
+
+    symbol   = res["symbol"]
+    n_bars   = res["n_bars"]
+    n_vecs   = res["n_vectors"]
+    n_exp    = res["n_experiments"]
+    n_valid  = res["n_valid"]
+    top      = res.get("top_results", [])
+    baseline = res.get("baseline")
+    all_res  = res.get("all_results", [])
+
+    sep  = "=" * 32
+    sep2 = "-" * 32
+
+    lines = [
+        f"BACKTEST ANALOG T1 — {symbol}",
+        f"{n_bars} bars | {n_vecs} vectors | {n_exp} exp ({n_valid} hop le)",
+        sep,
+    ]
+
+    # Baseline
+    lines.append("BASELINE (15 chieu | nguong 0.70):")
+    if baseline:
+        lines.append(
+            f"  WR {baseline['wr']:.0f}%  "
+            f"Exp {baseline['mean_exp']:+.2f}% (med {baseline['med_exp']:+.2f}%)  "
+            f"Sharpe {baseline['sharpe']:.2f}"
+        )
+        lines.append(
+            f"  MAE30 {baseline['mae30']:.1f}%  "
+            f"MaxDD {baseline['max_dd']:.1f}%  "
+            f"PF {baseline['pf']:.2f}  "
+            f"n={baseline['n_signals']}"
+        )
+    else:
+        lines.append("  Khong du tin hieu.")
+    lines.append(sep2)
+
+    # Top 5
+    lines.append(f"TOP 5 / {n_valid} experiments:")
+    lines.append("")
+
+    if not top:
+        lines.append("  Khong co experiment hop le (>= 5 tin hieu).")
+    else:
+        bl_sharpe = baseline["sharpe"] if baseline else 0.0
+        for rank, r in enumerate(top[:5], 1):
+            diff    = r["sharpe"] - bl_sharpe
+            sign    = "+" if diff >= 0 else ""
+            vs_base = f" [{sign}{diff:.2f} vs BL]"
+
+            em = "✅" if r["wr"] >= 60 and r["mean_exp"] > 0 else \
+                 "🟡" if r["mean_exp"] > 0 else "🔴"
+
+            lines.append(f"{em} #{rank} {r['combo']} | nguong {r['threshold']:.2f}{vs_base}")
+            lines.append(
+                f"   WR {r['wr']:.0f}%  "
+                f"Exp {r['mean_exp']:+.2f}% (med {r['med_exp']:+.2f}%)  "
+                f"Sharpe {r['sharpe']:.2f}"
+            )
+            lines.append(
+                f"   MAE30 {r['mae30']:.1f}%  "
+                f"MaxDD {r['max_dd']:.1f}%  "
+                f"PF {r['pf']:.2f}  "
+                f"n={r['n_signals']} skip={r['n_skip']}"
+            )
+            lines.append(f"   >> {r['hypothesis']}")
+            lines.append("")
+
+    lines.append(sep2)
+
+    # Phân tích combo giao thoa
+    cross_res = sorted(
+        [r for r in all_res if r.get("group") == "crossover" and not r.get("skip")],
+        key=lambda x: x["sharpe"], reverse=True,
+    )
+    if cross_res:
+        bc = cross_res[0]
+        bl_sharpe = baseline["sharpe"] if baseline else 0.0
+        diff = bc["sharpe"] - bl_sharpe
+        verdict = "tot hon" if diff > 0 else "kem hon"
+        lines.append("COMBO GIAO THOA (tot nhat):")
+        lines.append(
+            f"  {bc['combo']} | nguong {bc['threshold']:.2f} | "
+            f"WR {bc['wr']:.0f}%  Exp {bc['mean_exp']:+.2f}%  "
+            f"Sharpe {bc['sharpe']:.2f}"
+        )
+        lines.append(f"  → {verdict} baseline {abs(diff):.2f} Sharpe")
+        lines.append(sep2)
+
+    # Nhận xét tự động
+    lines.append("NHAN XET:")
+    if top and baseline:
+        best = top[0]
+        diff = best["sharpe"] - baseline["sharpe"]
+        if diff > 0.15:
+            lines.append(
+                f"  Chon loc chieu CO LOI ro rang: {best['combo']} "
+                f"vuot baseline {diff:+.2f} Sharpe."
+            )
+        elif diff > 0:
+            lines.append(
+                f"  Chon loc chieu loi nhat hoc (+{diff:.2f} Sharpe). "
+                f"Full 15 chieu van on."
+            )
+        else:
+            lines.append(
+                f"  Full 15 chieu la tot nhat voi {symbol}."
+            )
+
+        avg_n = sum(r["n_signals"] for r in top[:5]) / max(len(top[:5]), 1)
+        if avg_n < 15:
+            lines.append(f"  CANH BAO: Trung binh {avg_n:.0f} tin hieu — thieu y nghia thong ke.")
+        else:
+            lines.append(f"  So tin hieu TB: {avg_n:.0f} — du de tham khao.")
+
+        thresh_top5 = [r["threshold"] for r in top[:5]]
+        best_thresh = Counter(thresh_top5).most_common(1)[0][0]
+        lines.append(f"  Nguong pho bien trong top 5: {best_thresh:.2f}")
+
+        groups_top5    = [r["group"] for r in top[:5]]
+        dominant_group = Counter(groups_top5).most_common(1)[0][0]
+        group_labels   = {
+            "momentum":  "Momentum", "trend": "Trend Following",
+            "reversion": "Mean Reversion", "volume": "Volume",
+            "volatility":"Volatility", "crossover": "Combo giao thoa",
+            "baseline":  "Baseline",
+        }
+        lines.append(f"  Nhom thong tri top 5: {group_labels.get(dominant_group, dominant_group)}")
+    else:
+        lines.append("  Khong du du lieu de nhan xet.")
+
+    lines.append("")
+    lines.append("Day la backtest IN-SAMPLE. Nen dung ket qua nay de dinh huong,")
+    lines.append("khong phai de ket luan cuoi cung. Tang 2 se verify overfitting.")
+    lines.append(sep)
+
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM COMMAND HANDLER
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def backtest_analog_cmd(update, context):
+    """
+    /backtest_analog <MA> [days]
+    Test 15 combo x 7 nguong = 105 experiments.
+    """
+    try:
+        from bot import is_allowed, _deny
+    except ImportError:
+        def is_allowed(_): return True
+        async def _deny(_): pass
+
+    if not is_allowed(update):
+        await _deny(update)
+        return
+
+    args = context.args or []
+
+    if not args:
+        await update.message.reply_text(
+            "Cu phap: /backtest_analog <MA> [days]\n\n"
+            "Vi du:\n"
+            "  /backtest_analog HPG\n"
+            "  /backtest_analog VCB 1500\n\n"
+            "105 experiments | Metrics: WR, Exp, MAE30, MaxDD, Sharpe, PF\n"
+            "Thoi gian: 4-10 phut."
+        )
+        return
+
+    import re as _re
+    symbol = args[0].upper().strip()
+    if not _re.match(r'^[A-Z0-9]{2,10}$', symbol):
+        await update.message.reply_text(f"Ma '{symbol}' khong hop le.")
+        return
+
+    try:
+        days = max(500, min(int(args[1]), 2500)) if len(args) > 1 else 1800
+    except (ValueError, IndexError):
+        days = 1800
+
+    user_id = str(update.effective_user.id) if update.effective_user else "unknown"
+    since   = time.time() - _last_backtest_analog.get(user_id, 0)
+    if since < BACKTEST_ANALOG_COOLDOWN:
+        wait = int(BACKTEST_ANALOG_COOLDOWN - since)
+        await update.message.reply_text(f"Vui long cho {wait}s truoc khi chay tiep.")
+        return
+    _last_backtest_analog[user_id] = time.time()
+
+    chat_id = update.effective_chat.id
+    msg = await update.message.reply_text(
+        f"Backtest Analog T1: {symbol} ({days} ngay)\n"
+        f"15 combo x 7 nguong = 105 experiments\n"
+        f"Uoc tinh 4-10 phut, vui long doi..."
+    )
+
+    async def _bg():
+        try:
+            result = await asyncio.to_thread(_run_analog_backtest_sync, symbol, days)
+
+            if result["status"] == "error":
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg.message_id,
+                    text=f"Loi: {result.get('error','?')[:300]}",
+                )
+                return
+
+            summary = _format_analog_backtest_result(result)
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg.message_id,
+                text=_plain(summary)[:4096],
+            )
+
+        except Exception as e:
+            import traceback
+            logger.error(f"backtest_analog_cmd error: {e}\n{traceback.format_exc()}")
+            err_text = f"Loi /backtest_analog {symbol}: {str(e)[:200]}"
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg.message_id, text=err_text,
+                )
+            except Exception:
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=err_text)
+                except Exception:
+                    pass
+
+    asyncio.create_task(_bg())

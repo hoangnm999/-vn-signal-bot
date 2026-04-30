@@ -52,10 +52,11 @@ except ImportError:
     logger.warning("local_swarm_cmd.py chua co — /local_swarm bi tat")
 
 try:
-    from backtest_rule_cmd import backtest_rule_cmd
+    from backtest_rule_cmd import backtest_rule_cmd, backtest_analog_cmd
     _BACKTEST_RULE = True
 except ImportError:
     _BACKTEST_RULE = False
+    backtest_analog_cmd = None
     logger.warning("backtest_rule_cmd.py chua co — /backtest_rule bi tat")
 
 try:
@@ -1501,7 +1502,8 @@ def main():
     app.add_handler(CommandHandler("deepscan",    deepscan_cmd))
     app.add_handler(CommandHandler("check_all",   check_all_cmd))
     if _BACKTEST_RULE:
-        app.add_handler(CommandHandler("backtest_rule", backtest_rule_cmd))
+        app.add_handler(CommandHandler("backtest_rule",   backtest_rule_cmd))
+        app.add_handler(CommandHandler("backtest_analog", backtest_analog_cmd))
         if _ANALOG:
             app.add_handler(CommandHandler("analog", analog_cmd))
     if _BATCH_SCANNER:
