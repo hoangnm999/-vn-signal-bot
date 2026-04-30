@@ -58,6 +58,7 @@ try:
         backtest_analog_batch_cmd,
         backtest_analog_detail_cmd,
         walkforward_analog_cmd,
+        analog_pipeline_cmd,
     )
     _BACKTEST_RULE = True
 except ImportError:
@@ -66,6 +67,7 @@ except ImportError:
     backtest_analog_batch_cmd  = None
     backtest_analog_detail_cmd = None
     walkforward_analog_cmd     = None
+    analog_pipeline_cmd        = None
     logger.warning("backtest_rule_cmd.py chua co — /backtest_rule bi tat")
 
 try:
@@ -1516,6 +1518,7 @@ def main():
         app.add_handler(CommandHandler("backtest_analog_batch",  backtest_analog_batch_cmd))
         app.add_handler(CommandHandler("backtest_analog_detail", backtest_analog_detail_cmd))
         app.add_handler(CommandHandler("walkforward_analog",     walkforward_analog_cmd))
+        app.add_handler(CommandHandler("analog_pipeline",        analog_pipeline_cmd))
         if _ANALOG:
             app.add_handler(CommandHandler("analog", analog_cmd))
     if _BATCH_SCANNER:
