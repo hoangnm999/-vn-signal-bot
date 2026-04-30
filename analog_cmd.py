@@ -399,27 +399,15 @@ def _run_analog_sync(symbol: str, use_regime: bool = True) -> dict:
             ),
         }
 
-    # Lấy close price — luôn fetch trực tiếp từ vn_loader (giá mới nhất, không dùng DB cũ)
-    if close_px == 0:
-        try:
-            from vn_loader import load_vn_ohlcv
-            df_price = load_vn_ohlcv(symbol, days=10, min_bars=1)
-            if df_price is not None and len(df_price) > 0:
-                close_px = float(df_price["close"].iloc[-1]) * 1000  # nghìn đồng → đồng
-                logger.debug(f"analog {symbol}: close_px from vn_loader = {close_px:,.0f}")
-        except Exception as e:
-            logger.debug(f"analog {symbol}: vn_loader price fail: {e}")
-
-    # Fallback thứ 2: analyzer.get_price_data (chỉ dùng khi vn_loader fail)
-    if close_px == 0:
-        try:
-            from analyzer import get_price_data
-            res = get_price_data(symbol, days=5)
-            if res.get("success"):
-                close_px = float(res["df"]["close"].iloc[-1])
-                logger.debug(f"analog {symbol}: close_px from analyzer = {close_px:,.0f}")
-        except Exception:
-            pass
+    # Luôn fetch giá mới nhất trực tiếp — độc lập với state vector source
+    try:
+        from vn_loader import load_vn_ohlcv
+        df_price = load_vn_ohlcv(symbol, days=10, min_bars=1)
+        if df_price is not None and len(df_price) > 0:
+            close_px = float(df_price["close"].iloc[-1]) * 1000  # nghìn đồng → đồng
+            logger.info(f"analog {symbol}: close_px = {close_px:,.0f}")
+    except Exception as e:
+        logger.warning(f"analog {symbol}: vn_loader price fail: {e}")
 
     # ── 2. Kiểm tra và build cache nếu chưa có ───────────────────────────────
     try:
