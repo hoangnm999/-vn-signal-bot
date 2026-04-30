@@ -586,6 +586,123 @@ def get_report(days: int = 30) -> str:
             except Exception: pass
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SCAN RESULT — persist qua bot restart & Render deploy
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SCAN_RESULT_TTL_HOURS = 26   # Morning hôm sau vẫn đọc được
+
+def save_scan_result(result: dict, scan_type: str = "watchlist") -> bool:
+    """
+    Lưu kết quả scan vào PostgreSQL table bot_kv (key-value store đơn giản).
+    Tự tạo table nếu chưa có. Idempotent — upsert theo key.
+
+    Args:
+        result:    dict từ run_dual_scan()["regime_on"]
+        scan_type: "watchlist" hoặc "hose"
+    Returns:
+        True nếu lưu thành công
+    """
+    conn = None
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+
+        # Tạo table bot_kv nếu chưa có (migration-safe)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_kv (
+                key        VARCHAR(100) PRIMARY KEY,
+                value      TEXT         NOT NULL,
+                updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        key     = f"scan_result_{scan_type}"
+        payload = json.dumps(result, ensure_ascii=False, default=str)
+
+        cur.execute("""
+            INSERT INTO bot_kv (key, value, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value,
+                    updated_at = NOW()
+        """, (key, payload))
+
+        conn.commit()
+        cur.close()
+        ranked_n = len(result.get("ranked", []))
+        logger.info(f"[DB] scan_result saved: key={key}, ranked={ranked_n}")
+        return True
+
+    except Exception as e:
+        logger.error(f"save_scan_result error: {e}")
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+        return False
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
+
+
+def load_scan_result(scan_type: str = "watchlist",
+                     max_age_hours: float = _SCAN_RESULT_TTL_HOURS) -> dict | None:
+    """
+    Load kết quả scan từ PostgreSQL.
+    Trả về None nếu chưa có hoặc quá cũ (> max_age_hours).
+
+    Args:
+        scan_type:     "watchlist" hoặc "hose"
+        max_age_hours: bỏ qua nếu record cũ hơn ngưỡng này
+    Returns:
+        dict hoặc None
+    """
+    conn = None
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+
+        key = f"scan_result_{scan_type}"
+        cur.execute("""
+            SELECT value, updated_at
+            FROM bot_kv
+            WHERE key = %s
+        """, (key,))
+        row = cur.fetchone()
+        cur.close()
+
+        if not row:
+            logger.debug(f"[DB] load_scan_result: key={key} not found")
+            return None
+
+        value_str, updated_at = row
+
+        # Kiểm tra tuổi của record
+        from datetime import timezone as _tz
+        now_utc = datetime.utcnow().replace(tzinfo=_tz.utc)
+        if hasattr(updated_at, "tzinfo") and updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=_tz.utc)
+        age_hours = (now_utc - updated_at).total_seconds() / 3600
+
+        if age_hours > max_age_hours:
+            logger.info(f"[DB] load_scan_result: key={key} too old ({age_hours:.1f}h > {max_age_hours}h)")
+            return None
+
+        result = json.loads(value_str)
+        ranked_n = len(result.get("ranked", []))
+        logger.info(f"[DB] load_scan_result: key={key}, ranked={ranked_n}, age={age_hours:.1f}h")
+        return result
+
+    except Exception as e:
+        logger.warning(f"load_scan_result error (non-critical): {e}")
+        return None
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
+
+
 def get_history(symbol: str, limit: int = 10) -> str:
     """Lấy lịch sử signal của 1 mã"""
     # Validate + sanitize input

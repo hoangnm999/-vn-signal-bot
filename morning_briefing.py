@@ -81,10 +81,13 @@ def _get_top_symbols_fast(n: int = TOP_N_SCAN) -> tuple[list[dict], bool]:
     (tồn tại qua bot restart). Nếu chưa có cache → trả về watchlist thô.
     User cần chạy /scan_watchlist trước để có cache.
     """
-    # Đọc qua get_last_scan_result() — có file fallback qua restart
+    # Đọc qua get_last_scan_result() — PostgreSQL backend, tồn tại qua Render deploy
     try:
         from batch_scanner import get_last_scan_result
-        scan_result = get_last_scan_result()
+        # Thử watchlist trước, fallback hose nếu watchlist chưa có
+        scan_result = get_last_scan_result(scan_type="watchlist")
+        if not scan_result or not scan_result.get("ranked"):
+            scan_result = get_last_scan_result(scan_type="hose")
         if scan_result and isinstance(scan_result, dict):
             ranked = scan_result.get("ranked", [])
             if ranked:

@@ -51,49 +51,43 @@ _HOSE_LISTING_CACHE    = _DATA_DIR / "hose_listing.json"
 _HOSE_LISTING_TTL_SECS = 24 * 3600   # 24h — listing thay đổi rất ít
 
 # Scan Result Cache — persist qua bot restart, Morning Briefing đọc được
-_SCAN_RESULT_CACHE     = _DATA_DIR / "last_scan_result.json"
-_SCAN_RESULT_TTL_SECS  = 26 * 3600   # 26h — đủ cho Morning hôm sau đọc được
+# Scan Result Cache — persist vào PostgreSQL (xem _save_scan_result / get_last_scan_result)
 _last_scan_result      = None         # in-memory; set bởi run_dual_scan & cron
 
 
-def _save_scan_result(result: dict) -> None:
-    """Persist scan result ra file để tồn tại qua bot restart."""
+def _save_scan_result(result: dict, scan_type: str = "watchlist") -> None:
+    """
+    Persist scan result vào PostgreSQL (tồn tại qua Render deploy/restart).
+    Cũng cập nhật in-memory cache.
+    """
+    global _last_scan_result
+    _last_scan_result = result
     try:
-        _DATA_DIR.mkdir(exist_ok=True)
-        payload = {"ts": time.time(), "result": result}
-        _SCAN_RESULT_CACHE.write_text(
-            json.dumps(payload, ensure_ascii=False, default=str),
-            encoding="utf-8",
-        )
-        logger.info(f"[ScanCache] Saved scan result ({len(result.get('ranked', []))} ranked)")
+        from db import save_scan_result as _db_save
+        _db_save(result, scan_type=scan_type)
     except Exception as e:
-        logger.warning(f"[ScanCache] Save fail: {e}")
+        logger.warning(f"[ScanCache] DB save fail (non-critical): {e}")
 
 
-def get_last_scan_result() -> dict | None:
+def get_last_scan_result(scan_type: str = "watchlist") -> dict | None:
     """
     Trả về kết quả scan mới nhất.
-    Ưu tiên: in-memory → file cache (nếu < 26h).
-    Morning Briefing nên gọi hàm này thay vì đọc _last_scan_result trực tiếp.
+    Ưu tiên: in-memory → PostgreSQL (tồn tại qua restart & Render deploy).
+    Morning Briefing gọi hàm này.
     """
     global _last_scan_result
     # 1. In-memory (scan đã chạy trong session hiện tại)
     if _last_scan_result is not None:
         return _last_scan_result
-    # 2. File cache (tồn tại qua restart)
+    # 2. PostgreSQL (tồn tại qua restart)
     try:
-        if _SCAN_RESULT_CACHE.exists():
-            age = time.time() - _SCAN_RESULT_CACHE.stat().st_mtime
-            if age < _SCAN_RESULT_TTL_SECS:
-                payload = json.loads(_SCAN_RESULT_CACHE.read_text(encoding="utf-8"))
-                _last_scan_result = payload.get("result")
-                logger.info(f"[ScanCache] Loaded from file ({age/3600:.1f}h old, "
-                            f"{len((_last_scan_result or {}).get('ranked', []))} ranked)")
-                return _last_scan_result
-            else:
-                logger.info(f"[ScanCache] File too old ({age/3600:.1f}h > 26h), ignoring")
+        from db import load_scan_result as _db_load
+        result = _db_load(scan_type=scan_type)
+        if result:
+            _last_scan_result = result   # cache lại in-memory
+            return result
     except Exception as e:
-        logger.warning(f"[ScanCache] Load fail: {e}")
+        logger.warning(f"[ScanCache] DB load fail (non-critical): {e}")
     return None
 
 
@@ -1542,11 +1536,10 @@ async def scan_watchlist_cmd(update, context):
             dual_result = await asyncio.to_thread(
                 run_dual_scan, symbols, _progress_sync
             )
-            # Cache regime_on result cho morning_briefing (in-memory + file)
+            # Cache cho morning_briefing — persist vào PostgreSQL
             try:
                 import batch_scanner as _bs_self
-                _bs_self._last_scan_result = dual_result["regime_on"]
-                _bs_self._save_scan_result(dual_result["regime_on"])
+                _bs_self._save_scan_result(dual_result["regime_on"], scan_type="watchlist")
             except Exception:
                 pass
             messages = format_dual_scan_report(dual_result)
@@ -1832,11 +1825,10 @@ async def _start_hose_cron(bot, chat_ids: list[int]):
 
             dual_result = await asyncio.to_thread(run_dual_scan, symbols, _cron_progress)
 
-            # Cache cho morning_briefing (in-memory + file)
+            # Cache cho morning_briefing — persist vào PostgreSQL (tồn tại qua deploy)
             try:
                 import batch_scanner as _bs_self
-                _bs_self._last_scan_result = dual_result["regime_on"]
-                _bs_self._save_scan_result(dual_result["regime_on"])
+                _bs_self._save_scan_result(dual_result["regime_on"], scan_type="hose")
             except Exception:
                 pass
 
@@ -1900,11 +1892,10 @@ async def _start_scan_cron(bot, chat_ids: list[int]):
             symbols     = load_watchlist()
             dual_result = await asyncio.to_thread(run_dual_scan, symbols)
 
-            # Cache regime_on cho morning_briefing (in-memory + file)
+            # Cache cho morning_briefing — persist vào PostgreSQL
             try:
                 import batch_scanner as _bs_self
-                _bs_self._last_scan_result = dual_result["regime_on"]
-                _bs_self._save_scan_result(dual_result["regime_on"])
+                _bs_self._save_scan_result(dual_result["regime_on"], scan_type="watchlist")
             except Exception:
                 pass
 
