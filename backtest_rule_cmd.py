@@ -2237,7 +2237,7 @@ def _format_detail_result(res: dict) -> str:
     # Risk-adjusted: Exp >= 90% max nhưng MaxDD nhỏ hơn
     max_exp         = best_exp_row["mean_exp"]
     risk_candidates = [r for r in pass_rows if r["mean_exp"] >= max_exp * 0.90]
-    best_risk_adj   = min(risk_candidates, key=lambda x: x["max_dd"])
+    best_risk_adj   = max(risk_candidates, key=lambda x: x["max_dd"])
 
     lines.append("")
     lines.append("PHAN TICH THRESHOLD:")
