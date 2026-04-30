@@ -71,6 +71,19 @@ except ImportError:
     logger.warning("backtest_rule_cmd.py chua co — /backtest_rule bi tat")
 
 try:
+    from analog_signal import (
+        signal_status_cmd, signal_history_cmd,
+        _start_signal_cron,
+    )
+    _ANALOG_SIGNAL = True
+    logger.info("analog_signal.py loaded OK")
+except ImportError:
+    _ANALOG_SIGNAL = False
+    signal_status_cmd  = None
+    signal_history_cmd = None
+    logger.warning("analog_signal.py chua co — /signal_status bi tat")
+
+try:
     from analog_cmd import analog_cmd
     _ANALOG = True
     logger.info("analog_cmd.py loaded OK")
@@ -1521,6 +1534,9 @@ def main():
         app.add_handler(CommandHandler("analog_pipeline",        analog_pipeline_cmd))
         if _ANALOG:
             app.add_handler(CommandHandler("analog", analog_cmd))
+    if _ANALOG_SIGNAL:
+        app.add_handler(CommandHandler("signal_status",  signal_status_cmd))
+        app.add_handler(CommandHandler("signal_history", signal_history_cmd))
     if _BATCH_SCANNER:
         app.add_handler(CommandHandler("scan_watchlist", scan_watchlist_cmd))
         app.add_handler(CommandHandler("scan_hose",      scan_hose_cmd))
@@ -1571,6 +1587,11 @@ def main():
             asyncio.create_task(_start_portfolio_cron(application.bot, _scan_ids if _BATCH_SCANNER else []))
         if _MORNING:
             asyncio.create_task(_start_morning_cron(application.bot, _scan_ids if _BATCH_SCANNER else []))
+        if _ANALOG_SIGNAL:
+            _signal_ids = _scan_ids if _BATCH_SCANNER else []
+            if _signal_ids:
+                asyncio.create_task(_start_signal_cron(application.bot, _signal_ids))
+                logger.info(f"AnalogSignalCron: {len(_signal_ids)} chat_ids, 15:30 VN daily")
 
     app.post_init = post_init
 
