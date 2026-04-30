@@ -1723,10 +1723,10 @@ def _format_batch_result(batch: dict) -> str:
             lines.append(f"{r['symbol']:<7} LOI: {r['error']}")
             continue
 
-        # Emoji
-        if r["sharpe"] >= 1.2 and r["wr"] >= 60 and r["mean_exp"] > 0:
+        # Emoji — dựa trên Exp và PF, không dùng WR
+        if r["mean_exp"] > 1.0 and r["pf"] >= 2.0:
             em = "✅"
-        elif r["sharpe"] >= 1.0 and r["mean_exp"] > 0:
+        elif r["mean_exp"] > 0 and r["pf"] >= 1.5:
             em = "🟡"
         else:
             em = "🔴"
@@ -1794,16 +1794,18 @@ def _format_batch_result(batch: dict) -> str:
 
     lines.append("")
 
-    # Khuyến nghị walk-forward
-    if good_syms and all_top1:
-        top_combo_wf = Counter(all_top1).most_common(1)[0][0]
-        lines.append("  → BUOC TIEP THEO (Walk-forward 2025):")
-        lines.append(f"     Ma test    : {', '.join(good_syms)}")
-        lines.append(f"     Combo fix  : {top_combo_wf} (nhat quan nhat)")
-        lines.append(f"     Nguong fix : {Counter(r['threshold'] for r in rows if r.get('ok')).most_common(1)[0][0]:.2f}")
-        lines.append("     Chay /backtest_analog_wf de verify (sap co)")
+    # Khuyến nghị walk-forward — config riêng cho từng mã
+    good_rows = [r for r in rows if r.get("ok") and r["symbol"] in good_syms]
+    if good_rows:
+        lines.append("  → BUOC TIEP THEO:")
+        lines.append("     Chay detail de chon nguong chinh xac:")
+        for r in good_rows:
+            lines.append(
+                f"     /backtest_analog_detail {r['symbol']} "
+                f"{r['combo'].split()[0].lower()}"
+            )
     else:
-        lines.append("  → Khong co ma nao du dieu kien cho walk-forward.")
+        lines.append("  → Khong co ma nao du dieu kien.")
         lines.append("     Thu tang days hoac kiem tra lai data.")
 
     lines.append("")
