@@ -2446,3 +2446,581 @@ async def backtest_analog_detail_cmd(update, context):
                     pass
 
     asyncio.create_task(_bg())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WALK-FORWARD ANALOG — OOS test 01/01/2025 đến nay
+# ══════════════════════════════════════════════════════════════════════════════
+
+BACKTEST_ANALOG_WF_COOLDOWN = 300   # 5 phút per user
+_last_backtest_analog_wf: dict[str, float] = {}
+
+# Config cố định cho từng mã — kết quả từ backtest + detail
+# KHÔNG thay đổi sau khi thấy kết quả walk-forward
+_WF_SYMBOL_CONFIG = {
+    "FPT": {"combo": "Macro Trend",       "threshold": 0.55},
+    "MWG": {"combo": "Oversold Bounce",   "threshold": 0.55},
+    "STB": {"combo": "Oversold Bounce",   "threshold": 0.60},
+    "HPG": {"combo": "Volume Confirmed",  "threshold": 0.80},
+}
+
+# Giai đoạn OOS
+_WF_START_DATE = "2025-01-01"
+
+
+def _run_walkforward_sync(symbol: str) -> dict:
+    """
+    Walk-forward cho 1 mã:
+    - Training  : tất cả data TRƯỚC 2025-01-01
+    - OOS       : 2025-01-01 đến nay
+    - Config    : cố định từ _WF_SYMBOL_CONFIG
+    - Step      : 7 ngày
+    - So sánh  : WR/Exp/PF OOS vs in-sample
+    """
+    import numpy as np
+    import pandas as pd
+
+    symbol = symbol.upper()
+
+    # Kiểm tra config
+    if symbol not in _WF_SYMBOL_CONFIG:
+        return {
+            "status": "error",
+            "error":  f"{symbol} chua co config. Co san: {', '.join(_WF_SYMBOL_CONFIG)}"
+        }
+
+    cfg        = _WF_SYMBOL_CONFIG[symbol]
+    combo_name = cfg["combo"]
+    threshold  = cfg["threshold"]
+
+    # Tìm combo dims
+    combo = _find_combo(combo_name)
+    if combo is None:
+        return {"status": "error", "error": f"Khong tim thay combo '{combo_name}'"}
+    dims = combo["dims"]
+
+    # Fetch data — lấy đủ dài để có cả training lẫn OOS
+    try:
+        from vn_loader import load_vn_ohlcv
+        df = load_vn_ohlcv(symbol, days=2500, min_bars=200)
+    except Exception as e:
+        return {"status": "error", "error": f"Khong lay duoc data: {e}"}
+
+    if df is None or len(df) < 200:
+        return {"status": "error", "error": "Khong du du lieu"}
+
+    # Tính vectors toàn bộ
+    try:
+        from state_vector import compute_state_vector_for_date
+    except ImportError as e:
+        return {"status": "error", "error": f"Thieu state_vector: {e}"}
+
+    vectors = {}
+    for i in range(59, len(df)):
+        vec = compute_state_vector_for_date(df, i)
+        if vec is not None:
+            vectors[i] = vec
+
+    if len(vectors) < 100:
+        return {"status": "error", "error": "Khong du vectors"}
+
+    n_bars         = len(df)
+    dates          = df["date"].values
+    close_arr      = df["close"].values.astype(float)
+    low_arr        = df["low"].values.astype(float)
+    vector_indices = sorted(vectors.keys())
+
+    # Xác định ranh giới OOS
+    wf_start   = pd.Timestamp(_WF_START_DATE)
+    wf_end     = pd.Timestamp.now().normalize()
+    date_series= pd.to_datetime(df["date"])
+
+    # Index đầu tiên của OOS
+    oos_start_idx = next(
+        (i for i, d in enumerate(date_series) if pd.Timestamp(d) >= wf_start),
+        None
+    )
+    if oos_start_idx is None:
+        return {"status": "error", "error": f"Khong co data sau {_WF_START_DATE}"}
+
+    n_oos_bars = n_bars - oos_start_idx
+
+    WIN_THRESH  = 1.0
+    MIN_SAMPLES = 5
+    MDS_DAYS    = 30
+    FWD_DAYS    = 30
+
+    oos_signals   = []   # tín hiệu trong OOS
+    train_signals = []   # tín hiệu trong training (để so sánh)
+    n_skip_oos    = 0
+    n_skip_train  = 0
+
+    for t_idx in range(120, n_bars - FWD_DAYS - 1, 7):
+        if t_idx not in vectors:
+            continue
+
+        t_date    = pd.Timestamp(dates[t_idx])
+        is_oos    = t_date >= wf_start
+
+        target_vec = vectors[t_idx]
+        target_arr = np.array([target_vec.get(d, 0.0) for d in dims], dtype=float)
+        t_norm     = np.linalg.norm(target_arr)
+        if t_norm < 1e-9:
+            continue
+
+        # Chỉ dùng data TRAINING (trước t_idx - 90 ngày VÀ trước OOS)
+        # Đây là điểm quan trọng nhất của walk-forward:
+        # Ngay cả khi t_idx ở OOS, analog vẫn chỉ tìm trong training
+        exclude_cutoff = min(t_idx - 90, oos_start_idx - 1)
+        candidates     = [i for i in vector_indices if i < exclude_cutoff]
+        if len(candidates) < 10:
+            continue
+
+        # Cosine similarity
+        sim_list = []
+        for c_idx in candidates:
+            c_vec  = vectors[c_idx]
+            c_arr  = np.array([c_vec.get(d, 0.0) for d in dims], dtype=float)
+            c_norm = np.linalg.norm(c_arr)
+            if c_norm < 1e-9:
+                continue
+            sim = float(np.dot(target_arr, c_arr) / (t_norm * c_norm))
+            if sim >= threshold:
+                sim_list.append((c_idx, sim))
+
+        if not sim_list:
+            continue
+
+        # MDS
+        sim_list.sort(key=lambda x: -x[1])
+        kept = []
+        for c_idx, sim in sim_list:
+            c_date    = pd.Timestamp(dates[c_idx])
+            too_close = any(
+                abs((c_date - pd.Timestamp(dates[k])).days) < MDS_DAYS
+                for k, _ in kept
+            )
+            if not too_close:
+                kept.append((c_idx, sim))
+
+        if len(kept) < MIN_SAMPLES:
+            if is_oos:
+                n_skip_oos += 1
+            else:
+                n_skip_train += 1
+            continue
+
+        # Forward return 30D
+        fwd_rets = []
+        mae_vals = []
+        for c_idx, _ in kept:
+            fwd_idx = c_idx + FWD_DAYS
+            if fwd_idx >= n_bars:
+                continue
+            entry = close_arr[c_idx]
+            fwd_rets.append((close_arr[fwd_idx] - entry) / entry * 100)
+            win_low = np.min(low_arr[c_idx + 1: fwd_idx + 1]) if fwd_idx > c_idx else entry
+            mae_vals.append((win_low - entry) / entry * 100)
+
+        if len(fwd_rets) < MIN_SAMPLES:
+            if is_oos:
+                n_skip_oos += 1
+            else:
+                n_skip_train += 1
+            continue
+
+        # Actual forward return tại ngày T (OOS: đây là kết quả thực tế)
+        actual_fwd_idx = t_idx + FWD_DAYS
+        if actual_fwd_idx >= n_bars:
+            # Chưa có kết quả (chưa đủ 30 ngày) → ghi nhận pending
+            signal = {
+                "t_idx":    t_idx,
+                "t_date":   str(t_date)[:10],
+                "fwd_rets": fwd_rets,
+                "mae_vals": mae_vals,
+                "predicted":float(np.median(fwd_rets)),
+                "actual":   None,   # chưa có kết quả
+                "pending":  True,
+            }
+        else:
+            actual = (close_arr[actual_fwd_idx] - close_arr[t_idx]) / close_arr[t_idx] * 100
+            signal = {
+                "t_idx":    t_idx,
+                "t_date":   str(t_date)[:10],
+                "fwd_rets": fwd_rets,
+                "mae_vals": mae_vals,
+                "predicted":float(np.median(fwd_rets)),
+                "actual":   actual,
+                "pending":  False,
+            }
+
+        if is_oos:
+            oos_signals.append(signal)
+        else:
+            train_signals.append(signal)
+
+    # ── Tính metrics OOS (chỉ tín hiệu đã có kết quả) ─────────────────────────
+    def _calc_metrics(signals):
+        completed = [s for s in signals if not s.get("pending") and s["actual"] is not None]
+        if len(completed) < 3:
+            return None
+        actuals  = [s["actual"] for s in completed]
+        wins     = [x for x in actuals if x >= WIN_THRESH]
+        losses   = [x for x in actuals if x < WIN_THRESH]
+        wr       = len(wins) / len(actuals)
+        mean_exp = float(np.mean(actuals))
+        med_exp  = float(np.median(actuals))
+        std_ret  = float(np.std(actuals)) if len(actuals) > 1 else 1e-9
+        sharpe   = mean_exp / std_ret * (52 ** 0.5) if std_ret > 0 else 0.0
+        pos_sum  = sum(wins)
+        neg_sum  = abs(sum(losses)) if losses else 1e-9
+        pf       = pos_sum / neg_sum if neg_sum > 0 else 99.0
+        # Median MAE
+        all_maes = [float(np.median(s["mae_vals"])) for s in completed if s.get("mae_vals")]
+        mae30    = float(np.median(all_maes)) if all_maes else 0.0
+        # MaxDD equity curve
+        equity   = np.cumprod([1.0 + r / 100.0 for r in actuals])
+        peak     = np.maximum.accumulate(equity)
+        max_dd   = float(np.min((equity - peak) / peak * 100)) if len(equity) > 1 else 0.0
+        return {
+            "n":        len(completed),
+            "n_pending":len([s for s in signals if s.get("pending")]),
+            "wr":       round(wr * 100, 1),
+            "mean_exp": round(mean_exp, 2),
+            "med_exp":  round(med_exp, 2),
+            "sharpe":   round(sharpe, 3),
+            "pf":       round(pf, 2),
+            "mae30":    round(mae30, 2),
+            "max_dd":   round(max_dd, 1),
+        }
+
+    oos_metrics   = _calc_metrics(oos_signals)
+    train_metrics = _calc_metrics(train_signals)
+
+    return {
+        "status":        "ok",
+        "symbol":        symbol,
+        "combo":         combo_name,
+        "threshold":     threshold,
+        "wf_start":      _WF_START_DATE,
+        "n_oos_bars":    n_oos_bars,
+        "n_skip_oos":    n_skip_oos,
+        "n_skip_train":  n_skip_train,
+        "oos_signals":   oos_signals,
+        "oos_metrics":   oos_metrics,
+        "train_metrics": train_metrics,
+    }
+
+
+def _format_wf_result(res: dict) -> str:
+    """Format kết quả walk-forward so sánh OOS vs Training."""
+    symbol    = res["symbol"]
+    combo     = res["combo"]
+    threshold = res["threshold"]
+    wf_start  = res["wf_start"]
+    oos_m     = res.get("oos_metrics")
+    train_m   = res.get("train_metrics")
+    oos_sigs  = res.get("oos_signals", [])
+    n_pending = sum(1 for s in oos_sigs if s.get("pending"))
+
+    sep  = "=" * 36
+    sep2 = "-" * 36
+
+    lines = [
+        f"WALK-FORWARD: {symbol}",
+        f"Config: {combo} | nguong {threshold}",
+        f"OOS: {wf_start} → hom nay",
+        sep,
+    ]
+
+    # ── Training metrics ──────────────────────────────────────────────────────
+    lines.append("TRAINING (in-sample, truoc 2025):")
+    if train_m:
+        lines.append(
+            f"  WR {train_m['wr']:.0f}%  "
+            f"Exp {train_m['mean_exp']:+.2f}%  "
+            f"PF {train_m['pf']:.2f}  "
+            f"Sharpe {train_m['sharpe']:.2f}  "
+            f"n={train_m['n']}"
+        )
+        lines.append(
+            f"  MAE30 {train_m['mae30']:.1f}%  MaxDD {train_m['max_dd']:.1f}%"
+        )
+    else:
+        lines.append("  Khong du tin hieu training.")
+    lines.append(sep2)
+
+    # ── OOS metrics ───────────────────────────────────────────────────────────
+    lines.append(f"OUT-OF-SAMPLE ({wf_start} → hom nay):")
+    if oos_m:
+        lines.append(
+            f"  WR {oos_m['wr']:.0f}%  "
+            f"Exp {oos_m['mean_exp']:+.2f}%  "
+            f"PF {oos_m['pf']:.2f}  "
+            f"Sharpe {oos_m['sharpe']:.2f}  "
+            f"n={oos_m['n']}"
+            + (f" (+{n_pending} pending)" if n_pending else "")
+        )
+        lines.append(
+            f"  MAE30 {oos_m['mae30']:.1f}%  MaxDD {oos_m['max_dd']:.1f}%"
+        )
+    else:
+        lines.append(
+            f"  Chua du tin hieu OOS (can >= 3 tin hieu hoan thanh)."
+            + (f" Co {n_pending} tin hieu dang cho ket qua (< 30 ngay)." if n_pending else "")
+        )
+    lines.append(sep2)
+
+    # ── So sánh OOS vs Training ───────────────────────────────────────────────
+    if oos_m and train_m:
+        lines.append("SO SANH OOS vs TRAINING:")
+
+        def _delta(oos_val, train_val, higher_is_better=True):
+            diff = oos_val - train_val
+            ok   = diff >= 0 if higher_is_better else diff <= 0
+            sign = "+" if diff >= 0 else ""
+            em   = "✅" if ok else "⚠️"
+            return f"{em} {sign}{diff:.2f}"
+
+        lines.append(
+            f"  Exp   : OOS {oos_m['mean_exp']:+.2f}% vs Train {train_m['mean_exp']:+.2f}%  "
+            f"{_delta(oos_m['mean_exp'], train_m['mean_exp'])}"
+        )
+        lines.append(
+            f"  PF    : OOS {oos_m['pf']:.2f} vs Train {train_m['pf']:.2f}  "
+            f"{_delta(oos_m['pf'], train_m['pf'])}"
+        )
+        lines.append(
+            f"  WR    : OOS {oos_m['wr']:.0f}% vs Train {train_m['wr']:.0f}%  "
+            f"{_delta(oos_m['wr'], train_m['wr'])}"
+        )
+        lines.append(
+            f"  MaxDD : OOS {oos_m['max_dd']:.1f}% vs Train {train_m['max_dd']:.1f}%  "
+            f"{_delta(oos_m['max_dd'], train_m['max_dd'], higher_is_better=False)}"
+        )
+        lines.append(sep2)
+
+        # ── Verdict ───────────────────────────────────────────────────────────
+        lines.append("VERDICT:")
+        exp_ok  = oos_m["mean_exp"] > 0
+        pf_ok   = oos_m["pf"] >= 1.5
+        exp_deg = oos_m["mean_exp"] >= train_m["mean_exp"] * 0.60  # cho phép giảm tối đa 40%
+        pf_deg  = oos_m["pf"] >= train_m["pf"] * 0.50
+
+        if exp_ok and pf_ok and exp_deg and pf_deg:
+            lines.append(
+                f"  ✅ PASS — Pattern con gia tri tren OOS."
+            )
+            lines.append(
+                f"     Exp {oos_m['mean_exp']:+.2f}% dương, PF {oos_m['pf']:.2f} >= 1.5."
+            )
+            if oos_m["mean_exp"] >= train_m["mean_exp"] * 0.80:
+                lines.append("     Hieu suat OOS giu duoc >= 80% so voi training — rat tot.")
+            else:
+                lines.append("     Hieu suat OOS giam nhung van chap nhan duoc (>60% training).")
+            lines.append("     → Co the tien toi live trading than trong.")
+        elif exp_ok and pf_ok:
+            lines.append(
+                f"  🟡 PARTIAL PASS — Exp va PF van duong nhung suy giam nhieu."
+            )
+            lines.append(
+                f"     Exp OOS = {oos_m['mean_exp'] / train_m['mean_exp'] * 100:.0f}% so voi training."
+            )
+            lines.append("     → Theo doi them, chua nen live trading.")
+        else:
+            lines.append("  🔴 FAIL — OOS khong xac nhan pattern training.")
+            if not exp_ok:
+                lines.append(f"     Exp OOS am ({oos_m['mean_exp']:+.2f}%) — pattern het hieu luc.")
+            if not pf_ok:
+                lines.append(f"     PF OOS {oos_m['pf']:.2f} < 1.5 — he thong khong co loi nhuan thuc.")
+            lines.append("     → Khong dung cho live trading.")
+
+        # Cảnh báo n nhỏ
+        if oos_m["n"] < 20:
+            lines.append(
+                f"  ⚠️  Chi co {oos_m['n']} tin hieu OOS — "
+                f"ket qua co the chua on dinh, can them thoi gian."
+            )
+
+    lines.append("")
+    lines.append(
+        "Config da duoc fix truoc khi chay OOS — ket qua nay co gia tri thong ke."
+    )
+    lines.append(sep)
+    return "\n".join(lines)
+
+
+async def walkforward_analog_cmd(update, context):
+    """
+    /walkforward_analog [MA1 MA2 ...]
+
+    Walk-forward OOS test tu 2025-01-01 den hom nay.
+    Config co dinh theo ket qua backtest + detail.
+
+    Vi du:
+      /walkforward_analog              (chay ca 4 ma mac dinh)
+      /walkforward_analog FPT MWG      (chi FPT va MWG)
+      /walkforward_analog HPG
+    """
+    try:
+        from bot import is_allowed, _deny
+    except ImportError:
+        def is_allowed(_): return True
+        async def _deny(_): pass
+
+    if not is_allowed(update):
+        await _deny(update)
+        return
+
+    args = context.args or []
+
+    # Nếu không có args → chạy tất cả mã có config
+    if not args:
+        symbols = list(_WF_SYMBOL_CONFIG.keys())
+    else:
+        import re as _re
+        symbols = [a.upper() for a in args if _re.match(r'^[A-Z0-9]{2,10}$', a.upper())]
+        # Lọc chỉ mã có config
+        unknown = [s for s in symbols if s not in _WF_SYMBOL_CONFIG]
+        symbols = [s for s in symbols if s in _WF_SYMBOL_CONFIG]
+        if unknown:
+            await update.message.reply_text(
+                f"Cac ma chua co config: {', '.join(unknown)}\n"
+                f"Ma co san: {', '.join(_WF_SYMBOL_CONFIG)}"
+            )
+            if not symbols:
+                return
+
+    # Rate limit
+    user_id = str(update.effective_user.id) if update.effective_user else "unknown"
+    since   = time.time() - _last_backtest_analog_wf.get(user_id, 0)
+    if since < BACKTEST_ANALOG_WF_COOLDOWN:
+        wait = int(BACKTEST_ANALOG_WF_COOLDOWN - since)
+        await update.message.reply_text(f"Vui long cho {wait}s truoc khi chay tiep.")
+        return
+    _last_backtest_analog_wf[user_id] = time.time()
+
+    chat_id = update.effective_chat.id
+    msg     = await update.message.reply_text(
+        f"Walk-forward OOS: {', '.join(symbols)}\n"
+        f"Giai doan: {_WF_START_DATE} → hom nay\n"
+        f"Uoc tinh ~2-4 phut/ma..."
+    )
+
+    async def _bg():
+        try:
+            all_results = {}
+            for i, symbol in enumerate(symbols, 1):
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg.message_id,
+                        text=(
+                            f"Walk-forward: {symbol} ({i}/{len(symbols)})\n"
+                            f"Config: {_WF_SYMBOL_CONFIG[symbol]['combo']} "
+                            f"| nguong {_WF_SYMBOL_CONFIG[symbol]['threshold']}\n"
+                            f"Dang tinh..."
+                        ),
+                    )
+                except Exception:
+                    pass
+
+                res = await asyncio.to_thread(_run_walkforward_sync, symbol)
+                all_results[symbol] = res
+
+                # Gửi kết quả từng mã ngay khi xong
+                if res["status"] == "error":
+                    text = f"❌ {symbol}: {res.get('error','?')[:200]}"
+                else:
+                    text = _format_wf_result(res)
+
+                if i == 1 and len(symbols) == 1:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg.message_id,
+                        text=_plain(text)[:4096],
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=_plain(text)[:4096],
+                    )
+
+            # Nếu nhiều mã → gửi tổng kết
+            if len(symbols) > 1:
+                summary_lines = [
+                    "TONG KET WALK-FORWARD",
+                    f"Giai doan: {_WF_START_DATE} → hom nay",
+                    "=" * 32,
+                ]
+                pass_syms    = []
+                partial_syms = []
+                fail_syms    = []
+
+                for symbol, res in all_results.items():
+                    if res["status"] == "error":
+                        fail_syms.append(f"{symbol}(loi)")
+                        continue
+                    oos_m = res.get("oos_metrics")
+                    if not oos_m:
+                        fail_syms.append(f"{symbol}(chua du tin hieu)")
+                        continue
+                    train_m  = res.get("train_metrics", {}) or {}
+                    exp_ok   = oos_m["mean_exp"] > 0
+                    pf_ok    = oos_m["pf"] >= 1.5
+                    exp_deg  = oos_m["mean_exp"] >= (train_m.get("mean_exp", 0) or 0) * 0.60
+                    pf_deg   = oos_m["pf"] >= (train_m.get("pf", 0) or 0) * 0.50
+
+                    cfg = _WF_SYMBOL_CONFIG[symbol]
+                    line = (
+                        f"  {symbol}: "
+                        f"Exp {oos_m['mean_exp']:+.2f}%  "
+                        f"PF {oos_m['pf']:.2f}  "
+                        f"WR {oos_m['wr']:.0f}%  "
+                        f"n={oos_m['n']}"
+                    )
+                    if exp_ok and pf_ok and exp_deg and pf_deg:
+                        summary_lines.append(f"✅ PASS   {line[4:]}")
+                        pass_syms.append(symbol)
+                    elif exp_ok and pf_ok:
+                        summary_lines.append(f"🟡 PARTIAL{line[4:]}")
+                        partial_syms.append(symbol)
+                    else:
+                        summary_lines.append(f"🔴 FAIL   {line[4:]}")
+                        fail_syms.append(symbol)
+
+                summary_lines.append("-" * 32)
+                if pass_syms:
+                    summary_lines.append(f"PASS    : {', '.join(pass_syms)}")
+                if partial_syms:
+                    summary_lines.append(f"PARTIAL : {', '.join(partial_syms)}")
+                if fail_syms:
+                    summary_lines.append(f"FAIL    : {', '.join(fail_syms)}")
+                if pass_syms:
+                    summary_lines.append("")
+                    summary_lines.append(
+                        f"Ma du dieu kien live trading: {', '.join(pass_syms)}"
+                    )
+
+                # Edit message loading thành tổng kết
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg.message_id,
+                    text=_plain("\n".join(summary_lines))[:4096],
+                )
+
+        except Exception as e:
+            import traceback
+            logger.error(f"walkforward_analog_cmd error: {e}\n{traceback.format_exc()}")
+            err_text = f"Loi /walkforward_analog: {str(e)[:200]}"
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg.message_id, text=err_text,
+                )
+            except Exception:
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=err_text)
+                except Exception:
+                    pass
+
+    asyncio.create_task(_bg())
