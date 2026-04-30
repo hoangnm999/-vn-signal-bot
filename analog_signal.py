@@ -396,11 +396,13 @@ def _scan_symbol(symbol: str) -> Optional[dict]:
     if len(fwd_rets) < MIN_SAMPLES:
         return None
 
-    # Metrics
+    # Metrics — dùng median(fwd_rets) làm Exp, nhất quán với Tầng 1/2
+    # (Tầng 1/2: sig_rets = [median(fwd_rets) cho mỗi ngày T])
+    # WR/PF vẫn tính từ raw fwd_rets để giữ thông tin phân phối
+    exp      = float(np.median(fwd_rets))
     wins     = [x for x in fwd_rets if x >= WIN_THRESH]
     losses   = [x for x in fwd_rets if x < WIN_THRESH]
     wr       = len(wins) / len(fwd_rets)
-    exp      = float(np.mean(fwd_rets))
     pos_sum  = sum(wins)
     neg_sum  = abs(sum(losses)) if losses else 1e-9
     pf       = pos_sum / neg_sum if neg_sum > 0 else 99.0

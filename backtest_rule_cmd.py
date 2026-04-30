@@ -1304,9 +1304,12 @@ def _run_analog_backtest_sync(symbol: str, days: int = 1800) -> dict:
             mae30    = float(np.median(sig_maes))
 
             # Max Drawdown của equity curve
-            equity   = np.cumprod([1.0 + r / 100.0 for r in sig_rets])
+            # Dùng cumsum (% cộng dồn) thay cumprod vì các tín hiệu overlap
+            # (bước 7 ngày + hold 30 ngày → 4-5 tín hiệu đang mở đồng thời)
+            # cumprod compound sai khi signals không nối tiếp nhau
+            equity   = np.cumsum(sig_rets)
             peak     = np.maximum.accumulate(equity)
-            max_dd   = float(np.min((equity - peak) / peak * 100))
+            max_dd   = float(np.min(equity - peak))
 
             results.append({
                 "combo":     combo_name,
@@ -2139,9 +2142,9 @@ def _run_analog_detail_sync(symbol: str, combo_name: str, days: int = 1800) -> d
         neg_sum  = abs(sum(losses)) if losses else 1e-9
         pf       = pos_sum / neg_sum if neg_sum > 0 else 99.0
         mae30    = float(np.median(sig_maes))
-        equity   = np.cumprod([1.0 + r / 100.0 for r in sig_rets])
+        equity   = np.cumsum(sig_rets)
         peak     = np.maximum.accumulate(equity)
-        max_dd   = float(np.min((equity - peak) / peak * 100))
+        max_dd   = float(np.min(equity - peak))
 
         threshold_results.append({
             "threshold": threshold,
@@ -2678,10 +2681,10 @@ def _run_walkforward_sync(symbol: str) -> dict:
         # Median MAE
         all_maes = [float(np.median(s["mae_vals"])) for s in completed if s.get("mae_vals")]
         mae30    = float(np.median(all_maes)) if all_maes else 0.0
-        # MaxDD equity curve
-        equity   = np.cumprod([1.0 + r / 100.0 for r in actuals])
+        # MaxDD equity curve — cumsum vì signals overlap (bước 7n + hold 30n)
+        equity   = np.cumsum(actuals)
         peak     = np.maximum.accumulate(equity)
-        max_dd   = float(np.min((equity - peak) / peak * 100)) if len(equity) > 1 else 0.0
+        max_dd   = float(np.min(equity - peak)) if len(equity) > 1 else 0.0
         return {
             "n":        len(completed),
             "n_pending":len([s for s in signals if s.get("pending")]),
@@ -3263,9 +3266,9 @@ def _run_pipeline_sync(symbol: str, days: int = 1800) -> dict:
         pf       = pos_sum / neg_sum if neg_sum > 0 else 99.0
         all_maes = [float(np.median(s["mae_vals"])) for s in done if s.get("mae_vals")]
         mae30    = float(np.median(all_maes)) if all_maes else 0.0
-        equity   = np.cumprod([1.0 + r / 100.0 for r in actuals])
+        equity   = np.cumsum(actuals)
         peak     = np.maximum.accumulate(equity)
-        max_dd   = float(np.min((equity - peak) / peak * 100)) if len(equity) > 1 else 0.0
+        max_dd   = float(np.min(equity - peak)) if len(equity) > 1 else 0.0
         return {
             "n":         len(done),
             "n_pending": len([s for s in signals if s.get("pending")]),
