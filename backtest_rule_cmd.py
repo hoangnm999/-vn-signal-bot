@@ -1327,7 +1327,18 @@ def _run_analog_backtest_sync(symbol: str, days: int = 1800) -> dict:
 
     # 4. Xếp hạng ──────────────────────────────────────────────────────────────
     valid = [r for r in results if not r.get("skip")]
-    valid.sort(key=lambda x: x["sharpe"], reverse=True)
+    # Xếp hạng: Exp > 0 và PF >= 1.5 trước, sau đó sort theo Exp DESC, PF tiebreak
+    # Sharpe chỉ dùng tiebreak cuối cùng
+    def _rank_key(r):
+        exp_ok = r["mean_exp"] > 0
+        pf_ok  = r["pf"] >= 1.5
+        return (
+            int(exp_ok and pf_ok),   # pass bộ lọc cứng lên trước
+            r["mean_exp"],           # Exp cao hơn → tốt hơn
+            r["pf"],                 # PF tiebreak
+            r["sharpe"],             # Sharpe tiebreak cuối
+        )
+    valid.sort(key=_rank_key, reverse=True)
 
     baseline = next(
         (r for r in results
@@ -1427,53 +1438,72 @@ def _format_analog_backtest_result(res: dict) -> str:
 
     lines.append(sep2)
 
-    # Phân tích combo giao thoa
+    # Phân tích combo giao thoa — sort theo Exp+PF
     cross_res = sorted(
-        [r for r in all_res if r.get("group") == "crossover" and not r.get("skip")],
-        key=lambda x: x["sharpe"], reverse=True,
+        [r for r in all_res if r.get("group") == "crossover" and not r.get("skip")
+         and r["mean_exp"] > 0],
+        key=lambda x: (x["mean_exp"], x["pf"]), reverse=True,
     )
     if cross_res:
-        bc = cross_res[0]
-        bl_sharpe = baseline["sharpe"] if baseline else 0.0
-        diff = bc["sharpe"] - bl_sharpe
+        bc      = cross_res[0]
+        bl_exp  = baseline["mean_exp"] if baseline else 0.0
+        diff    = bc["mean_exp"] - bl_exp
         verdict = "tot hon" if diff > 0 else "kem hon"
-        lines.append("COMBO GIAO THOA (tot nhat):")
+        lines.append("COMBO GIAO THOA (tot nhat theo Exp+PF):")
         lines.append(
             f"  {bc['combo']} | nguong {bc['threshold']:.2f} | "
-            f"WR {bc['wr']:.0f}%  Exp {bc['mean_exp']:+.2f}%  "
-            f"Sharpe {bc['sharpe']:.2f}"
+            f"Exp {bc['mean_exp']:+.2f}%  PF {bc['pf']:.2f}  WR {bc['wr']:.0f}%"
         )
-        lines.append(f"  → {verdict} baseline {abs(diff):.2f} Sharpe")
+        lines.append(f"  → {verdict} baseline {abs(diff):.2f}% Exp")
         lines.append(sep2)
 
     # Nhận xét tự động
     lines.append("NHAN XET:")
+    lines.append("  Xep hang: Exp (chinh) → PF (tiebreak). WR chi tham khao tam ly.")
     if top and baseline:
-        best = top[0]
-        diff = best["sharpe"] - baseline["sharpe"]
-        if diff > 0.15:
-            lines.append(
-                f"  Chon loc chieu CO LOI ro rang: {best['combo']} "
-                f"vuot baseline {diff:+.2f} Sharpe."
-            )
-        elif diff > 0:
-            lines.append(
-                f"  Chon loc chieu loi nhat hoc (+{diff:.2f} Sharpe). "
-                f"Full 15 chieu van on."
-            )
+        best    = top[0]
+        bl_exp  = baseline["mean_exp"] if baseline else 0.0
+        exp_diff = best["mean_exp"] - bl_exp
+
+        # Pass bộ lọc cứng không?
+        if best["mean_exp"] > 0 and best["pf"] >= 1.5:
+            if exp_diff > 0.5:
+                lines.append(
+                    f"  Chon loc chieu CO LOI ro rang: {best['combo']} "
+                    f"Exp {best['mean_exp']:+.2f}% (baseline {bl_exp:+.2f}%), "
+                    f"PF {best['pf']:.2f}."
+                )
+            elif exp_diff > 0:
+                lines.append(
+                    f"  Chon loc chieu loi nhat hoc: Exp chi tot hon baseline "
+                    f"{exp_diff:+.2f}%. Full 15 chieu van chap nhan duoc."
+                )
+            else:
+                lines.append(
+                    f"  Full 15 chieu co Exp tot hon. Chon loc chieu KHONG cai thien Exp."
+                )
         else:
             lines.append(
-                f"  Full 15 chieu la tot nhat voi {symbol}."
+                f"  CANH BAO: Top combo chua pass bo loc cung "
+                f"(Exp {best['mean_exp']:+.2f}%, PF {best['pf']:.2f}). "
+                f"Ket qua nay khong nen dung cho live trading."
+            )
+
+        # WR note — chỉ nêu nếu WR thấp để cảnh báo tâm lý
+        if best["wr"] < 50:
+            lines.append(
+                f"  Luu y tam ly: WR {best['wr']:.0f}% — "
+                f"thuong thua nhieu hon thang, can ky luat cao."
             )
 
         avg_n = sum(r["n_signals"] for r in top[:5]) / max(len(top[:5]), 1)
         if avg_n < 15:
-            lines.append(f"  CANH BAO: Trung binh {avg_n:.0f} tin hieu — thieu y nghia thong ke.")
+            lines.append(f"  CANH BAO: TB {avg_n:.0f} tin hieu/exp — thieu y nghia thong ke.")
         else:
             lines.append(f"  So tin hieu TB: {avg_n:.0f} — du de tham khao.")
 
-        thresh_top5 = [r["threshold"] for r in top[:5]]
-        best_thresh = Counter(thresh_top5).most_common(1)[0][0]
+        thresh_top5    = [r["threshold"] for r in top[:5]]
+        best_thresh    = Counter(thresh_top5).most_common(1)[0][0]
         lines.append(f"  Nguong pho bien trong top 5: {best_thresh:.2f}")
 
         groups_top5    = [r["group"] for r in top[:5]]
@@ -1673,7 +1703,8 @@ def _format_batch_result(batch: dict) -> str:
         rows.append(row)
         all_top1.append(best["combo"])
 
-        if best["sharpe"] >= 1.0 and best["wr"] >= 55 and best["mean_exp"] > 0:
+        # Bộ lọc cứng: Exp > 0 và PF >= 1.5 (WR chỉ tham khảo tâm lý)
+        if best["mean_exp"] > 0 and best["pf"] >= 1.5:
             good_syms.append(symbol)
         else:
             weak_syms.append(symbol)
@@ -1913,6 +1944,495 @@ async def backtest_analog_batch_cmd(update, context):
             import traceback
             logger.error(f"backtest_analog_batch_cmd error: {e}\n{traceback.format_exc()}")
             err_text = f"Loi /backtest_analog_batch: {str(e)[:200]}"
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg.message_id, text=err_text,
+                )
+            except Exception:
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=err_text)
+                except Exception:
+                    pass
+
+    asyncio.create_task(_bg())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKTEST ANALOG DETAIL — full threshold table cho 1 mã + 1 combo
+# ══════════════════════════════════════════════════════════════════════════════
+
+BACKTEST_ANALOG_DETAIL_COOLDOWN = 180   # 3 phút per user
+_last_backtest_analog_detail: dict[str, float] = {}
+
+# Map tên combo → index trong _ANALOG_COMBOS (dùng để lookup)
+def _find_combo(name_query: str) -> dict | None:
+    """
+    Tìm combo theo tên, hỗ trợ partial match không phân biệt hoa thường.
+    Ví dụ: "oversold" → "Oversold + Momentum"
+    """
+    q = name_query.lower().strip()
+    # Exact match trước
+    for c in _ANALOG_COMBOS:
+        if c["name"].lower() == q:
+            return c
+    # Partial match
+    for c in _ANALOG_COMBOS:
+        if q in c["name"].lower():
+            return c
+    # Match từng từ
+    words = q.split()
+    for c in _ANALOG_COMBOS:
+        if all(w in c["name"].lower() for w in words):
+            return c
+    return None
+
+
+def _run_analog_detail_sync(symbol: str, combo_name: str, days: int = 1800) -> dict:
+    """
+    Chạy backtest cho 1 mã + 1 combo trên TẤT CẢ 7 threshold.
+    Tái sử dụng logic từ _run_analog_backtest_sync nhưng chỉ cho 1 combo.
+    """
+    import numpy as np
+    import pandas as pd
+
+    # Tìm combo
+    combo = _find_combo(combo_name)
+    if combo is None:
+        return {
+            "status": "error",
+            "error":  f"Khong tim thay combo '{combo_name}'. "
+                      f"Cac combo co san: {', '.join(c['name'] for c in _ANALOG_COMBOS)}"
+        }
+
+    # Fetch data
+    try:
+        from vn_loader import load_vn_ohlcv
+        df = load_vn_ohlcv(symbol, days=days, min_bars=200)
+    except Exception as e:
+        return {"status": "error", "error": f"Khong lay duoc data {symbol}: {e}"}
+
+    if df is None or len(df) < 200:
+        return {"status": "error", "error": "Khong du du lieu (can >= 200 bars)"}
+
+    n_bars    = len(df)
+    dates     = df["date"].values
+    close_arr = df["close"].values.astype(float)
+    low_arr   = df["low"].values.astype(float)
+
+    # Tính vectors
+    try:
+        from state_vector import compute_state_vector_for_date
+    except ImportError as e:
+        return {"status": "error", "error": f"Thieu state_vector: {e}"}
+
+    vectors = {}
+    for i in range(59, n_bars):
+        vec = compute_state_vector_for_date(df, i)
+        if vec is not None:
+            vectors[i] = vec
+
+    if len(vectors) < 100:
+        return {"status": "error", "error": f"Chi co {len(vectors)} vectors"}
+
+    vector_indices = sorted(vectors.keys())
+
+    WIN_THRESH  = 1.0
+    MIN_SAMPLES = 5
+    MDS_DAYS    = 30
+    FWD_DAYS    = 30
+    dims        = combo["dims"]
+
+    threshold_results = []
+
+    for threshold in _ANALOG_THRESHOLDS:
+        signals = []
+        n_skip  = 0
+
+        for t_idx in range(120, n_bars - FWD_DAYS - 1, 7):
+            if t_idx not in vectors:
+                continue
+
+            target_vec = vectors[t_idx]
+            target_arr = np.array([target_vec.get(d, 0.0) for d in dims], dtype=float)
+            t_norm     = np.linalg.norm(target_arr)
+            if t_norm < 1e-9:
+                continue
+
+            exclude_cutoff = t_idx - 90
+            candidates     = [i for i in vector_indices if i < exclude_cutoff]
+            if len(candidates) < 10:
+                continue
+
+            sim_list = []
+            for c_idx in candidates:
+                c_vec  = vectors[c_idx]
+                c_arr  = np.array([c_vec.get(d, 0.0) for d in dims], dtype=float)
+                c_norm = np.linalg.norm(c_arr)
+                if c_norm < 1e-9:
+                    continue
+                sim = float(np.dot(target_arr, c_arr) / (t_norm * c_norm))
+                if sim >= threshold:
+                    sim_list.append((c_idx, sim))
+
+            if not sim_list:
+                continue
+
+            # MDS
+            sim_list.sort(key=lambda x: -x[1])
+            kept = []
+            for c_idx, sim in sim_list:
+                c_date    = pd.Timestamp(dates[c_idx])
+                too_close = any(
+                    abs((c_date - pd.Timestamp(dates[k])).days) < MDS_DAYS
+                    for k, _ in kept
+                )
+                if not too_close:
+                    kept.append((c_idx, sim))
+
+            if len(kept) < MIN_SAMPLES:
+                n_skip += 1
+                continue
+
+            fwd_rets = []
+            mae_vals = []
+            for c_idx, _ in kept:
+                fwd_idx = c_idx + FWD_DAYS
+                if fwd_idx >= n_bars:
+                    continue
+                entry   = close_arr[c_idx]
+                fwd_rets.append((close_arr[fwd_idx] - entry) / entry * 100)
+                win_low = np.min(low_arr[c_idx + 1: fwd_idx + 1]) if fwd_idx > c_idx else entry
+                mae_vals.append((win_low - entry) / entry * 100)
+
+            if len(fwd_rets) < MIN_SAMPLES:
+                n_skip += 1
+                continue
+
+            signals.append({
+                "fwd_rets": fwd_rets,
+                "mae_vals": mae_vals,
+            })
+
+        # Metrics
+        if len(signals) < 5:
+            threshold_results.append({
+                "threshold": threshold,
+                "n_signals": len(signals),
+                "n_skip":    n_skip,
+                "skip":      True,
+            })
+            continue
+
+        sig_rets = [float(np.median(s["fwd_rets"])) for s in signals]
+        sig_maes = [float(np.median(s["mae_vals"])) for s in signals]
+
+        wins     = [x for x in sig_rets if x >= WIN_THRESH]
+        losses   = [x for x in sig_rets if x < WIN_THRESH]
+        wr       = len(wins) / len(sig_rets)
+        mean_exp = float(np.mean(sig_rets))
+        med_exp  = float(np.median(sig_rets))
+        std_ret  = float(np.std(sig_rets)) if len(sig_rets) > 1 else 1e-9
+        sharpe   = mean_exp / std_ret * (52 ** 0.5) if std_ret > 0 else 0.0
+        pos_sum  = sum(wins)
+        neg_sum  = abs(sum(losses)) if losses else 1e-9
+        pf       = pos_sum / neg_sum if neg_sum > 0 else 99.0
+        mae30    = float(np.median(sig_maes))
+        equity   = np.cumprod([1.0 + r / 100.0 for r in sig_rets])
+        peak     = np.maximum.accumulate(equity)
+        max_dd   = float(np.min((equity - peak) / peak * 100))
+
+        threshold_results.append({
+            "threshold": threshold,
+            "n_signals": len(signals),
+            "n_skip":    n_skip,
+            "wr":        round(wr * 100, 1),
+            "mean_exp":  round(mean_exp, 2),
+            "med_exp":   round(med_exp, 2),
+            "mae30":     round(mae30, 2),
+            "max_dd":    round(max_dd, 1),
+            "sharpe":    round(sharpe, 3),
+            "pf":        round(pf, 2),
+            "skip":      False,
+        })
+
+    return {
+        "status":   "ok",
+        "symbol":   symbol,
+        "combo":    combo["name"],
+        "dims":     dims,
+        "hypothesis": combo["hypothesis"],
+        "n_bars":   n_bars,
+        "n_vectors":len(vectors),
+        "threshold_results": threshold_results,
+    }
+
+
+def _format_detail_result(res: dict) -> str:
+    """Format full threshold table + khuyến nghị walk-forward."""
+    symbol    = res["symbol"]
+    combo     = res["combo"]
+    hypo      = res["hypothesis"]
+    n_bars    = res["n_bars"]
+    n_vecs    = res["n_vectors"]
+    rows      = res["threshold_results"]
+
+    sep  = "=" * 36
+    sep2 = "-" * 36
+
+    lines = [
+        f"DETAIL: {symbol} — {combo}",
+        f"{n_bars} bars | {n_vecs} vectors",
+        f">> {hypo}",
+        sep,
+        f"{'Nguong':<8} {'WR':<6} {'Exp':<8} {'Med':<8} {'Sharpe':<8} {'PF':<6} {'n':<5} {'MaxDD':<8} {'skip'}",
+        sep2,
+    ]
+
+    valid_rows = [r for r in rows if not r.get("skip")]
+
+    for r in rows:
+        if r.get("skip"):
+            lines.append(
+                f"{r['threshold']:.2f}    "
+                f"{'— skip (< 5 tin hieu)'}"
+                f"  skip={r['n_skip']}"
+            )
+            continue
+
+        # Đánh dấu row tốt nhất: pass bộ lọc cứng (Exp>0, PF>=1.5) + Exp cao nhất
+        pass_rows  = [r for r in valid_rows if r["mean_exp"] > 0 and r["pf"] >= 1.5]
+        best_exp_pf = max(pass_rows, key=lambda x: (x["mean_exp"], x["pf"])) if pass_rows else None
+        is_best = best_exp_pf and r["threshold"] == best_exp_pf["threshold"]
+        marker  = " ◄ Exp+PF" if is_best else ""
+
+        lines.append(
+            f"{r['threshold']:.2f}    "
+            f"{r['wr']:.0f}%   "
+            f"{r['mean_exp']:+.2f}%  "
+            f"{r['med_exp']:+.2f}%  "
+            f"{r['sharpe']:.2f}    "
+            f"{r['pf']:.2f}  "
+            f"{r['n_signals']:<5}"
+            f"{r['max_dd']:.1f}%  "
+            f"skip={r['n_skip']}"
+            f"{marker}"
+        )
+
+    lines.append(sep2)
+
+    # Phân tích và khuyến nghị
+    if not valid_rows:
+        lines.append("Khong co threshold nao du tin hieu.")
+        return "\n".join(lines)
+
+    # Best theo Exp+PF (bộ lọc cứng trước)
+    pass_rows = [r for r in valid_rows if r["mean_exp"] > 0 and r["pf"] >= 1.5]
+    if not pass_rows:
+        # Không có row nào pass → dùng tất cả valid, chọn Exp cao nhất
+        pass_rows = valid_rows
+
+    best_exp_row    = max(pass_rows, key=lambda x: (x["mean_exp"], x["pf"]))
+    # Risk-adjusted: Exp >= 90% max nhưng MaxDD nhỏ hơn
+    max_exp         = best_exp_row["mean_exp"]
+    risk_candidates = [r for r in pass_rows if r["mean_exp"] >= max_exp * 0.90]
+    best_risk_adj   = min(risk_candidates, key=lambda x: x["max_dd"])
+
+    lines.append("")
+    lines.append("PHAN TICH THRESHOLD:")
+    lines.append("  Xep hang: Exp (chinh) → PF (tiebreak) → Sharpe (tiebreak cuoi)")
+    lines.append("  WR chi tham khao tam ly, khong dung lam tieu chi loc chinh.")
+    lines.append("")
+
+    # Trend analysis
+    exp_vals    = [r["mean_exp"] for r in valid_rows]
+    pf_vals     = [r["pf"]      for r in valid_rows]
+    max_dd_vals = [r["max_dd"]  for r in valid_rows]
+    if len(exp_vals) >= 3:
+        peak_idx = exp_vals.index(max(exp_vals))
+        has_peak = 0 < peak_idx < len(exp_vals) - 1
+        if has_peak:
+            lines.append(
+                f"  Exp dat dinh tai nguong {valid_rows[peak_idx]['threshold']:.2f} "
+                f"— tang hoac giam nguong deu kem hon."
+            )
+        else:
+            lines.append(
+                f"  Exp tang dan theo threshold "
+                f"(nguong cao = chat loc tot hon voi combo nay)."
+            )
+        dd_improving = all(
+            max_dd_vals[i] >= max_dd_vals[i+1]
+            for i in range(len(max_dd_vals)-1)
+        )
+        if dd_improving:
+            lines.append(
+                "  MaxDD giam dan khi tang threshold — it rui ro hon."
+            )
+
+    lines.append("")
+    lines.append(
+        f"  Exp+PF tot nhat : nguong {best_exp_row['threshold']:.2f} "
+        f"(Exp {best_exp_row['mean_exp']:+.2f}%, PF {best_exp_row['pf']:.2f}, "
+        f"MaxDD {best_exp_row['max_dd']:.1f}%)"
+    )
+    lines.append(
+        f"  Risk-adjusted   : nguong {best_risk_adj['threshold']:.2f} "
+        f"(Exp {best_risk_adj['mean_exp']:+.2f}%, PF {best_risk_adj['pf']:.2f}, "
+        f"MaxDD {best_risk_adj['max_dd']:.1f}%)"
+    )
+    if best_exp_row["wr"] < 50:
+        lines.append(
+            f"  Luu y tam ly: WR {best_exp_row['wr']:.0f}% — "
+            f"chap nhan cuoi thua nhieu hon thang nhung Exp va PF van duong."
+        )
+    lines.append("")
+    lines.append("KHUYEN NGHI WALK-FORWARD:")
+    if best_exp_row["threshold"] == best_risk_adj["threshold"]:
+        lines.append(
+            f"  → Dung nguong {best_exp_row['threshold']:.2f} "
+            f"(vua Exp+PF tot nhat vua MaxDD tot)."
+        )
+    else:
+        lines.append(
+            f"  → Uu tien loi nhuan cao : {best_exp_row['threshold']:.2f} "
+            f"(Exp {best_exp_row['mean_exp']:+.2f}%, PF {best_exp_row['pf']:.2f})"
+        )
+        lines.append(
+            f"  → Uu tien rui ro thap  : {best_risk_adj['threshold']:.2f} "
+            f"(Exp {best_risk_adj['mean_exp']:+.2f}%, MaxDD {best_risk_adj['max_dd']:.1f}%)"
+        )
+        exp_diff = best_exp_row["mean_exp"] - best_risk_adj["mean_exp"]
+        dd_diff  = abs(best_exp_row["max_dd"] - best_risk_adj["max_dd"])
+        lines.append(
+            f"  → Goi y: dung {best_risk_adj['threshold']:.2f} cho live trading "
+            f"(Exp chi kem {exp_diff:.2f}% nhung MaxDD tot hon {dd_diff:.1f}%)"
+        )
+
+    lines.append("")
+    lines.append(
+        "Day la IN-SAMPLE. Fix threshold truoc khi chay walk-forward,"
+    )
+    lines.append("khong dieu chinh sau khi thay ket qua.")
+    lines.append(sep)
+
+    return "\n".join(lines)
+
+
+async def backtest_analog_detail_cmd(update, context):
+    """
+    /backtest_analog_detail <MA> <combo> [days]
+
+    Hien thi full threshold table (7 nguong) cho 1 ma + 1 combo.
+    Giup chon threshold chinh xac truoc khi walk-forward.
+
+    Vi du:
+      /backtest_analog_detail SSI "Oversold + Momentum"
+      /backtest_analog_detail HPG "Volume Confirmed"
+      /backtest_analog_detail HPG volume          (partial match)
+      /backtest_analog_detail SSI oversold 1500
+    """
+    try:
+        from bot import is_allowed, _deny
+    except ImportError:
+        def is_allowed(_): return True
+        async def _deny(_): pass
+
+    if not is_allowed(update):
+        await _deny(update)
+        return
+
+    args = context.args or []
+
+    # List combos nếu không có args
+    if not args:
+        combo_list = "\n".join(f"  • {c['name']}" for c in _ANALOG_COMBOS)
+        await update.message.reply_text(
+            "Cu phap: /backtest_analog_detail <MA> <combo> [days]\n\n"
+            "Vi du:\n"
+            "  /backtest_analog_detail SSI oversold\n"
+            "  /backtest_analog_detail HPG volume\n"
+            "  /backtest_analog_detail HPG \"Volume Confirmed\" 1500\n\n"
+            f"Cac combo co san:\n{combo_list}"
+        )
+        return
+
+    import re as _re
+
+    # Parse symbol
+    symbol = args[0].upper().strip()
+    if not _re.match(r'^[A-Z0-9]{2,10}$', symbol):
+        await update.message.reply_text(f"Ma '{symbol}' khong hop le.")
+        return
+
+    if len(args) < 2:
+        await update.message.reply_text(
+            f"Can them ten combo. Vi du:\n"
+            f"  /backtest_analog_detail {symbol} volume\n"
+            f"  /backtest_analog_detail {symbol} oversold"
+        )
+        return
+
+    # Parse combo name và days
+    # Ghép args[1:] để hỗ trợ tên combo nhiều từ
+    joined  = " ".join(args[1:])
+    # Tách days nếu có số ở cuối
+    days    = 1800
+    parts   = joined.rsplit(" ", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        days       = max(500, min(int(parts[1]), 2500))
+        combo_query = parts[0].strip().strip('"')
+    else:
+        combo_query = joined.strip().strip('"')
+
+    # Validate combo
+    combo = _find_combo(combo_query)
+    if combo is None:
+        combo_list = "\n".join(f"  • {c['name']}" for c in _ANALOG_COMBOS)
+        await update.message.reply_text(
+            f"Khong tim thay combo '{combo_query}'.\n\n"
+            f"Cac combo co san:\n{combo_list}"
+        )
+        return
+
+    # Rate limit
+    user_id = str(update.effective_user.id) if update.effective_user else "unknown"
+    since   = time.time() - _last_backtest_analog_detail.get(user_id, 0)
+    if since < BACKTEST_ANALOG_DETAIL_COOLDOWN:
+        wait = int(BACKTEST_ANALOG_DETAIL_COOLDOWN - since)
+        await update.message.reply_text(f"Vui long cho {wait}s truoc khi chay tiep.")
+        return
+    _last_backtest_analog_detail[user_id] = time.time()
+
+    chat_id = update.effective_chat.id
+    msg     = await update.message.reply_text(
+        f"Detail: {symbol} — {combo['name']}\n"
+        f"7 threshold × 1 combo | {days} ngay\n"
+        f"Uoc tinh ~2-4 phut..."
+    )
+
+    async def _bg():
+        try:
+            result = await asyncio.to_thread(
+                _run_analog_detail_sync, symbol, combo_query, days
+            )
+
+            if result["status"] == "error":
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg.message_id,
+                    text=f"Loi: {result.get('error','?')[:300]}",
+                )
+                return
+
+            summary = _format_detail_result(result)
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg.message_id,
+                text=_plain(summary)[:4096],
+            )
+
+        except Exception as e:
+            import traceback
+            logger.error(f"backtest_analog_detail_cmd error: {e}\n{traceback.format_exc()}")
+            err_text = f"Loi /backtest_analog_detail: {str(e)[:200]}"
             try:
                 await context.bot.edit_message_text(
                     chat_id=chat_id, message_id=msg.message_id, text=err_text,
