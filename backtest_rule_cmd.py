@@ -1303,13 +1303,11 @@ def _run_analog_backtest_sync(symbol: str, days: int = 1800) -> dict:
             pf       = pos_sum / neg_sum if neg_sum > 0 else 99.0
             mae30    = float(np.median(sig_maes))
 
-            # Max Drawdown của equity curve
-            # Dùng cumsum (% cộng dồn) thay cumprod vì các tín hiệu overlap
-            # (bước 7 ngày + hold 30 ngày → 4-5 tín hiệu đang mở đồng thời)
-            # cumprod compound sai khi signals không nối tiếp nhau
-            equity   = np.cumsum(sig_rets)
-            peak     = np.maximum.accumulate(equity)
-            max_dd   = float(np.min(equity - peak))
+            # Worst Signal = return tệ nhất của 1 tín hiệu đơn lẻ
+            # Đây là metric rủi ro đúng cho hệ thống analog:
+            # Mỗi signal là 1 bet độc lập (overlap 4-5 signals đồng thời)
+            # → equity curve tổng không có ý nghĩa, rủi ro thực = tệ nhất 1 lệnh
+            max_dd   = float(np.min(sig_rets))
 
             results.append({
                 "combo":     combo_name,
@@ -1400,7 +1398,7 @@ def _format_analog_backtest_result(res: dict) -> str:
         )
         lines.append(
             f"  MAE30 {baseline['mae30']:.1f}%  "
-            f"MaxDD {baseline['max_dd']:.1f}%  "
+            f"Worst {baseline['max_dd']:.1f}%  "
             f"PF {baseline['pf']:.2f}  "
             f"n={baseline['n_signals']}"
         )
@@ -1432,7 +1430,7 @@ def _format_analog_backtest_result(res: dict) -> str:
             )
             lines.append(
                 f"   MAE30 {r['mae30']:.1f}%  "
-                f"MaxDD {r['max_dd']:.1f}%  "
+                f"Worst {r['max_dd']:.1f}%  "
                 f"PF {r['pf']:.2f}  "
                 f"n={r['n_signals']} skip={r['n_skip']}"
             )
@@ -1556,7 +1554,7 @@ async def backtest_analog_cmd(update, context):
             "Vi du:\n"
             "  /backtest_analog HPG\n"
             "  /backtest_analog VCB 1500\n\n"
-            "105 experiments | Metrics: WR, Exp, MAE30, MaxDD, Sharpe, PF\n"
+            "105 experiments | Metrics: WR, Exp, MAE30, Worst, Sharpe, PF\n"
             "Thoi gian: 4-10 phut."
         )
         return
@@ -2142,9 +2140,8 @@ def _run_analog_detail_sync(symbol: str, combo_name: str, days: int = 1800) -> d
         neg_sum  = abs(sum(losses)) if losses else 1e-9
         pf       = pos_sum / neg_sum if neg_sum > 0 else 99.0
         mae30    = float(np.median(sig_maes))
-        equity   = np.cumsum(sig_rets)
-        peak     = np.maximum.accumulate(equity)
-        max_dd   = float(np.min(equity - peak))
+        # Worst Signal = return tệ nhất của 1 tín hiệu (metric rủi ro đúng)
+        max_dd   = float(np.min(sig_rets))
 
         threshold_results.append({
             "threshold": threshold,
@@ -2189,7 +2186,7 @@ def _format_detail_result(res: dict) -> str:
         f"{n_bars} bars | {n_vecs} vectors",
         f">> {hypo}",
         sep,
-        f"{'Nguong':<8} {'WR':<6} {'Exp':<8} {'Med':<8} {'Sharpe':<8} {'PF':<6} {'n':<5} {'MaxDD':<8} {'skip'}",
+        f"{'Nguong':<8} {'WR':<6} {'Exp':<8} {'Med':<8} {'Sharpe':<8} {'PF':<6} {'n':<5} {'Worst':<8} {'skip'}",
         sep2,
     ]
 
@@ -2278,12 +2275,12 @@ def _format_detail_result(res: dict) -> str:
     lines.append(
         f"  Exp+PF tot nhat : nguong {best_exp_row['threshold']:.2f} "
         f"(Exp {best_exp_row['mean_exp']:+.2f}%, PF {best_exp_row['pf']:.2f}, "
-        f"MaxDD {best_exp_row['max_dd']:.1f}%)"
+        f"Worst {best_exp_row['max_dd']:.1f}%)"
     )
     lines.append(
         f"  Risk-adjusted   : nguong {best_risk_adj['threshold']:.2f} "
         f"(Exp {best_risk_adj['mean_exp']:+.2f}%, PF {best_risk_adj['pf']:.2f}, "
-        f"MaxDD {best_risk_adj['max_dd']:.1f}%)"
+        f"Worst {best_risk_adj['max_dd']:.1f}%)"
     )
     if best_exp_row["wr"] < 50:
         lines.append(
@@ -2304,13 +2301,13 @@ def _format_detail_result(res: dict) -> str:
         )
         lines.append(
             f"  → Uu tien rui ro thap  : {best_risk_adj['threshold']:.2f} "
-            f"(Exp {best_risk_adj['mean_exp']:+.2f}%, MaxDD {best_risk_adj['max_dd']:.1f}%)"
+            f"(Exp {best_risk_adj['mean_exp']:+.2f}%, Worst {best_risk_adj['max_dd']:.1f}%)"
         )
         exp_diff = best_exp_row["mean_exp"] - best_risk_adj["mean_exp"]
         dd_diff  = abs(best_exp_row["max_dd"] - best_risk_adj["max_dd"])
         lines.append(
             f"  → Goi y: dung {best_risk_adj['threshold']:.2f} cho live trading "
-            f"(Exp chi kem {exp_diff:.2f}% nhung MaxDD tot hon {dd_diff:.1f}%)"
+            f"(Exp chi kem {exp_diff:.2f}% nhung Worst tot hon {dd_diff:.1f}%)"
         )
 
     lines.append("")
@@ -2460,7 +2457,8 @@ _last_backtest_analog_wf: dict[str, float] = {}
 
 # Config cố định cho từng mã — kết quả từ backtest + detail
 # KHÔNG thay đổi sau khi thấy kết quả walk-forward
-_WF_SYMBOL_CONFIG = {
+# Config mặc định (hardcode) — fallback khi DB chưa có dữ liệu
+_WF_SYMBOL_CONFIG_DEFAULT = {
     "FPT": {"combo": "Macro Trend",       "threshold": 0.55},
     "MWG": {"combo": "Oversold Bounce",   "threshold": 0.55},
     "STB": {"combo": "Oversold Bounce",   "threshold": 0.60},
@@ -2469,6 +2467,34 @@ _WF_SYMBOL_CONFIG = {
     "DPM": {"combo": "Volatility Aware",  "threshold": 0.55},
     "DCM": {"combo": "Volatility Aware",  "threshold": 0.55},
 }
+
+# Config live — được merge từ hardcode + DB khi bot start
+# Dùng dict mutable để _run_pipeline_wf_sync có thể cập nhật runtime
+_WF_SYMBOL_CONFIG: dict = dict(_WF_SYMBOL_CONFIG_DEFAULT)
+
+
+def _load_wf_config_from_db():
+    """
+    Load analog config từ DB và merge vào _WF_SYMBOL_CONFIG.
+    DB config ưu tiên hơn hardcode (override).
+    Gọi 1 lần khi bot start (từ bot.py sau init_db()).
+    """
+    global _WF_SYMBOL_CONFIG
+    try:
+        from db import load_analog_configs
+        db_configs = load_analog_configs()
+        if db_configs:
+            _WF_SYMBOL_CONFIG = dict(_WF_SYMBOL_CONFIG_DEFAULT)
+            _WF_SYMBOL_CONFIG.update(db_configs)
+            logger.info(
+                f"[WFConfig] Loaded {len(db_configs)} configs from DB. "
+                f"Total: {len(_WF_SYMBOL_CONFIG)} symbols: {list(_WF_SYMBOL_CONFIG.keys())}"
+            )
+        else:
+            logger.info("[WFConfig] No DB configs found, using hardcoded defaults.")
+    except Exception as e:
+        logger.warning(f"[WFConfig] load_wf_config_from_db error (using defaults): {e}")
+
 
 # Giai đoạn OOS
 _WF_START_DATE = "2025-01-01"
@@ -2541,23 +2567,23 @@ def _run_pipeline_wf_sync(symbol: str) -> dict:
 
     # Thêm tạm vào _WF_SYMBOL_CONFIG để _run_walkforward_sync dùng được
     _WF_SYMBOL_CONFIG[symbol] = {"combo": combo_name, "threshold": threshold}
-    try:
-        result = _run_walkforward_sync(symbol)
-    finally:
-        # Xoá nếu không pass — chỉ giữ lại nếu PASS để lần sau không cần pipeline lại
-        if result.get("status") != "ok":
-            _WF_SYMBOL_CONFIG.pop(symbol, None)
-        else:
-            oos_m = result.get("oos_metrics") or {}
-            oos_ok = oos_m.get("mean_exp", 0) > 0 and oos_m.get("pf", 0) >= 1.5
-            if not oos_ok:
-                _WF_SYMBOL_CONFIG.pop(symbol, None)
+    result = _run_walkforward_sync(symbol)
 
-    # Đánh dấu kết quả đến từ auto-pipeline để formatter biết hiển thị thêm gợi ý
+    # Kiểm tra kết quả: nếu không ok → xoá khỏi memory
+    oos_pass = False
     if result.get("status") == "ok":
-        result["auto_config"] = True
-        result["found_combo"] = combo_name
-        result["found_threshold"] = threshold
+        oos_m    = result.get("oos_metrics") or {}
+        oos_pass = oos_m.get("mean_exp", 0) > 0 and oos_m.get("pf", 0) >= 1.5
+
+    if not oos_pass:
+        _WF_SYMBOL_CONFIG.pop(symbol, None)
+
+    # Đánh dấu kết quả đến từ auto-pipeline để formatter và /analog_approve biết
+    if result.get("status") == "ok":
+        result["auto_config"]      = True
+        result["found_combo"]      = combo_name
+        result["found_threshold"]  = threshold
+        result["oos_pass"]         = oos_pass
 
     return result
 
@@ -2772,10 +2798,8 @@ def _run_walkforward_sync(symbol: str) -> dict:
         # Median MAE
         all_maes = [float(np.median(s["mae_vals"])) for s in completed if s.get("mae_vals")]
         mae30    = float(np.median(all_maes)) if all_maes else 0.0
-        # MaxDD equity curve — cumsum vì signals overlap (bước 7n + hold 30n)
-        equity   = np.cumsum(actuals)
-        peak     = np.maximum.accumulate(equity)
-        max_dd   = float(np.min(equity - peak)) if len(equity) > 1 else 0.0
+        # Worst Signal = return thực tế tệ nhất của 1 tín hiệu OOS
+        max_dd   = float(np.min(actuals)) if actuals else 0.0
         return {
             "n":        len(completed),
             "n_pending":len([s for s in signals if s.get("pending")]),
@@ -2838,7 +2862,7 @@ def _format_wf_result(res: dict) -> str:
             f"n={train_m['n']}"
         )
         lines.append(
-            f"  MAE30 {train_m['mae30']:.1f}%  MaxDD {train_m['max_dd']:.1f}%"
+            f"  MAE30 {train_m['mae30']:.1f}%  Worst {train_m['max_dd']:.1f}%"
         )
     else:
         lines.append("  Khong du tin hieu training.")
@@ -2856,7 +2880,7 @@ def _format_wf_result(res: dict) -> str:
             + (f" (+{n_pending} pending)" if n_pending else "")
         )
         lines.append(
-            f"  MAE30 {oos_m['mae30']:.1f}%  MaxDD {oos_m['max_dd']:.1f}%"
+            f"  MAE30 {oos_m['mae30']:.1f}%  Worst {oos_m['max_dd']:.1f}%"
         )
     else:
         lines.append(
@@ -2889,7 +2913,7 @@ def _format_wf_result(res: dict) -> str:
             f"{_delta(oos_m['wr'], train_m['wr'])}"
         )
         lines.append(
-            f"  MaxDD : OOS {oos_m['max_dd']:.1f}% vs Train {train_m['max_dd']:.1f}%  "
+            f"  Worst : OOS {oos_m['max_dd']:.1f}% vs Train {train_m['max_dd']:.1f}%  "
             f"{_delta(oos_m['max_dd'], train_m['max_dd'], higher_is_better=False)}"
         )
         lines.append(sep2)
@@ -3406,9 +3430,8 @@ def _run_pipeline_sync(symbol: str, days: int = 1800) -> dict:
         pf       = pos_sum / neg_sum if neg_sum > 0 else 99.0
         all_maes = [float(np.median(s["mae_vals"])) for s in done if s.get("mae_vals")]
         mae30    = float(np.median(all_maes)) if all_maes else 0.0
-        equity   = np.cumsum(actuals)
-        peak     = np.maximum.accumulate(equity)
-        max_dd   = float(np.min(equity - peak)) if len(equity) > 1 else 0.0
+        # Worst Signal = return tệ nhất của 1 tín hiệu (metric rủi ro đúng)
+        max_dd   = float(np.min(actuals)) if actuals else 0.0
         return {
             "n":         len(done),
             "n_pending": len([s for s in signals if s.get("pending")]),
@@ -3696,3 +3719,254 @@ async def analog_pipeline_cmd(update, context):
                     pass
 
     asyncio.create_task(_bg())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# /analog_approve — lưu config mới vào DB (không cần sửa code nữa)
+# /analog_configs — xem tất cả config đang active
+# /analog_remove  — xoá 1 mã khỏi config DB
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def analog_approve_cmd(update, context):
+    """
+    /analog_approve <MA> [combo] [threshold] [mae30] [sizing]
+
+    Lưu config analog của 1 mã vào DB — không cần sửa code nữa.
+
+    Có 2 cách dùng:
+
+    1. Sau khi /walkforward_analog tìm được config tự động (PASS):
+       Bot đã gợi ý combo + threshold — chỉ cần approve:
+         /analog_approve LPB
+
+    2. Tự nhập tay (sau khi xem kết quả /backtest_analog_detail):
+         /analog_approve LPB "Oversold Bounce" 0.60 -6.5 1.0
+         /analog_approve TCB "Volume Confirmed" 0.75 -5.0 0.5
+
+    Args:
+        MA:        mã cổ phiếu
+        combo:     tên combo (optional nếu đã chạy pipeline trước đó)
+        threshold: ngưỡng cosine (optional)
+        mae30:     MAE 30 ngày, số âm (optional, default 0)
+        sizing:    hệ số vốn 0.5 hoặc 1.0 (optional, default 1.0)
+
+    Sau khi approve:
+      - Config được lưu vào DB (persist qua bot restart)
+      - /walkforward_analog <MA> sẽ dùng config này ngay lập tức
+      - Để đưa vào live signal cron, dùng /analog_approve rồi thêm
+        dims thủ công vào SIGNAL_SYMBOLS trong analog_signal.py
+    """
+    try:
+        from bot import is_allowed, _deny
+    except ImportError:
+        def is_allowed(_): return True
+        async def _deny(_): pass
+
+    if not is_allowed(update):
+        await _deny(update)
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Cu phap:\n"
+            "  /analog_approve <MA>  (neu da chay pipeline, lay config tu do)\n"
+            "  /analog_approve <MA> <combo> <threshold> [mae30] [sizing]\n\n"
+            "Vi du:\n"
+            "  /analog_approve LPB\n"
+            "  /analog_approve LPB \"Oversold Bounce\" 0.60 -6.5 1.0\n"
+            "  /analog_approve TCB \"Volume Confirmed\" 0.75 -5.0 0.5\n\n"
+            f"Config hien tai: {', '.join(_WF_SYMBOL_CONFIG.keys())}"
+        )
+        return
+
+    import re as _re
+    symbol = args[0].upper().strip()
+    if not _re.match(r'^[A-Z0-9]{2,10}$', symbol):
+        await update.message.reply_text(f"Ma khong hop le: {symbol}")
+        return
+
+    # Lấy combo + threshold từ args hoặc từ _WF_SYMBOL_CONFIG (đã được pipeline set)
+    if len(args) >= 3:
+        # Nhập tay: /analog_approve LPB "Oversold Bounce" 0.60 -6.5 1.0
+        import re
+        full_args = " ".join(args[1:])
+        quoted    = re.findall(r'"([^"]*)"', full_args)
+        combo     = quoted[0] if quoted else args[1]
+        try:
+            threshold = float(args[2]) if len(args) > 2 else 0.60
+            mae30     = float(args[3]) if len(args) > 3 else 0.0
+            sizing    = float(args[4]) if len(args) > 4 else 1.0
+        except (ValueError, IndexError):
+            await update.message.reply_text("threshold/mae30/sizing phai la so. Vi du: 0.60 -6.5 1.0")
+            return
+    elif symbol in _WF_SYMBOL_CONFIG:
+        # Lấy từ config đã có trong memory (pipeline vừa tìm hoặc hardcode)
+        cfg       = _WF_SYMBOL_CONFIG[symbol]
+        combo     = cfg["combo"]
+        threshold = cfg["threshold"]
+        mae30     = cfg.get("mae30", 0.0)
+        sizing    = cfg.get("sizing", 1.0)
+    else:
+        await update.message.reply_text(
+            f"{symbol} chua co config trong memory.\n"
+            f"Chay /walkforward_analog {symbol} truoc de pipeline tu dong tim config,\n"
+            f"hoac nhap tay: /analog_approve {symbol} \"<combo>\" <threshold>"
+        )
+        return
+
+    # Validate combo tồn tại
+    combo_obj = _find_combo(combo)
+    if combo_obj is None:
+        combos_available = [c["name"] for c in _ANALOG_COMBOS]
+        await update.message.reply_text(
+            f"Combo '{combo}' khong ton tai.\n"
+            f"Combo co san:\n" + "\n".join(f"  - {c}" for c in combos_available)
+        )
+        return
+
+    dims = combo_obj["dims"]
+
+    # Lưu vào DB
+    try:
+        from db import save_analog_config
+        ok = save_analog_config(
+            symbol=symbol, combo=combo, threshold=threshold,
+            mae30=mae30, sizing=sizing, dims=dims,
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Loi luu DB: {e}")
+        return
+
+    if not ok:
+        await update.message.reply_text(f"Luu DB that bai — kiem tra log.")
+        return
+
+    # Cập nhật memory ngay lập tức
+    _WF_SYMBOL_CONFIG[symbol] = {"combo": combo, "threshold": threshold,
+                                  "mae30": mae30, "sizing": sizing}
+
+    sep = "─" * 32
+    lines = [
+        f"✅ DA LUU CONFIG: {symbol}",
+        sep,
+        f"  Combo     : {combo}",
+        f"  Threshold : {threshold}",
+        f"  MAE30     : {mae30:.1f}%",
+        f"  Sizing    : {int(sizing*100)}%",
+        f"  Dims ({len(dims)}): {', '.join(dims[:3])}{'...' if len(dims) > 3 else ''}",
+        sep,
+        f"Config da luu vao DB — persist qua bot restart.",
+        f"/walkforward_analog {symbol} se dung config nay ngay.",
+        "",
+        f"Buoc tiep theo de them vao LIVE SIGNAL CRON:",
+        f"  Them vao SIGNAL_SYMBOLS trong analog_signal.py:",
+        f'  "{symbol}": {{',
+        f'      "combo": "{combo}",',
+        f'      "dims": {dims},',
+        f'      "threshold": {threshold},',
+        f'      "mae30": {mae30},',
+        f'      "sizing": {sizing},',
+        f'  }}',
+    ]
+    await update.message.reply_text("\n".join(lines)[:4096])
+
+
+async def analog_configs_cmd(update, context):
+    """
+    /analog_configs
+    Xem tất cả analog config đang active (hardcode + DB).
+    """
+    try:
+        from bot import is_allowed, _deny
+    except ImportError:
+        def is_allowed(_): return True
+        async def _deny(_): pass
+
+    if not is_allowed(update):
+        await _deny(update)
+        return
+
+    # Load fresh từ DB để hiển thị chính xác nhất
+    try:
+        from db import load_analog_configs
+        db_configs = load_analog_configs()
+    except Exception:
+        db_configs = {}
+
+    sep   = "─" * 36
+    lines = [
+        f"ANALOG CONFIGS ({len(_WF_SYMBOL_CONFIG)} ma)",
+        f"DB: {len(db_configs)} ma | Hardcode: {len(_WF_SYMBOL_CONFIG_DEFAULT)} ma",
+        sep,
+    ]
+
+    for symbol, cfg in sorted(_WF_SYMBOL_CONFIG.items()):
+        source = "DB" if symbol in db_configs else "hardcode"
+        mae30  = cfg.get("mae30", 0.0)
+        sizing = cfg.get("sizing", 1.0)
+        lines.append(
+            f"{'📀' if source == 'DB' else '🔧'} {symbol:<5} [{source}]"
+        )
+        lines.append(
+            f"   {cfg['combo']} | thr={cfg['threshold']}"
+            + (f" | MAE={mae30:.1f}%" if mae30 else "")
+            + (f" | size={int(sizing*100)}%" if sizing != 1.0 else "")
+        )
+
+    lines += [
+        sep,
+        "📀 = luu trong DB (persist)  🔧 = hardcode trong code",
+        "",
+        "Lenh quan ly:",
+        "  /analog_approve <MA> [combo] [threshold] — them/sua config",
+        "  /analog_remove <MA>                       — xoa config DB",
+        "  /analog_configs                            — xem danh sach nay",
+    ]
+    await update.message.reply_text("\n".join(lines)[:4096])
+
+
+async def analog_remove_cmd(update, context):
+    """
+    /analog_remove <MA>
+    Xoá config của 1 mã khỏi DB. Không ảnh hưởng hardcode defaults.
+    """
+    try:
+        from bot import is_allowed, _deny
+    except ImportError:
+        def is_allowed(_): return True
+        async def _deny(_): pass
+
+    if not is_allowed(update):
+        await _deny(update)
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Cu phap: /analog_remove <MA>\n"
+            "Vi du: /analog_remove LPB\n\n"
+            "Chi xoa config luu trong DB.\n"
+            "Neu ma co hardcode default, no se quay ve gia tri do."
+        )
+        return
+
+    symbol = args[0].upper().strip()
+
+    try:
+        from db import delete_analog_config
+        deleted = delete_analog_config(symbol)
+    except Exception as e:
+        await update.message.reply_text(f"Loi xoa DB: {e}")
+        return
+
+    # Cập nhật memory: nếu có hardcode thì quay về, không thì xoá
+    if symbol in _WF_SYMBOL_CONFIG_DEFAULT:
+        _WF_SYMBOL_CONFIG[symbol] = dict(_WF_SYMBOL_CONFIG_DEFAULT[symbol])
+        status = f"Da xoa DB config. Quay ve hardcode default:\n  {_WF_SYMBOL_CONFIG[symbol]}"
+    else:
+        _WF_SYMBOL_CONFIG.pop(symbol, None)
+        status = f"Da xoa khoi tat ca config. {symbol} se can chay pipeline lai."
+
+    msg = f"{'✅' if deleted else '⚠️'} {symbol}: {status}"
+    await update.message.reply_text(msg)

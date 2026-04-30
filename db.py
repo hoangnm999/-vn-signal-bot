@@ -787,3 +787,159 @@ def get_history(symbol: str, limit: int = 10) -> str:
         if conn:
             try: conn.close()
             except Exception: pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANALOG CONFIG — lưu/load combo+threshold từ DB thay vì hardcode
+# Dùng bot_kv table (đã có sẵn) với key prefix "analog_cfg:{symbol}"
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ANALOG_CFG_PREFIX = "analog_cfg:"
+
+
+def _ensure_bot_kv(cur):
+    """Tạo bot_kv nếu chưa có — idempotent."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_kv (
+            key        VARCHAR(100) PRIMARY KEY,
+            value      TEXT         NOT NULL,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+        )
+    """)
+
+
+def save_analog_config(symbol: str, combo: str, threshold: float,
+                       mae30: float = 0.0, sizing: float = 1.0,
+                       dims: list = None, note: str = "") -> bool:
+    """
+    Lưu hoặc cập nhật config analog cho 1 mã vào DB.
+    Dùng sau khi /walkforward_analog tự động tìm được config mới PASS.
+
+    Args:
+        symbol:    mã CK (VD: "LPB")
+        combo:     tên combo (VD: "Oversold Bounce")
+        threshold: ngưỡng cosine similarity (VD: 0.60)
+        mae30:     MAE 30 ngày từ backtest (âm, VD: -6.2)
+        sizing:    hệ số vốn 0.5 hoặc 1.0
+        dims:      list dimension names (nếu None → tự lấy từ _ANALOG_COMBOS)
+        note:      ghi chú tự do
+    Returns:
+        True nếu lưu thành công
+    """
+    conn = None
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        _ensure_bot_kv(cur)
+
+        key     = f"{_ANALOG_CFG_PREFIX}{symbol.upper()}"
+        payload = json.dumps({
+            "symbol":    symbol.upper(),
+            "combo":     combo,
+            "threshold": threshold,
+            "mae30":     mae30,
+            "sizing":    sizing,
+            "dims":      dims or [],
+            "note":      note,
+        }, ensure_ascii=False)
+
+        cur.execute("""
+            INSERT INTO bot_kv (key, value, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value,
+                    updated_at = NOW()
+        """, (key, payload))
+
+        conn.commit()
+        cur.close()
+        logger.info(f"[AnalogCfg] Saved config {symbol}: {combo} @ {threshold}")
+        return True
+
+    except Exception as e:
+        logger.error(f"save_analog_config error: {e}")
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+        return False
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
+
+
+def load_analog_configs() -> dict:
+    """
+    Load tất cả analog config từ DB.
+    Returns:
+        dict[symbol -> config_dict] — rỗng nếu chưa có gì
+    """
+    conn = None
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        _ensure_bot_kv(cur)
+        conn.commit()
+
+        cur.execute("""
+            SELECT key, value FROM bot_kv
+            WHERE key LIKE %s
+            ORDER BY key
+        """, (f"{_ANALOG_CFG_PREFIX}%",))
+        rows = cur.fetchall()
+        cur.close()
+
+        configs = {}
+        for key, value_str in rows:
+            try:
+                cfg = json.loads(value_str)
+                symbol = cfg.get("symbol") or key[len(_ANALOG_CFG_PREFIX):]
+                configs[symbol.upper()] = cfg
+            except Exception as e:
+                logger.warning(f"load_analog_configs: skip bad row {key}: {e}")
+
+        logger.info(f"[AnalogCfg] Loaded {len(configs)} configs from DB: {list(configs.keys())}")
+        return configs
+
+    except Exception as e:
+        logger.warning(f"load_analog_configs error (non-critical): {e}")
+        return {}
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
+
+
+def delete_analog_config(symbol: str) -> bool:
+    """
+    Xoá config của 1 mã khỏi DB.
+    Dùng khi mã bị loại khỏi live trading.
+    """
+    conn = None
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        _ensure_bot_kv(cur)
+
+        key = f"{_ANALOG_CFG_PREFIX}{symbol.upper()}"
+        cur.execute("DELETE FROM bot_kv WHERE key = %s", (key,))
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+
+        if deleted:
+            logger.info(f"[AnalogCfg] Deleted config {symbol}")
+        else:
+            logger.info(f"[AnalogCfg] No config found for {symbol}")
+        return deleted > 0
+
+    except Exception as e:
+        logger.error(f"delete_analog_config error: {e}")
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+        return False
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass

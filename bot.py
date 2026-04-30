@@ -59,6 +59,10 @@ try:
         backtest_analog_detail_cmd,
         walkforward_analog_cmd,
         analog_pipeline_cmd,
+        analog_approve_cmd,
+        analog_configs_cmd,
+        analog_remove_cmd,
+        _load_wf_config_from_db,
     )
     _BACKTEST_RULE = True
 except ImportError:
@@ -68,6 +72,10 @@ except ImportError:
     backtest_analog_detail_cmd = None
     walkforward_analog_cmd     = None
     analog_pipeline_cmd        = None
+    analog_approve_cmd         = None
+    analog_configs_cmd         = None
+    analog_remove_cmd          = None
+    _load_wf_config_from_db    = None
     logger.warning("backtest_rule_cmd.py chua co — /backtest_rule bi tat")
 
 try:
@@ -1507,6 +1515,13 @@ def main():
     except Exception as e:
         logger.warning(f"DB init failed: {e}")
 
+    # Load analog config từ DB — merge với hardcode defaults
+    if _BACKTEST_RULE and _load_wf_config_from_db:
+        try:
+            _load_wf_config_from_db()
+        except Exception as e:
+            logger.warning(f"load_wf_config_from_db failed (using defaults): {e}")
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start",        start))
@@ -1532,6 +1547,9 @@ def main():
         app.add_handler(CommandHandler("backtest_analog_detail", backtest_analog_detail_cmd))
         app.add_handler(CommandHandler("walkforward_analog",     walkforward_analog_cmd))
         app.add_handler(CommandHandler("analog_pipeline",        analog_pipeline_cmd))
+        app.add_handler(CommandHandler("analog_approve",         analog_approve_cmd))
+        app.add_handler(CommandHandler("analog_configs",         analog_configs_cmd))
+        app.add_handler(CommandHandler("analog_remove",          analog_remove_cmd))
         if _ANALOG:
             app.add_handler(CommandHandler("analog", analog_cmd))
     if _ANALOG_SIGNAL:
