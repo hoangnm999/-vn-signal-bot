@@ -1586,3 +1586,341 @@ async def backtest_analog_cmd(update, context):
                     pass
 
     asyncio.create_task(_bg())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKTEST ANALOG BATCH — nhiều mã một lượt
+# ══════════════════════════════════════════════════════════════════════════════
+
+BACKTEST_ANALOG_BATCH_COOLDOWN = 600   # 10 phút per user
+_last_backtest_analog_batch: dict[str, float] = {}
+BATCH_MAX_SYMBOLS = 10   # giới hạn tối đa để tránh timeout Render
+
+
+def _run_analog_batch_sync(symbols: list[str], days: int = 1800) -> dict:
+    """
+    Chạy _run_analog_backtest_sync tuần tự cho từng mã.
+    Trả về dict tổng hợp kết quả tất cả mã.
+    """
+    results = {}
+    for symbol in symbols:
+        try:
+            r = _run_analog_backtest_sync(symbol, days)
+            results[symbol] = r
+        except Exception as e:
+            results[symbol] = {"status": "error", "error": str(e)[:120]}
+    return results
+
+
+def _format_batch_result(batch: dict) -> str:
+    """
+    Format kết quả batch thành 2 phần:
+      1. Bảng tổng quan: mỗi mã 1 dòng
+      2. Nhận xét cross-symbol: combo nào nhất quán nhất
+    """
+    from collections import Counter
+
+    sep  = "=" * 32
+    sep2 = "-" * 32
+
+    # ── Gom dữ liệu từng mã ──────────────────────────────────────────────────
+    rows        = []   # dữ liệu cho bảng tổng quan
+    all_top1    = []   # top combo của mỗi mã (để phân tích nhất quán)
+    good_syms   = []   # mã Sharpe >= 1.0
+    weak_syms   = []   # mã Sharpe < 1.0 hoặc lỗi
+
+    for symbol, res in batch.items():
+        if res.get("status") == "error":
+            rows.append({
+                "symbol": symbol, "ok": False,
+                "error": res.get("error", "?")[:60],
+            })
+            weak_syms.append(symbol)
+            continue
+
+        top     = res.get("top_results", [])
+        bl      = res.get("baseline")
+        n_valid = res.get("n_valid", 0)
+
+        if not top:
+            rows.append({
+                "symbol": symbol, "ok": False,
+                "error": f"Khong du tin hieu ({n_valid} exp hop le)",
+            })
+            weak_syms.append(symbol)
+            continue
+
+        best = top[0]
+        bl_sharpe = bl["sharpe"] if bl else 0.0
+
+        row = {
+            "symbol":    symbol,
+            "ok":        True,
+            "combo":     best["combo"],
+            "threshold": best["threshold"],
+            "wr":        best["wr"],
+            "mean_exp":  best["mean_exp"],
+            "mae30":     best["mae30"],
+            "max_dd":    best["max_dd"],
+            "sharpe":    best["sharpe"],
+            "pf":        best["pf"],
+            "n":         best["n_signals"],
+            "bl_sharpe": bl_sharpe,
+            "vs_bl":     round(best["sharpe"] - bl_sharpe, 2),
+            "group":     best.get("group", ""),
+            "n_valid":   n_valid,
+        }
+        rows.append(row)
+        all_top1.append(best["combo"])
+
+        if best["sharpe"] >= 1.0 and best["wr"] >= 55 and best["mean_exp"] > 0:
+            good_syms.append(symbol)
+        else:
+            weak_syms.append(symbol)
+
+    # ── Bảng tổng quan ───────────────────────────────────────────────────────
+    lines = [
+        f"BACKTEST ANALOG BATCH — {len(batch)} ma",
+        f"Days: 1800 | 105 experiments/ma",
+        sep,
+        "MA      TOP COMBO            WR   Exp   Sharpe  n   vsBase",
+        sep2,
+    ]
+
+    for r in rows:
+        if not r["ok"]:
+            lines.append(f"{r['symbol']:<7} LOI: {r['error']}")
+            continue
+
+        # Emoji
+        if r["sharpe"] >= 1.2 and r["wr"] >= 60 and r["mean_exp"] > 0:
+            em = "✅"
+        elif r["sharpe"] >= 1.0 and r["mean_exp"] > 0:
+            em = "🟡"
+        else:
+            em = "🔴"
+
+        vs = f"{r['vs_bl']:+.2f}"
+        combo_short = r["combo"][:18]   # cắt ngắn để vừa dòng
+
+        lines.append(
+            f"{em}{r['symbol']:<6} "
+            f"{combo_short:<20} "
+            f"{r['wr']:.0f}%  "
+            f"{r['mean_exp']:+.1f}%  "
+            f"{r['sharpe']:.2f}   "
+            f"{r['n']:<4} "
+            f"{vs}"
+        )
+
+    lines.append(sep2)
+
+    # ── Phân tích cross-symbol ────────────────────────────────────────────────
+    lines.append("")
+    lines.append("PHAN TICH CHUNG:")
+
+    # Mã nên/không nên dùng analog
+    if good_syms:
+        lines.append(f"  Nen dung analog : {', '.join(good_syms)}")
+    if weak_syms:
+        lines.append(f"  Nen bo qua      : {', '.join(weak_syms)}")
+
+    lines.append("")
+
+    # Combo nhất quán nhất
+    if all_top1:
+        combo_counts = Counter(all_top1)
+        top_combos   = combo_counts.most_common(3)
+        lines.append("  Combo nhat quan tren nhieu ma:")
+        for combo, count in top_combos:
+            pct = count / len(all_top1) * 100
+            lines.append(f"    {combo}: {count}/{len(all_top1)} ma ({pct:.0f}%)")
+
+        # Nhóm thống trị
+        ok_rows = [r for r in rows if r.get("ok")]
+        if ok_rows:
+            groups = Counter(r["group"] for r in ok_rows)
+            group_labels = {
+                "momentum":  "Momentum", "trend": "Trend Following",
+                "reversion": "Mean Reversion", "volume": "Volume",
+                "volatility":"Volatility", "crossover": "Combo giao thoa",
+                "baseline":  "Baseline",
+            }
+            top_group = groups.most_common(1)[0]
+            lines.append(
+                f"  Nhom thong tri: "
+                f"{group_labels.get(top_group[0], top_group[0])} "
+                f"({top_group[1]}/{len(ok_rows)} ma)"
+            )
+
+            # Threshold phổ biến
+            thresholds = Counter(r["threshold"] for r in ok_rows)
+            top_thresh = thresholds.most_common(1)[0]
+            lines.append(
+                f"  Nguong pho bien: {top_thresh[0]:.2f} "
+                f"({top_thresh[1]}/{len(ok_rows)} ma)"
+            )
+
+    lines.append("")
+
+    # Khuyến nghị walk-forward
+    if good_syms and all_top1:
+        top_combo_wf = Counter(all_top1).most_common(1)[0][0]
+        lines.append("  → BUOC TIEP THEO (Walk-forward 2025):")
+        lines.append(f"     Ma test    : {', '.join(good_syms)}")
+        lines.append(f"     Combo fix  : {top_combo_wf} (nhat quan nhat)")
+        lines.append(f"     Nguong fix : {Counter(r['threshold'] for r in rows if r.get('ok')).most_common(1)[0][0]:.2f}")
+        lines.append("     Chay /backtest_analog_wf de verify (sap co)")
+    else:
+        lines.append("  → Khong co ma nao du dieu kien cho walk-forward.")
+        lines.append("     Thu tang days hoac kiem tra lai data.")
+
+    lines.append("")
+    lines.append("Ket qua IN-SAMPLE. Walk-forward 2025 moi la kiem chung thuc su.")
+    lines.append(sep)
+
+    return "\n".join(lines)
+
+
+async def backtest_analog_batch_cmd(update, context):
+    """
+    /backtest_analog_batch HPG VCB STB CTG MWG FPT TCB [days]
+
+    Chay backtest analog cho nhieu ma mot luot.
+    Ket qua: bang so sanh + combo nhat quan + khuyen nghi walk-forward.
+
+    Vi du:
+      /backtest_analog_batch HPG VCB STB
+      /backtest_analog_batch HPG VCB STB CTG MWG FPT TCB 1500
+    """
+    try:
+        from bot import is_allowed, _deny
+    except ImportError:
+        def is_allowed(_): return True
+        async def _deny(_): pass
+
+    if not is_allowed(update):
+        await _deny(update)
+        return
+
+    args = context.args or []
+
+    if not args:
+        await update.message.reply_text(
+            "Cu phap: /backtest_analog_batch MA1 MA2 MA3... [days]\n\n"
+            "Vi du:\n"
+            "  /backtest_analog_batch HPG VCB STB\n"
+            "  /backtest_analog_batch HPG VCB STB CTG MWG FPT TCB\n\n"
+            f"Toi da {BATCH_MAX_SYMBOLS} ma mot lan.\n"
+            "Thoi gian: ~5-10 phut/ma. 7 ma ~ 35-70 phut.\n"
+            "Ket qua: bang so sanh + combo nhat quan + khuyen nghi walk-forward."
+        )
+        return
+
+    # Parse symbols và days
+    import re as _re
+    symbols = []
+    days    = 1800
+    for arg in args:
+        if _re.match(r'^\d+$', arg):
+            days = max(500, min(int(arg), 2500))
+        elif _re.match(r'^[A-Z0-9]{2,10}$', arg.upper()):
+            symbols.append(arg.upper())
+
+    if not symbols:
+        await update.message.reply_text("Khong tim thay ma hop le trong lenh.")
+        return
+
+    if len(symbols) > BATCH_MAX_SYMBOLS:
+        await update.message.reply_text(
+            f"Toi da {BATCH_MAX_SYMBOLS} ma mot lan. "
+            f"Ban nhap {len(symbols)} ma — vui long chia thanh nhieu lenh."
+        )
+        return
+
+    # Rate limit
+    user_id = str(update.effective_user.id) if update.effective_user else "unknown"
+    since   = time.time() - _last_backtest_analog_batch.get(user_id, 0)
+    if since < BACKTEST_ANALOG_BATCH_COOLDOWN:
+        wait = int(BACKTEST_ANALOG_BATCH_COOLDOWN - since)
+        await update.message.reply_text(
+            f"Vui long cho {wait}s truoc khi /backtest_analog_batch tiep."
+        )
+        return
+    _last_backtest_analog_batch[user_id] = time.time()
+
+    chat_id  = update.effective_chat.id
+    est_mins = len(symbols) * 7   # ước tính ~7 phút/mã
+
+    msg = await update.message.reply_text(
+        f"Backtest Analog Batch: {len(symbols)} ma\n"
+        f"Ma: {', '.join(symbols)}\n"
+        f"105 experiments/ma | {days} ngay lich su\n"
+        f"Uoc tinh ~{est_mins} phut. Vui long doi..."
+    )
+
+    async def _bg():
+        try:
+            # Chạy từng mã, cập nhật progress
+            results = {}
+            for i, symbol in enumerate(symbols, 1):
+                # Cập nhật progress message
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg.message_id,
+                        text=(
+                            f"Backtest Analog Batch: {len(symbols)} ma\n"
+                            f"Dang chay: {symbol} ({i}/{len(symbols)})\n"
+                            f"Hoan thanh: {', '.join(symbols[:i-1]) if i > 1 else 'chua co'}\n"
+                            f"Con lai: ~{(len(symbols)-i)*7} phut..."
+                        ),
+                    )
+                except Exception:
+                    pass
+
+                # Chạy backtest cho symbol này
+                try:
+                    r = await asyncio.to_thread(_run_analog_backtest_sync, symbol, days)
+                    results[symbol] = r
+                except Exception as e:
+                    results[symbol] = {"status": "error", "error": str(e)[:120]}
+
+            # Format và gửi kết quả
+            summary = _format_batch_result(results)
+
+            # Nếu dài hơn 4096 → tách 2 message
+            if len(summary) <= 4096:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg.message_id,
+                    text=_plain(summary),
+                )
+            else:
+                # Part 1: edit message loading
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg.message_id,
+                    text=_plain(summary[:4000] + "\n...(tiep theo)"),
+                )
+                # Part 2: send message mới
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=_plain(summary[4000:])[:4096],
+                )
+
+        except Exception as e:
+            import traceback
+            logger.error(f"backtest_analog_batch_cmd error: {e}\n{traceback.format_exc()}")
+            err_text = f"Loi /backtest_analog_batch: {str(e)[:200]}"
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg.message_id, text=err_text,
+                )
+            except Exception:
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=err_text)
+                except Exception:
+                    pass
+
+    asyncio.create_task(_bg())
