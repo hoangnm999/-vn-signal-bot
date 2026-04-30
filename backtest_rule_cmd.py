@@ -2465,10 +2465,101 @@ _WF_SYMBOL_CONFIG = {
     "MWG": {"combo": "Oversold Bounce",   "threshold": 0.55},
     "STB": {"combo": "Oversold Bounce",   "threshold": 0.60},
     "HPG": {"combo": "Volume Confirmed",  "threshold": 0.80},
+    "GAS": {"combo": "No Volume",         "threshold": 0.55},
+    "DPM": {"combo": "Volatility Aware",  "threshold": 0.55},
+    "DCM": {"combo": "Volatility Aware",  "threshold": 0.55},
 }
 
 # Giai đoạn OOS
 _WF_START_DATE = "2025-01-01"
+
+
+def _run_pipeline_wf_sync(symbol: str) -> dict:
+    """
+    Dùng cho mã CHƯA có trong _WF_SYMBOL_CONFIG:
+      1. Chạy Tầng 1 (105 experiments) để tìm combo + threshold tối ưu
+      2. Chạy Tầng 2 (walk-forward OOS) với config vừa tìm được
+      3. Trả về cùng format với _run_walkforward_sync để dùng chung formatter
+
+    Sau khi có kết quả PASS, admin có thể thêm vào _WF_SYMBOL_CONFIG và
+    SIGNAL_SYMBOLS để đưa vào live trading — không cần nhờ Claude nữa.
+    """
+    import numpy as np
+    import pandas as pd
+
+    # Tầng 1: tìm combo + threshold tốt nhất
+    bt_res = _run_analog_backtest_sync(symbol)
+    if bt_res.get("status") == "error":
+        return {"status": "error", "error": bt_res["error"]}
+
+    valid = bt_res.get("top_results", [])
+    pass_results = [
+        r for r in valid
+        if r["mean_exp"] > _PIPELINE_MIN_EXP
+        and r["pf"] >= _PIPELINE_MIN_PF
+        and r["max_dd"] >= _PIPELINE_MAX_DD
+    ]
+    if not pass_results:
+        top = valid[0] if valid else {}
+        return {
+            "status": "skip",
+            "reason": (
+                f"Khong co combo nao qua bo loc "
+                f"(top: Exp={top.get('mean_exp',0):+.2f}% PF={top.get('pf',0):.2f})"
+            ),
+        }
+
+    best_bt    = pass_results[0]
+    combo_name = best_bt["combo"]
+
+    # Tầng 1b: detail để tìm threshold tối ưu
+    detail_res = _run_analog_detail_sync(symbol, combo_name)
+    if detail_res.get("status") != "error":
+        thresh_rows = [
+            r for r in detail_res.get("threshold_results", [])
+            if not r.get("skip")
+            and r["mean_exp"] > _PIPELINE_MIN_EXP
+            and r["pf"] >= _PIPELINE_MIN_PF
+            and r["max_dd"] >= _PIPELINE_MAX_DD
+        ]
+        if thresh_rows:
+            max_exp         = max(r["mean_exp"] for r in thresh_rows)
+            top_thresh      = [r for r in thresh_rows if r["mean_exp"] >= max_exp * 0.90]
+            best_thresh_row = max(top_thresh, key=lambda x: x["max_dd"])
+            threshold       = best_thresh_row["threshold"]
+        else:
+            threshold = best_bt["threshold"]
+    else:
+        threshold = best_bt["threshold"]
+
+    # Tầng 2: walk-forward với config vừa tìm
+    combo = _find_combo(combo_name)
+    if combo is None:
+        return {"status": "error", "error": f"Khong tim thay combo '{combo_name}'"}
+
+    dims = combo["dims"]
+
+    # Thêm tạm vào _WF_SYMBOL_CONFIG để _run_walkforward_sync dùng được
+    _WF_SYMBOL_CONFIG[symbol] = {"combo": combo_name, "threshold": threshold}
+    try:
+        result = _run_walkforward_sync(symbol)
+    finally:
+        # Xoá nếu không pass — chỉ giữ lại nếu PASS để lần sau không cần pipeline lại
+        if result.get("status") != "ok":
+            _WF_SYMBOL_CONFIG.pop(symbol, None)
+        else:
+            oos_m = result.get("oos_metrics") or {}
+            oos_ok = oos_m.get("mean_exp", 0) > 0 and oos_m.get("pf", 0) >= 1.5
+            if not oos_ok:
+                _WF_SYMBOL_CONFIG.pop(symbol, None)
+
+    # Đánh dấu kết quả đến từ auto-pipeline để formatter biết hiển thị thêm gợi ý
+    if result.get("status") == "ok":
+        result["auto_config"] = True
+        result["found_combo"] = combo_name
+        result["found_threshold"] = threshold
+
+    return result
 
 
 def _run_walkforward_sync(symbol: str) -> dict:
@@ -2849,6 +2940,19 @@ def _format_wf_result(res: dict) -> str:
     lines.append(
         "Config da duoc fix truoc khi chay OOS — ket qua nay co gia tri thong ke."
     )
+
+    # Gợi ý thêm config khi đến từ auto-pipeline và PASS
+    if res.get("auto_config"):
+        oos_ok = oos_m and oos_m.get("mean_exp", 0) > 0 and oos_m.get("pf", 0) >= 1.5
+        if oos_ok:
+            lines.append(sep2)
+            lines.append(f"💡 AUTO-PIPELINE — Tim thay config moi:")
+            lines.append(f"   Combo: {combo} | Nguong: {threshold}")
+            lines.append(f"   De them vao live trading, cap nhat 2 cho trong code:")
+            lines.append(f"   1. _WF_SYMBOL_CONFIG: \"{symbol}\": {{\"combo\": \"{combo}\", \"threshold\": {threshold}}}")
+            lines.append(f"   2. SIGNAL_SYMBOLS trong analog_signal.py (them dims tuong ung)")
+            lines.append(f"   Sau do chay /analog_pipeline {symbol} de xac nhan lai.")
+
     lines.append(sep)
     return "\n".join(lines)
 
@@ -2858,12 +2962,17 @@ async def walkforward_analog_cmd(update, context):
     /walkforward_analog [MA1 MA2 ...]
 
     Walk-forward OOS test tu 2025-01-01 den hom nay.
-    Config co dinh theo ket qua backtest + detail.
+
+    - Ma da co config (_WF_SYMBOL_CONFIG): chay nhanh voi config co san.
+    - Ma CHUA co config: tu dong chay Pipeline (Tang 1 → Tang 2) de tim
+      combo + threshold tot nhat, sau do luu vao config va chay WF.
+      Khong can nhờ setup tay nua.
 
     Vi du:
-      /walkforward_analog              (chay ca 4 ma mac dinh)
-      /walkforward_analog FPT MWG      (chi FPT va MWG)
-      /walkforward_analog HPG
+      /walkforward_analog              (chay tat ca ma co config)
+      /walkforward_analog DCM          (tu dong pipeline neu chua co config)
+      /walkforward_analog FPT MWG DCM  (hon hop: co san + chua co config)
+      /walkforward_analog VNM ACB      (ma moi hoan toan)
     """
     try:
         from bot import is_allowed, _deny
@@ -2883,16 +2992,17 @@ async def walkforward_analog_cmd(update, context):
     else:
         import re as _re
         symbols = [a.upper() for a in args if _re.match(r'^[A-Z0-9]{2,10}$', a.upper())]
-        # Lọc chỉ mã có config
-        unknown = [s for s in symbols if s not in _WF_SYMBOL_CONFIG]
-        symbols = [s for s in symbols if s in _WF_SYMBOL_CONFIG]
-        if unknown:
-            await update.message.reply_text(
-                f"Cac ma chua co config: {', '.join(unknown)}\n"
-                f"Ma co san: {', '.join(_WF_SYMBOL_CONFIG)}"
-            )
-            if not symbols:
-                return
+
+    if not symbols:
+        await update.message.reply_text(
+            "Cu phap: /walkforward_analog [MA1 MA2 ...]\n\n"
+            "Vi du:\n"
+            "  /walkforward_analog              (tat ca ma co config)\n"
+            "  /walkforward_analog DCM          (tu dong tim config neu chua co)\n"
+            "  /walkforward_analog MWG STB DCM\n\n"
+            f"Ma da co config: {', '.join(_WF_SYMBOL_CONFIG)}"
+        )
+        return
 
     # Rate limit
     user_id = str(update.effective_user.id) if update.effective_user else "unknown"
@@ -2903,37 +3013,65 @@ async def walkforward_analog_cmd(update, context):
         return
     _last_backtest_analog_wf[user_id] = time.time()
 
-    chat_id = update.effective_chat.id
-    msg     = await update.message.reply_text(
+    # Phân loại mã: có config sẵn vs cần tự động pipeline
+    known   = [s for s in symbols if s in _WF_SYMBOL_CONFIG]
+    unknown = [s for s in symbols if s not in _WF_SYMBOL_CONFIG]
+
+    info_parts = []
+    if known:
+        info_parts.append(f"Config san: {', '.join(known)}")
+    if unknown:
+        info_parts.append(f"Tu dong Pipeline (Tang 1+2): {', '.join(unknown)}")
+
+    chat_id  = update.effective_chat.id
+    est_mins = len(known) * 2 + len(unknown) * 10
+    msg = await update.message.reply_text(
         f"Walk-forward OOS: {', '.join(symbols)}\n"
+        + "\n".join(info_parts) + "\n"
         f"Giai doan: {_WF_START_DATE} → hom nay\n"
-        f"Uoc tinh ~2-4 phut/ma..."
+        f"Uoc tinh ~{est_mins} phut..."
     )
 
     async def _bg():
         try:
             all_results = {}
             for i, symbol in enumerate(symbols, 1):
+                is_unknown = symbol not in _WF_SYMBOL_CONFIG
+
                 try:
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
                         message_id=msg.message_id,
                         text=(
                             f"Walk-forward: {symbol} ({i}/{len(symbols)})\n"
-                            f"Config: {_WF_SYMBOL_CONFIG[symbol]['combo']} "
-                            f"| nguong {_WF_SYMBOL_CONFIG[symbol]['threshold']}\n"
-                            f"Dang tinh..."
+                            + (
+                                f"Tu dong Pipeline: Tim combo + threshold tot nhat...\n"
+                                if is_unknown else
+                                f"Config: {_WF_SYMBOL_CONFIG[symbol]['combo']} "
+                                f"| nguong {_WF_SYMBOL_CONFIG[symbol]['threshold']}\n"
+                            )
+                            + f"Dang tinh..."
                         ),
                     )
                 except Exception:
                     pass
 
-                res = await asyncio.to_thread(_run_walkforward_sync, symbol)
+                if is_unknown:
+                    # Chạy pipeline tự động: Tầng 1 tìm config → Tầng 2 WF
+                    res = await asyncio.to_thread(_run_pipeline_wf_sync, symbol)
+                else:
+                    res = await asyncio.to_thread(_run_walkforward_sync, symbol)
+
                 all_results[symbol] = res
 
-                # Gửi kết quả từng mã ngay khi xong
+                # Gửi kết quả từng mã
                 if res["status"] == "error":
                     text = f"❌ {symbol}: {res.get('error','?')[:200]}"
+                elif res["status"] == "skip":
+                    text = (
+                        f"⛔ {symbol}: Khong co combo nao qua bo loc\n"
+                        f"   {res.get('reason','?')[:150]}"
+                    )
                 else:
                     text = _format_wf_result(res)
 
@@ -2949,7 +3087,7 @@ async def walkforward_analog_cmd(update, context):
                         text=_plain(text)[:4096],
                     )
 
-            # Nếu nhiều mã → gửi tổng kết
+            # Tổng kết nếu nhiều mã
             if len(symbols) > 1:
                 summary_lines = [
                     "TONG KET WALK-FORWARD",
@@ -2961,28 +3099,26 @@ async def walkforward_analog_cmd(update, context):
                 fail_syms    = []
 
                 for symbol, res in all_results.items():
-                    if res["status"] == "error":
-                        fail_syms.append(f"{symbol}(loi)")
+                    if res["status"] in ("error", "skip"):
+                        fail_syms.append(f"{symbol}({'loi' if res['status']=='error' else 'skip'})")
                         continue
                     oos_m = res.get("oos_metrics")
                     if not oos_m:
                         fail_syms.append(f"{symbol}(chua du tin hieu)")
                         continue
-                    train_m  = res.get("train_metrics", {}) or {}
-                    exp_ok   = oos_m["mean_exp"] > 0
-                    pf_ok    = oos_m["pf"] >= 1.5
-                    exp_deg  = oos_m["mean_exp"] >= (train_m.get("mean_exp", 0) or 0) * 0.60
-                    pf_deg   = oos_m["pf"] >= (train_m.get("pf", 0) or 0) * 0.50
-
-                    cfg = _WF_SYMBOL_CONFIG[symbol]
-                    line = (
-                        f"  {symbol}: "
+                    train_m = res.get("train_metrics", {}) or {}
+                    exp_ok  = oos_m["mean_exp"] > 0
+                    pf_ok   = oos_m["pf"] >= 1.5
+                    exp_deg = oos_m["mean_exp"] >= (train_m.get("mean_exp", 0) or 0) * 0.60
+                    cfg_tag = "" if symbol in _WF_SYMBOL_CONFIG else " [auto]"
+                    line    = (
+                        f"  {symbol}{cfg_tag}: "
                         f"Exp {oos_m['mean_exp']:+.2f}%  "
                         f"PF {oos_m['pf']:.2f}  "
                         f"WR {oos_m['wr']:.0f}%  "
                         f"n={oos_m['n']}"
                     )
-                    if exp_ok and pf_ok and exp_deg and pf_deg:
+                    if exp_ok and pf_ok and exp_deg:
                         summary_lines.append(f"✅ PASS   {line[4:]}")
                         pass_syms.append(symbol)
                     elif exp_ok and pf_ok:
@@ -2998,14 +3134,18 @@ async def walkforward_analog_cmd(update, context):
                 if partial_syms:
                     summary_lines.append(f"PARTIAL : {', '.join(partial_syms)}")
                 if fail_syms:
-                    summary_lines.append(f"FAIL    : {', '.join(fail_syms)}")
-                if pass_syms:
+                    summary_lines.append(f"FAIL/SKIP: {', '.join(fail_syms)}")
+
+                # Gợi ý lưu config cho mã auto pass
+                auto_pass = [s for s in pass_syms if s not in _WF_SYMBOL_CONFIG]
+                if auto_pass:
                     summary_lines.append("")
                     summary_lines.append(
-                        f"Ma du dieu kien live trading: {', '.join(pass_syms)}"
+                        f"💡 Ma moi PASS: {', '.join(auto_pass)}\n"
+                        f"   Ket qua da luu tam thoi. "
+                        f"Dung /analog_pipeline de xac nhan truoc khi them vao live."
                     )
 
-                # Edit message loading thành tổng kết
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=msg.message_id,
