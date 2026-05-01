@@ -514,6 +514,22 @@ def _scan_symbol(symbol: str) -> Optional[dict]:
     # R:R thực tế
     rr = abs(tp_pct / sl_pct) if sl_pct < 0 else 0.0
 
+    # Phân bố thời gian của analogs — kiểm tra có cụm lại không
+    analog_dates = [pd.Timestamp(dates[c_idx]) for c_idx, _ in kept
+                    if c_idx + FWD_DAYS < n_bars]
+    analog_dates.sort()
+
+    # Đếm số năm khác nhau có mặt trong tập analogs
+    analog_years = sorted(set(d.year for d in analog_dates))
+
+    # Đếm số analogs trong 2 năm gần nhất (bias gần đây)
+    cutoff_recent = pd.Timestamp(dates[exclude_cutoff - 1]) - pd.DateOffset(years=2)
+    n_recent = sum(1 for d in analog_dates if d >= cutoff_recent)
+    pct_recent = n_recent / len(analog_dates) * 100 if analog_dates else 0
+
+    # Khoảng thời gian trải dài (năm đầu → năm cuối)
+    year_span = analog_years[-1] - analog_years[0] if len(analog_years) >= 2 else 0
+
     return {
         "symbol":      symbol,
         "combo":       cfg["combo"],
@@ -535,6 +551,11 @@ def _scan_symbol(symbol: str) -> Optional[dict]:
         "oos_exp":     cfg.get("oos_exp", 0.0),
         "oos_pf":      cfg.get("oos_pf",  0.0),
         "mae30":       mae30,
+        # Phân bố thời gian
+        "analog_years":  analog_years,
+        "year_span":     year_span,
+        "n_recent":      n_recent,
+        "pct_recent":    round(pct_recent, 1),
     }
 
 
@@ -561,6 +582,24 @@ def _format_signal_msg(sig: dict, signal_date: str) -> str:
     rr_str  = f"{rr:.2f}" if rr > 0 else "N/A"
     rr_em   = "✅" if rr >= 1.0 else "⚠️"
 
+    # Phân bố thời gian analogs
+    analog_years = sig.get("analog_years", [])
+    year_span    = sig.get("year_span", 0)
+    pct_recent   = sig.get("pct_recent", 0.0)
+    n_recent     = sig.get("n_recent", 0)
+    n_years      = len(analog_years)
+
+    # Đánh giá chất lượng phân bố
+    if year_span >= 4 and pct_recent <= 60:
+        dist_em  = "✅"
+        dist_note = f"Trai deu {n_years} nam ({analog_years[0] if analog_years else '?'}-{analog_years[-1] if analog_years else '?'})"
+    elif year_span >= 2:
+        dist_em  = "⚠️"
+        dist_note = f"Phan bo trung binh — {pct_recent:.0f}% trong 2 nam gan nhat"
+    else:
+        dist_em  = "🔴"
+        dist_note = f"CUM LAI — {pct_recent:.0f}% analogs trong 2 nam gan! Ket qua it tin cay"
+
     lines = [
         f"📊 ANALOG SIGNAL — {sym}",
         f"Ngay: {signal_date} | {cfg['combo']} | sim>={cfg['threshold']}",
@@ -576,6 +615,10 @@ def _format_signal_msg(sig: dict, signal_date: str) -> str:
         f"  MFE median : {mfe_med:+.1f}%  (dinh cao nhat ky vong)",
         f"  MAE median : {mae_med:+.1f}%  (day thap nhat ky vong)",
         f"  {rr_em} R:R      : {rr_str}  (MFE / |MAE|)",
+        sep,
+        "Chat luong analog pool:",
+        f"  {dist_em} {dist_note}",
+        f"  Trai qua: {', '.join(str(y) for y in analog_years) if analog_years else 'N/A'}",
         sep,
         "So voi OOS benchmark (2025):",
         f"  {exp_em} Exp: {sig['exp_pct']:+.2f}% vs OOS {cfg['oos_exp']:+.2f}% ({exp_vs:+.2f}%)",
@@ -596,6 +639,7 @@ def _format_signal_msg(sig: dict, signal_date: str) -> str:
         "   Ket qua qua khu khong dam bao tuong lai.",
     ]
     return "\n".join(lines)
+
 
 
 
