@@ -108,6 +108,81 @@ CONFLICT_RULES = {
     "DCM": "DPM",   # DPM ưu tiên hơn DCM — cùng combo, MaxDD DPM tốt hơn
 }
 
+
+def _load_signal_symbols_from_db():
+    """
+    Load analog config từ DB và merge vào SIGNAL_SYMBOLS.
+
+    Logic merge:
+    - Hardcode SIGNAL_SYMBOLS là baseline đã verify kỹ (t1_exp, oos_exp, ...)
+    - DB config (từ /analog_approve) override hoặc thêm mã mới
+    - Mã DB cần có đủ dims để được add vào cron scan
+    - Mã DB thiếu dims → bỏ qua, log warning
+
+    Gọi 1 lần khi bot start (từ _start_signal_cron và signal_status_cmd).
+    """
+    try:
+        from db import load_analog_configs
+        db_configs = load_analog_configs()
+        if not db_configs:
+            logger.info("[AnalogSignal] No DB configs found, using hardcoded SIGNAL_SYMBOLS.")
+            return
+
+        added   = []
+        skipped = []
+        for symbol, cfg in db_configs.items():
+            dims = cfg.get("dims")
+            if not dims or len(dims) == 0:
+                skipped.append(f"{symbol}(no dims)")
+                continue
+
+            combo     = cfg.get("combo", "")
+            threshold = cfg.get("threshold", 0.60)
+            mae30     = cfg.get("mae30", 0.0)
+            sizing    = cfg.get("sizing", 1.0)
+
+            if symbol in SIGNAL_SYMBOLS:
+                # Override các field từ DB, giữ lại t1_exp/oos_exp nếu DB không có
+                existing = SIGNAL_SYMBOLS[symbol]
+                SIGNAL_SYMBOLS[symbol] = {
+                    **existing,           # giữ t1_exp, oos_exp, note từ hardcode
+                    "combo":     combo,
+                    "dims":      dims,
+                    "threshold": threshold,
+                    "mae30":     mae30,
+                    "sizing":    sizing,
+                }
+                added.append(f"{symbol}(updated)")
+            else:
+                # Mã mới hoàn toàn từ DB
+                SIGNAL_SYMBOLS[symbol] = {
+                    "combo":     combo,
+                    "dims":      dims,
+                    "threshold": threshold,
+                    "mae30":     mae30,
+                    "sizing":    sizing,
+                    "t1_exp":    cfg.get("t1_exp", 0.0),
+                    "t1_pf":     cfg.get("t1_pf",  0.0),
+                    "oos_exp":   cfg.get("oos_exp", 0.0),
+                    "oos_pf":    cfg.get("oos_pf",  0.0),
+                    "note":      cfg.get("note", "Config tu DB — da verify qua walkforward"),
+                }
+                added.append(f"{symbol}(new)")
+
+        if added:
+            logger.info(
+                f"[AnalogSignal] DB merge: {len(added)} symbols added/updated: {added}. "
+                f"Total SIGNAL_SYMBOLS: {len(SIGNAL_SYMBOLS)}: {list(SIGNAL_SYMBOLS.keys())}"
+            )
+        if skipped:
+            logger.warning(
+                f"[AnalogSignal] DB merge skipped (missing dims): {skipped}. "
+                f"Chay /analog_approve <MA> voi dims day du de fix."
+            )
+
+    except Exception as e:
+        logger.warning(f"[AnalogSignal] _load_signal_symbols_from_db error (non-critical): {e}")
+
 SIGNAL_COOLDOWN_DAYS = 7      # tối đa 1 signal/mã mỗi 7 ngày
 MIN_SAMPLES          = 5      # tối thiểu 5 analog độc lập
 MDS_DAYS             = 30     # minimum distance sampling
@@ -493,7 +568,11 @@ async def _start_signal_cron(bot, chat_ids: list):
       3. Push nếu có signal mới (cooldown 7 ngày/mã)
     """
     _init_signal_table()
-    logger.info(f"[AnalogSignal] Cron started: {len(chat_ids)} chat_ids")
+    _load_signal_symbols_from_db()   # merge DB config vào SIGNAL_SYMBOLS
+    logger.info(
+        f"[AnalogSignal] Cron started: {len(chat_ids)} chat_ids, "
+        f"{len(SIGNAL_SYMBOLS)} symbols: {list(SIGNAL_SYMBOLS.keys())}"
+    )
 
     while True:
         try:
@@ -613,6 +692,7 @@ async def signal_status_cmd(update, context):
 
     try:
         _init_signal_table()
+        _load_signal_symbols_from_db()   # đảm bảo SIGNAL_SYMBOLS up-to-date
         signals = await asyncio.to_thread(_get_active_signals)
     except Exception as e:
         await update.message.reply_text(f"Loi doc DB: {e}")
