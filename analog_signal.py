@@ -459,22 +459,43 @@ def _scan_symbol(symbol: str) -> Optional[dict]:
     if len(kept) < MIN_SAMPLES:
         return None
 
-    # Forward returns của analogs
-    fwd_rets = []
+    # Forward returns + MFE + MAE của từng analog
+    fwd_rets  = []
+    mfe_vals  = []   # Maximum Favorable Excursion: đỉnh cao nhất trong 30D
+    mae_vals  = []   # Maximum Adverse Excursion: đáy thấp nhất trong 30D
+
+    high_arr = df["high"].values.astype(float) if "high" in df.columns else close_arr
+    low_arr  = df["low"].values.astype(float)  if "low"  in df.columns else close_arr
+
     for c_idx, _ in kept:
         fwd_idx = c_idx + FWD_DAYS
         if fwd_idx >= n_bars:
             continue
         entry = close_arr[c_idx]
+        if entry <= 0:
+            continue
+
+        # Forward return: close[T+30] vs close[T]
         fwd_rets.append((close_arr[fwd_idx] - entry) / entry * 100)
+
+        # MFE: đỉnh cao nhất trong window [T+1, T+30]
+        window_high = high_arr[c_idx + 1: fwd_idx + 1]
+        if len(window_high) > 0:
+            mfe_vals.append((np.max(window_high) - entry) / entry * 100)
+
+        # MAE: đáy thấp nhất trong window [T+1, T+30]
+        window_low = low_arr[c_idx + 1: fwd_idx + 1]
+        if len(window_low) > 0:
+            mae_vals.append((np.min(window_low) - entry) / entry * 100)
 
     if len(fwd_rets) < MIN_SAMPLES:
         return None
 
-    # Metrics — dùng median(fwd_rets) làm Exp, nhất quán với Tầng 1/2
-    # (Tầng 1/2: sig_rets = [median(fwd_rets) cho mỗi ngày T])
-    # WR/PF vẫn tính từ raw fwd_rets để giữ thông tin phân phối
+    # Metrics — median(fwd_rets) làm Exp, nhất quán với Tầng 1/2
     exp      = float(np.median(fwd_rets))
+    mfe_med  = float(np.median(mfe_vals))  if mfe_vals else exp
+    mae_med  = float(np.median(mae_vals))  if mae_vals else mae30
+
     wins     = [x for x in fwd_rets if x >= WIN_THRESH]
     losses   = [x for x in fwd_rets if x < WIN_THRESH]
     wr       = len(wins) / len(fwd_rets)
@@ -485,9 +506,13 @@ def _scan_symbol(symbol: str) -> Optional[dict]:
 
     # Giá hiện tại
     entry_price = float(close_arr[-1])
-    sl_pct      = mae30 - 2.0   # MAE30 - buffer 2%
+    sl_pct      = mae_med - 2.0         # MAE median từ analogs - buffer 2%
     sl_price    = entry_price * (1 + sl_pct / 100)
-    tp_price    = entry_price * (1 + exp / 100)
+    tp_pct      = mfe_med               # MFE median làm TP — đỉnh kỳ vọng
+    tp_price    = entry_price * (1 + tp_pct / 100)
+
+    # R:R thực tế
+    rr = abs(tp_pct / sl_pct) if sl_pct < 0 else 0.0
 
     return {
         "symbol":      symbol,
@@ -495,16 +520,20 @@ def _scan_symbol(symbol: str) -> Optional[dict]:
         "threshold":   threshold,
         "entry_price": entry_price,
         "sl_price":    sl_price,
-        "sl_pct":      sl_pct,
+        "sl_pct":      round(sl_pct, 1),
         "tp_price":    tp_price,
+        "tp_pct":      round(tp_pct, 1),
         "exp_pct":     round(exp, 2),
+        "mfe_med":     round(mfe_med, 2),
+        "mae_med":     round(mae_med, 2),
+        "rr":          round(rr, 2),
         "pf":          round(pf, 2),
         "wr":          round(wr * 100, 1),
         "n_analogs":   len(fwd_rets),
         "avg_sim":     round(avg_sim, 3),
         # So sánh với OOS walk-forward
-        "oos_exp":     cfg["oos_exp"],
-        "oos_pf":      cfg["oos_pf"],
+        "oos_exp":     cfg.get("oos_exp", 0.0),
+        "oos_pf":      cfg.get("oos_pf",  0.0),
         "mae30":       mae30,
     }
 
@@ -525,35 +554,49 @@ def _format_signal_msg(sig: dict, signal_date: str) -> str:
     note    = cfg.get("note", "")
     sizing_str = "" if sizing == 1.0 else f"\n  ⚠️  Sizing khuyen nghi: {int(sizing*100)}% (MaxDD cao hon)"
 
+    # MFE / MAE / R:R từ analogs hôm nay
+    mfe_med = sig.get("mfe_med", sig["exp_pct"])
+    mae_med = sig.get("mae_med", sig["mae30"])
+    rr      = sig.get("rr", 0.0)
+    rr_str  = f"{rr:.2f}" if rr > 0 else "N/A"
+    rr_em   = "✅" if rr >= 1.0 else "⚠️"
+
     lines = [
         f"📊 ANALOG SIGNAL — {sym}",
         f"Ngay: {signal_date} | {cfg['combo']} | sim>={cfg['threshold']}",
         sep,
-        f"Tin hieu hom nay:",
-        f"  WR {sig['wr']:.0f}%  "
-        f"Exp {sig['exp_pct']:+.2f}%  "
-        f"PF {sig['pf']:.2f}  "
-        f"n={sig['n_analogs']} analogs",
+        "Tin hieu hom nay:",
+        (f"  WR {sig['wr']:.0f}%  "
+         f"Exp {sig['exp_pct']:+.2f}%  "
+         f"PF {sig['pf']:.2f}  "
+         f"n={sig['n_analogs']} analogs"),
         f"  Do tuong dong TB: {sig['avg_sim']:.3f}",
         sep,
-        f"So voi OOS benchmark (2025):",
+        f"Phan tich 30D tu {sig['n_analogs']} analog tuong tu:",
+        f"  MFE median : {mfe_med:+.1f}%  (dinh cao nhat ky vong)",
+        f"  MAE median : {mae_med:+.1f}%  (day thap nhat ky vong)",
+        f"  {rr_em} R:R      : {rr_str}  (MFE / |MAE|)",
+        sep,
+        "So voi OOS benchmark (2025):",
         f"  {exp_em} Exp: {sig['exp_pct']:+.2f}% vs OOS {cfg['oos_exp']:+.2f}% ({exp_vs:+.2f}%)",
         f"  {pf_em} PF : {sig['pf']:.2f} vs OOS {cfg['oos_pf']:.2f} ({pf_vs:+.2f})",
         sep,
         f"Ke hoach hanh dong (goi y):{sizing_str}",
         f"  Entry : {sig['entry_price']:,.0f}",
-        f"  SL    : {sig['sl_price']:,.0f} ({sig['sl_pct']:.1f}%)",
-        f"  TP    : {sig['tp_price']:,.0f} ({sig['exp_pct']:+.1f}%)",
+        f"  SL    : {sig['sl_price']:,.0f}  (MAE {mae_med:.1f}% - 2% buffer)",
+        f"  TP    : {sig['tp_price']:,.0f}  (MFE median {mfe_med:+.1f}%)",
+        f"  → Hold toi da 30 ngay, thoat neu cham SL",
     ]
     if note:
         lines.append(sep)
         lines.append(f"📝 {note}")
     lines += [
         sep,
-        f"⚠️  Day la goi y, khong phai khuyen nghi dau tu.",
-        f"   Ket qua qua khu khong dam bao tuong lai.",
+        "⚠️  Day la goi y, khong phai khuyen nghi dau tu.",
+        "   Ket qua qua khu khong dam bao tuong lai.",
     ]
     return "\n".join(lines)
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
