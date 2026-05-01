@@ -2024,19 +2024,19 @@ def _format_analog_compare_result(res: dict) -> str:
 
 async def backtest_analog_cmd(update, context):
     """
-    /backtest_analog <MA> [days] [--compare]
+    /backtest_analog <MA> [days] [compare]
 
     Test 15 combo x 7 nguong = 105 experiments.
 
-    Flag --compare: chay them 2 backtest de so sanh:
-      A (Goc)    : MIN_SAMPLES=5, khong filter  (mac dinh hien tai)
+    Them "compare" de so sanh 3 phuong an:
+      A (Goc)    : MIN_SAMPLES=5, khong filter  (mac dinh)
       B (MinS=10): MIN_SAMPLES=10, khong filter
       C (HardFlt): MIN_SAMPLES=5 + hard filter theo combo
 
     Vi du:
-      /backtest_analog MWG             (backtest goc, nhanh hon)
-      /backtest_analog MWG --compare   (so sanh 3 phuong an, ~3x lau hon)
-      /backtest_analog MWG 1500 --compare
+      /backtest_analog MWG             (backtest goc, ~4-10 phut)
+      /backtest_analog MWG compare     (so sanh A/B/C, ~12-30 phut)
+      /backtest_analog MWG 1500 compare
     """
     try:
         from bot import is_allowed, _deny
@@ -2052,31 +2052,34 @@ async def backtest_analog_cmd(update, context):
 
     if not args:
         await update.message.reply_text(
-            "Cu phap: /backtest_analog <MA> [days] [--compare]\n\n"
+            "Cu phap: /backtest_analog <MA> [days] [compare]\n\n"
             "Vi du:\n"
             "  /backtest_analog HPG\n"
-            "  /backtest_analog MWG --compare\n"
-            "  /backtest_analog VCB 1500 --compare\n\n"
-            "--compare: so sanh 3 phuong an A/B/C (~3x lau hon)\n"
-            "Thoi gian: 4-10 phut (goc) | 12-30 phut (--compare)."
+            "  /backtest_analog MWG compare\n"
+            "  /backtest_analog VCB 1500 compare\n\n"
+            "compare: so sanh 3 phuong an A/B/C (~3x lau hon)\n"
+            "Thoi gian: 4-10 phut (goc) | 12-30 phut (compare)."
         )
         return
 
     import re as _re
 
-    # Parse args — tach flag --compare
-    do_compare = "--compare" in args
-    raw_args   = [a for a in args if a != "--compare"]
+    # Parse args — tach keyword "compare"
+    do_compare = "compare" in [a.lower() for a in args]
+    raw_args   = [a for a in args if a.lower() != "compare"]
 
     symbol = raw_args[0].upper().strip() if raw_args else ""
     if not _re.match(r'^[A-Z0-9]{2,10}$', symbol):
         await update.message.reply_text(f"Ma '{symbol}' khong hop le.")
         return
 
-    try:
-        days = max(500, min(int(raw_args[1]), 2500)) if len(raw_args) > 1 else 1800
-    except (ValueError, IndexError):
-        days = 1800
+    # Parse days — chỉ lấy nếu arg thứ 2 là số
+    days = 1800
+    if len(raw_args) > 1:
+        try:
+            days = max(500, min(int(raw_args[1]), 2500))
+        except ValueError:
+            days = 1800  # bỏ qua nếu không phải số
 
     user_id = str(update.effective_user.id) if update.effective_user else "unknown"
     since   = time.time() - _last_backtest_analog.get(user_id, 0)
