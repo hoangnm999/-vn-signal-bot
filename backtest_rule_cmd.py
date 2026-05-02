@@ -2352,3 +2352,33 @@ async def analog_remove_cmd(update, context):
 
     flag = "✅" if deleted else "⚠️"
     await update.message.reply_text(f"{flag} {symbol}: {status}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STUBS — giữ tương thích với bot.py imports
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def backtest_analog_batch_cmd(update, context):
+    """/backtest_analog_batch — Dùng /analog_pipeline thay thế."""
+    await update.message.reply_text(
+        "⚠️ /backtest_analog_batch đã được thay bằng /analog_pipeline\n"
+        "Cú pháp: /analog_pipeline <MA1> <MA2> ...\n"
+        "Ví dụ: /analog_pipeline MWG STB DPM"
+    )
+
+
+async def analog_regime_analysis_cmd(update, context):
+    """/analog_regime_analysis — Đã gộp vào /walkforward_analog."""
+    await update.message.reply_text(
+        "⚠️ /analog_regime_analysis đã được gộp vào /walkforward_analog\n"
+        "Dùng: /walkforward_analog <MA> để xem đầy đủ kết quả OOS."
+    )
+
+
+async def analog_sim_dist_cmd(update, context):
+    """/analog_sim_dist — Đã loại bỏ trong V2."""
+    await update.message.reply_text(
+        "⚠️ /analog_sim_dist không còn trong V2.\n"
+        "Dùng /backtest_analog_detail <MA> \"<combo>\" để xem "
+        "phân bố threshold theo từng combo."
+    )
