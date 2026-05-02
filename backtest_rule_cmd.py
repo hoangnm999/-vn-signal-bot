@@ -3063,6 +3063,190 @@ def _run_walkforward_sync(symbol: str) -> dict:
     }
 
 
+def _format_wf_result(res: dict) -> str:
+    """Format kết quả walk-forward so sánh OOS vs Training."""
+    symbol    = res["symbol"]
+    combo     = res["combo"]
+    threshold = res["threshold"]
+    wf_start  = res["wf_start"]
+    oos_m     = res.get("oos_metrics")
+    train_m   = res.get("train_metrics")
+    oos_sigs  = res.get("oos_signals", [])
+    n_pending = sum(1 for s in oos_sigs if s.get("pending"))
+
+    sep  = "=" * 36
+    sep2 = "-" * 36
+
+    lines = [
+        f"WALK-FORWARD: {symbol}",
+        f"Config: {combo} | nguong {threshold}",
+        f"OOS: {wf_start} → hom nay",
+        sep,
+    ]
+
+    # ── Training metrics ──────────────────────────────────────────────────────
+    lines.append("TRAINING (in-sample, truoc 2025):")
+    if train_m:
+        lines.append(
+            f"  WR {train_m['wr']:.0f}%  "
+            f"Exp {train_m['mean_exp']:+.2f}%  "
+            f"PF {train_m['pf']:.2f}  "
+            f"Sharpe {train_m['sharpe']:.2f}  "
+            f"n={train_m['n']}"
+        )
+        lines.append(
+            f"  MAE30 {train_m['mae30']:.1f}%  Worst {train_m['max_dd']:.1f}%"
+        )
+    else:
+        lines.append("  Khong du tin hieu training.")
+    lines.append(sep2)
+
+    # ── OOS metrics ───────────────────────────────────────────────────────────
+    n_skip_cooldown = res.get("n_skip_cooldown", 0)
+    cooldown_bars   = res.get("cooldown_bars", 10)
+    lines.append(f"OUT-OF-SAMPLE ({wf_start} → hom nay):")
+    lines.append(f"  [Simulate cooldown {cooldown_bars} bars (~2 tuan) — giong live trading]")
+    if oos_m:
+        lines.append(
+            f"  WR {oos_m['wr']:.0f}%  "
+            f"Exp {oos_m['mean_exp']:+.2f}%  "
+            f"PF {oos_m['pf']:.2f}  "
+            f"Sharpe {oos_m['sharpe']:.2f}  "
+            f"n={oos_m['n']}"
+            + (f" (+{n_pending} pending)" if n_pending else "")
+        )
+        lines.append(
+            f"  MAE30 {oos_m['mae30']:.1f}%  Worst {oos_m['max_dd']:.1f}%"
+        )
+        if n_skip_cooldown:
+            lines.append(
+                f"  (Bo qua {n_skip_cooldown} nut scan vi cooldown — "
+                f"giu lai {oos_m['n']} tin hieu thuc su)"
+            )
+    else:
+        lines.append(
+            f"  Chua du tin hieu OOS (can >= 3 tin hieu hoan thanh)."
+            + (f" Co {n_pending} tin hieu dang cho ket qua (< 30 ngay)." if n_pending else "")
+        )
+    lines.append(sep2)
+
+    # ── So sánh OOS vs Training ───────────────────────────────────────────────
+    if oos_m and train_m:
+        lines.append("SO SANH OOS vs TRAINING:")
+
+        def _delta(oos_val, train_val, higher_is_better=True):
+            diff = oos_val - train_val
+            ok   = diff >= 0 if higher_is_better else diff <= 0
+            sign = "+" if diff >= 0 else ""
+            em   = "✅" if ok else "⚠️"
+            return f"{em} {sign}{diff:.2f}"
+
+        lines.append(
+            f"  Exp   : OOS {oos_m['mean_exp']:+.2f}% vs Train {train_m['mean_exp']:+.2f}%  "
+            f"{_delta(oos_m['mean_exp'], train_m['mean_exp'])}"
+        )
+        lines.append(
+            f"  PF    : OOS {oos_m['pf']:.2f} vs Train {train_m['pf']:.2f}  "
+            f"{_delta(oos_m['pf'], train_m['pf'])}"
+        )
+        lines.append(
+            f"  WR    : OOS {oos_m['wr']:.0f}% vs Train {train_m['wr']:.0f}%  "
+            f"{_delta(oos_m['wr'], train_m['wr'])}"
+        )
+        lines.append(
+            f"  Worst : OOS {oos_m['max_dd']:.1f}% vs Train {train_m['max_dd']:.1f}%  "
+            f"{_delta(oos_m['max_dd'], train_m['max_dd'], higher_is_better=False)}"
+        )
+        lines.append(sep2)
+
+        # ── Verdict ───────────────────────────────────────────────────────────
+        lines.append("VERDICT:")
+        exp_ok  = oos_m["mean_exp"] > 0
+        pf_ok   = oos_m["pf"] >= 1.5
+        exp_deg = oos_m["mean_exp"] >= train_m["mean_exp"] * 0.60
+        pf_deg  = oos_m["pf"] >= train_m["pf"] * 0.50
+
+        if exp_ok and pf_ok and exp_deg and pf_deg:
+            lines.append(f"  ✅ PASS — Pattern con gia tri tren OOS.")
+            lines.append(f"     Exp {oos_m['mean_exp']:+.2f}% dương, PF {oos_m['pf']:.2f} >= 1.5.")
+            if oos_m["mean_exp"] >= train_m["mean_exp"] * 0.80:
+                lines.append("     Hieu suat OOS giu duoc >= 80% so voi training — rat tot.")
+            else:
+                lines.append("     Hieu suat OOS giam nhung van chap nhan duoc (>60% training).")
+            lines.append("     → Co the tien toi live trading than trong.")
+        elif exp_ok and pf_ok:
+            lines.append(f"  🟡 PARTIAL PASS — Exp va PF van duong nhung suy giam nhieu.")
+            lines.append(
+                f"     Exp OOS = {oos_m['mean_exp'] / train_m['mean_exp'] * 100:.0f}% so voi training."
+            )
+            lines.append("     → Theo doi them, chua nen live trading.")
+        else:
+            lines.append("  🔴 FAIL — OOS khong xac nhan pattern training.")
+            if not exp_ok:
+                lines.append(f"     Exp OOS am ({oos_m['mean_exp']:+.2f}%) — pattern het hieu luc.")
+            if not pf_ok:
+                lines.append(f"     PF OOS {oos_m['pf']:.2f} < 1.5 — he thong khong co loi nhuan thuc.")
+            lines.append("     → Khong dung cho live trading.")
+
+        # Cảnh báo n nhỏ
+        if oos_m["n"] < 20:
+            lines.append(
+                f"  ⚠️  Chi co {oos_m['n']} tin hieu OOS — "
+                f"ket qua co the chua on dinh, can them thoi gian."
+            )
+
+        # ── Random Baseline (null hypothesis) ─────────────────────────────────
+        baseline = _run_random_baseline(symbol)
+        if baseline.get("status") == "ok":
+            lines.append(sep2)
+            lines.append("NULL HYPOTHESIS (random entry baseline):")
+            lines.append(
+                f"  Random {baseline['n_trials']} entry OOS: "
+                f"WR {baseline['wr']:.0f}%  Exp {baseline['mean_exp']:+.2f}%  PF {baseline['pf']:.2f}"
+            )
+            alpha_exp = oos_m["mean_exp"] - baseline["mean_exp"]
+            alpha_pf  = oos_m["pf"] - baseline["pf"]
+            alpha_em  = "✅" if alpha_exp > 0.5 else ("⚠️" if alpha_exp > 0 else "🔴")
+            lines.append(
+                f"  Alpha thuc (WF - Random): "
+                f"Exp {alpha_em} {alpha_exp:+.2f}%  PF {alpha_pf:+.2f}"
+            )
+            if alpha_exp <= 0:
+                lines.append(
+                    "  🔴 CANH BAO: WF OOS khong tot hon random entry "
+                    "→ co the chi la market drift, khong co edge pattern."
+                )
+            elif alpha_exp < 0.5:
+                lines.append(
+                    "  ⚠️  Alpha nho (<0.5%) — can them n de xac nhan edge thuc su."
+                )
+            else:
+                lines.append(
+                    f"  ✅ Alpha duong ro rang ({alpha_exp:+.2f}%) — "
+                    "co bang chung pattern matching them gia tri ngoai drift."
+                )
+
+    lines.append("")
+    lines.append(
+        "Config da duoc fix truoc khi chay OOS — ket qua nay co gia tri thong ke."
+    )
+
+    # Gợi ý thêm config khi đến từ auto-pipeline và PASS
+    if res.get("auto_config"):
+        oos_ok = oos_m and oos_m.get("mean_exp", 0) > 0 and oos_m.get("pf", 0) >= 1.5
+        if oos_ok:
+            lines.append(sep2)
+            lines.append(f"💡 AUTO-PIPELINE — Tim thay config moi:")
+            lines.append(f"   Combo: {combo} | Nguong: {threshold}")
+            lines.append(f"   De them vao live trading, cap nhat 2 cho trong code:")
+            lines.append(f"   1. _WF_SYMBOL_CONFIG: \"{symbol}\": {{\"combo\": \"{combo}\", \"threshold\": {threshold}}}")
+            lines.append(f"   2. SIGNAL_SYMBOLS trong analog_signal.py (them dims tuong ung)")
+            lines.append(f"   Sau do chay /analog_pipeline {symbol} de xac nhan lai.")
+
+    lines.append(sep)
+    return "\n".join(lines)
+
+
 def _run_random_baseline(symbol: str, n_trials: int = 500) -> dict:
     """
     Null hypothesis test: chọn ngày OOS ngẫu nhiên (không dùng analog signal),
