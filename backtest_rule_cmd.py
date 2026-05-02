@@ -1143,10 +1143,373 @@ _ANALOG_COMBOS = [
 _ANALOG_THRESHOLDS = [0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
 # Tổng: 15 × 7 = 105 experiments
 
+# ── Hard filter cho Backtest C ────────────────────────────────────────────────
+# Format: {dim: (min, max)} — vector value phải trong khoảng [min, max]
+# Ngưỡng dựa trên ý nghĩa kinh tế:
+#   rsi_norm < -0.30    → RSI < 35
+#   trend_slope > 0.20  → SMA20 > SMA50 + 2%
+#   volume_spike > 0.25 → vol > 150% MA20
+#   atr_ratio > 0.50    → ATR > 2.5% giá
+#   momentum_5d < -0.20 → giảm > 2% trong 5 ngày
+_COMBO_HARD_FILTERS = {
+    "Full Baseline":       {},
+    "Mean Reversion":      {"rsi_norm": (-1.0,-0.30), "bb_position": (0.0,0.25)},
+    "Oversold Bounce":     {"rsi_norm": (-1.0,-0.30), "stoch_k_norm": (-1.0,-0.30)},
+    "Oversold + Momentum": {"rsi_norm": (-1.0,-0.30), "stoch_k_norm": (-1.0,-0.30)},
+    "Trend + Oversold":    {"trend_slope": (0.20,1.0), "rsi_norm": (-1.0,-0.30)},
+    "Trend Following":     {"trend_slope": (0.20,1.0), "price_vs_sma50": (0.05,1.0)},
+    "Trend + Volume":      {"trend_slope": (0.20,1.0), "volume_spike": (0.25,1.0)},
+    "Momentum + Trend":    {"trend_slope": (0.20,1.0), "momentum_20d": (0.10,1.0)},
+    "Macro Trend":         {"trend_slope": (0.20,1.0), "price_vs_sma50": (0.05,1.0)},
+    "Volume Confirmed":    {"volume_spike": (0.25,1.0)},
+    "Momentum + Volume":   {"volume_spike": (0.25,1.0), "momentum_5d": (-1.0,-0.20)},
+    "Short-term Signal":   {"momentum_5d": (-1.0,-0.20), "volume_spike": (0.25,1.0)},
+    "Volatility Aware":    {"atr_ratio": (0.50,1.0), "bb_position": (0.0,0.25)},
+    "Pure Momentum":       {"momentum_5d": (-1.0,-0.20), "momentum_20d": (-1.0,-0.10)},
+    "No Volume":           {"rsi_norm": (-1.0,-0.30), "bb_position": (0.0,0.25)},
+}
+
+
+def _check_hard_filter(vec: dict, combo_name: str) -> bool:
+    """Kiểm tra ngày T có thỏa hard filter của combo không."""
+    filters = _COMBO_HARD_FILTERS.get(combo_name)
+    if not filters:
+        return True
+    for dim, (lo, hi) in filters.items():
+        val = vec.get(dim, 0.0)
+        if not (lo <= val <= hi):
+            return False
+    return True
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CORE RUNNER
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _run_one_experiment(
+    combo, threshold, vectors, vector_indices, dates,
+    close_arr, low_arr, n_bars,
+    min_samples=5, use_hard_filter=False,
+):
+    """Chạy 1 experiment dùng chung cho A/B/C."""
+    import numpy as np
+    import pandas as pd
+
+    WIN_THRESH = 1.0
+    MDS_DAYS   = 30
+    FWD_DAYS   = 30
+
+    combo_name = combo["name"]
+    dims       = combo["dims"]
+    hypothesis = combo["hypothesis"]
+    group      = combo.get("group", "")
+    signals    = []
+    n_skip     = 0
+
+    for t_idx in range(120, n_bars - FWD_DAYS - 1, 7):
+        if t_idx not in vectors:
+            continue
+        target_vec = vectors[t_idx]
+        if use_hard_filter and not _check_hard_filter(target_vec, combo_name):
+            n_skip += 1
+            continue
+        target_arr = np.array([target_vec.get(d, 0.0) for d in dims], dtype=float)
+        t_norm     = np.linalg.norm(target_arr)
+        if t_norm < 1e-9:
+            continue
+        exclude_cutoff = t_idx - 90
+        candidates     = [i for i in vector_indices if i < exclude_cutoff]
+        if len(candidates) < 10:
+            continue
+        sim_list = []
+        for c_idx in candidates:
+            c_vec  = vectors[c_idx]
+            c_arr  = np.array([c_vec.get(d, 0.0) for d in dims], dtype=float)
+            c_norm = np.linalg.norm(c_arr)
+            if c_norm < 1e-9:
+                continue
+            sim = float(np.dot(target_arr, c_arr) / (t_norm * c_norm))
+            if sim >= threshold:
+                sim_list.append((c_idx, sim))
+        if not sim_list:
+            continue
+        sim_list.sort(key=lambda x: -x[1])
+        kept = []
+        for c_idx, sim in sim_list:
+            c_date    = pd.Timestamp(dates[c_idx])
+            too_close = any(
+                abs((c_date - pd.Timestamp(dates[k])).days) < MDS_DAYS
+                for k, _ in kept
+            )
+            if not too_close:
+                kept.append((c_idx, sim))
+        if len(kept) < min_samples:
+            n_skip += 1
+            continue
+        fwd_rets = []
+        mae_vals = []
+        for c_idx, _ in kept:
+            fwd_idx = c_idx + FWD_DAYS
+            if fwd_idx >= n_bars:
+                continue
+            entry = close_arr[c_idx]
+            fwd_rets.append((close_arr[fwd_idx] - entry) / entry * 100)
+            win_low = np.min(low_arr[c_idx + 1: fwd_idx + 1]) if fwd_idx > c_idx else entry
+            mae_vals.append((win_low - entry) / entry * 100)
+        if len(fwd_rets) < min_samples:
+            n_skip += 1
+            continue
+        signals.append({"fwd_rets": fwd_rets, "mae_vals": mae_vals})
+
+    if len(signals) < 5:
+        return {
+            "combo": combo_name, "group": group, "hypothesis": hypothesis,
+            "threshold": threshold, "n_signals": len(signals), "n_skip": n_skip,
+            "skip": True,
+        }
+
+    sig_rets = [float(np.median(s["fwd_rets"])) for s in signals]
+    sig_maes = [float(np.median(s["mae_vals"])) for s in signals]
+    wins     = [x for x in sig_rets if x >= WIN_THRESH]
+    losses   = [x for x in sig_rets if x < WIN_THRESH]
+    wr       = len(wins) / len(sig_rets)
+    mean_exp = float(np.mean(sig_rets))
+    med_exp  = float(np.median(sig_rets))
+    std_ret  = float(np.std(sig_rets)) if len(sig_rets) > 1 else 1e-9
+    sharpe   = mean_exp / std_ret * (52 ** 0.5) if std_ret > 0 else 0.0
+    pos_sum  = sum(wins)
+    neg_sum  = abs(sum(losses)) if losses else 1e-9
+    pf       = pos_sum / neg_sum if neg_sum > 0 else 99.0
+    mae30    = float(np.median(sig_maes))
+    max_dd   = float(np.min(sig_rets))
+
+    return {
+        "combo": combo_name, "group": group, "hypothesis": hypothesis,
+        "threshold": threshold, "n_signals": len(signals), "n_skip": n_skip,
+        "wr": round(wr * 100, 1), "mean_exp": round(mean_exp, 2),
+        "med_exp": round(med_exp, 2), "mae30": round(mae30, 2),
+        "max_dd": round(max_dd, 1), "sharpe": round(sharpe, 3),
+        "pf": round(pf, 2), "skip": False,
+    }
+
+
+def _run_analog_backtest_variants_sync(symbol: str, days: int = 1800) -> dict:
+    """
+    Chạy 3 backtest song song từ cùng 1 bộ data:
+      A: Gốc       — MIN_SAMPLES=5, không filter
+      B: MinS=10   — MIN_SAMPLES=10, không filter
+      C: HardFlt   — MIN_SAMPLES=5, + hard filter theo combo
+    """
+    import numpy as np
+
+    try:
+        from vn_loader import load_vn_ohlcv
+        df = load_vn_ohlcv(symbol, days=days, min_bars=200)
+    except Exception as e:
+        return {"status": "error", "error": f"Khong lay duoc data {symbol}: {e}"}
+
+    if df is None or len(df) < 200:
+        return {"status": "error", "error": "Khong du du lieu (can >= 200 bars)"}
+
+    if "low" not in df.columns:
+        df["low"] = df["close"]
+
+    n_bars    = len(df)
+    dates     = df["date"].values
+    close_arr = df["close"].values.astype(float)
+    low_arr   = df["low"].values.astype(float)
+
+    try:
+        from state_vector import compute_state_vector_for_date
+    except ImportError as e:
+        return {"status": "error", "error": f"Thieu state_vector: {e}"}
+
+    vectors = {}
+    for i in range(59, n_bars):
+        vec = compute_state_vector_for_date(df, i)
+        if vec is not None:
+            vectors[i] = vec
+
+    if len(vectors) < 100:
+        return {"status": "error", "error": f"Chi co {len(vectors)} vectors"}
+
+    vector_indices = sorted(vectors.keys())
+    common_args    = (vectors, vector_indices, dates, close_arr, low_arr, n_bars)
+
+    variants = {
+        "A": {"min_samples": 5,  "use_hard_filter": False},
+        "B": {"min_samples": 10, "use_hard_filter": False},
+        "C": {"min_samples": 5,  "use_hard_filter": True},
+    }
+
+    all_variant_results = {}
+    for tag, cfg in variants.items():
+        results = []
+        for combo in _ANALOG_COMBOS:
+            for threshold in _ANALOG_THRESHOLDS:
+                r = _run_one_experiment(
+                    combo, threshold, *common_args,
+                    min_samples=cfg["min_samples"],
+                    use_hard_filter=cfg["use_hard_filter"],
+                )
+                results.append(r)
+
+        valid = [r for r in results if not r.get("skip")]
+
+        def _rank_key(r):
+            return (
+                int(r["mean_exp"] > 0 and r["pf"] >= 1.5),
+                r["mean_exp"], r["pf"], r["sharpe"],
+            )
+        valid.sort(key=_rank_key, reverse=True)
+
+        baseline = next(
+            (r for r in results
+             if r["combo"] == "Full Baseline"
+             and abs(r["threshold"] - 0.70) < 0.001
+             and not r.get("skip")),
+            None,
+        )
+        all_variant_results[tag] = {
+            "results": results, "valid": valid,
+            "top": valid[:5], "baseline": baseline,
+        }
+
+    return {
+        "status": "ok", "symbol": symbol,
+        "n_bars": n_bars, "n_vectors": len(vectors),
+        "variants": all_variant_results,
+    }
+
+
+def _format_analog_compare_result(res: dict) -> str:
+    """Formatter so sánh 3 backtest A/B/C cạnh nhau."""
+    symbol   = res["symbol"]
+    n_bars   = res["n_bars"]
+    n_vecs   = res["n_vectors"]
+    variants = res["variants"]
+    sep  = "=" * 36
+    sep2 = "-" * 36
+
+    tag_labels = {
+        "A": "A (Goc)    ",
+        "B": "B (MinS=10)",
+        "C": "C (HardFlt)",
+    }
+
+    lines = [
+        f"BACKTEST ANALOG COMPARE — {symbol}",
+        f"{n_bars} bars | {n_vecs} vectors",
+        sep,
+        "PHUONG AN:",
+        "  A (Goc)    : MIN_SAMPLES=5, khong filter",
+        "  B (MinS=10): MIN_SAMPLES=10, khong filter",
+        "  C (HardFlt): MIN_SAMPLES=5 + hard filter combo",
+        sep,
+        "TOP 1 MOI PHUONG AN:",
+        "",
+    ]
+
+    best_results = {}
+    for tag in ["A", "B", "C"]:
+        v   = variants[tag]
+        top = v["top"]
+        if not top:
+            lines.append(f"  [{tag_labels[tag]}] Khong co ket qua hop le.")
+            continue
+        best = top[0]
+        best_results[tag] = best
+        pass_filter = best["mean_exp"] > 0 and best["pf"] >= 1.5
+        em = "OK" if pass_filter else "!!"
+        lines.append(f"[{em}] [{tag_labels[tag]}]")
+        lines.append(f"   {best['combo']} | nguong {best['threshold']:.2f}")
+        lines.append(
+            f"   WR {best['wr']:.0f}%  Exp {best['mean_exp']:+.2f}%  "
+            f"PF {best['pf']:.2f}  n={best['n_signals']}"
+        )
+        lines.append(
+            f"   MAE30 {best['mae30']:.1f}%  Worst {best['max_dd']:.1f}%  "
+            f"Sharpe {best['sharpe']:.2f}"
+        )
+        lines.append("")
+
+    lines.append(sep2)
+
+    # Bảng so sánh trực tiếp
+    combos = [best_results[t]["combo"] for t in ["A","B","C"] if t in best_results]
+    if len(set(combos)) == 1:
+        combo_name = combos[0]
+        lines.append(f"BANG SO SANH — {combo_name}:")
+        lines.append(f"  {'':12} {'n':>5} {'WR':>5} {'Exp':>7} {'PF':>6} {'MAE30':>7} {'Worst':>7}")
+        lines.append(f"  {'-'*48}")
+        for tag in ["A","B","C"]:
+            if tag not in best_results:
+                continue
+            r = best_results[tag]
+            lines.append(
+                f"  {tag_labels[tag]} "
+                f"{r['n_signals']:>5} {r['wr']:>4.0f}% "
+                f"{r['mean_exp']:>+6.2f}% {r['pf']:>6.2f} "
+                f"{r['mae30']:>6.1f}% {r['max_dd']:>6.1f}%"
+            )
+    else:
+        lines.append("BANG SO SANH (combo khac nhau):")
+        lines.append(f"  {'':12} {'Combo':25} {'Exp':>7} {'PF':>6} {'n':>5}")
+        lines.append(f"  {'-'*54}")
+        for tag in ["A","B","C"]:
+            if tag not in best_results:
+                continue
+            r = best_results[tag]
+            lines.append(
+                f"  {tag_labels[tag]} {r['combo']:<25} "
+                f"{r['mean_exp']:>+6.2f}% {r['pf']:>6.2f} {r['n_signals']:>5}"
+            )
+
+    lines.append("")
+    lines.append(sep2)
+    lines.append("NHAN XET:")
+
+    if len(best_results) == 3:
+        exp_a = best_results["A"]["mean_exp"]
+        exp_b = best_results["B"]["mean_exp"]
+        exp_c = best_results["C"]["mean_exp"]
+        n_a   = best_results["A"]["n_signals"]
+        n_b   = best_results["B"]["n_signals"]
+        n_c   = best_results["C"]["n_signals"]
+
+        if exp_b >= exp_a:
+            lines.append(f"  B tot hon A: Exp {exp_b:+.2f}% vs {exp_a:+.2f}%, n: {n_a}->{n_b}")
+        elif exp_b >= exp_a * 0.90:
+            lines.append(f"  B gan bang A (Exp {exp_b:+.2f}% vs {exp_a:+.2f}%), n giam {n_a-n_b}")
+        else:
+            lines.append(f"  B kem hon A: Exp {exp_b:+.2f}% vs {exp_a:+.2f}%, giu A")
+
+        if exp_c >= exp_a:
+            lines.append(f"  C tot hon A: Exp {exp_c:+.2f}% vs {exp_a:+.2f}%, n: {n_a}->{n_c}")
+        elif exp_c >= exp_a * 0.90:
+            lines.append(f"  C gan bang A, n giam manh ({n_a}->{n_c}), hard filter khong them nhieu gia tri")
+        else:
+            lines.append(f"  C kem hon A: hard filter loai qua nhieu tin hieu tot, giu A")
+
+        best_tag = max(["A","B","C"],
+            key=lambda t: (
+                int(best_results[t]["mean_exp"] > 0 and best_results[t]["pf"] >= 1.5),
+                best_results[t]["mean_exp"], best_results[t]["pf"],
+            )
+        )
+        lines.append(f"  => Khuyen nghi: {tag_labels[best_tag]} — "
+                     f"Exp {best_results[best_tag]['mean_exp']:+.2f}% "
+                     f"PF {best_results[best_tag]['pf']:.2f} "
+                     f"n={best_results[best_tag]['n_signals']}")
+
+    lines += [
+        "",
+        "Day la backtest IN-SAMPLE. Dung /walkforward_analog de validate OOS.",
+        sep,
+    ]
+    return "\n".join(lines)
+
+
 
 def _run_analog_backtest_sync(symbol: str, days: int = 1800) -> dict:
     """
@@ -1170,11 +1533,7 @@ def _run_analog_backtest_sync(symbol: str, days: int = 1800) -> dict:
     n_bars    = len(df)
     dates     = df["date"].values
     close_arr = df["close"].values.astype(float)
-    # Defensive: đảm bảo có cột low (file cũ không cần, file mới dùng cho MAE)
-    if "low" not in df.columns:
-        df["low"] = df["close"]
-        logger.warning(f"[Backtest] {symbol}: khong co cot low, dung close thay the")
-    low_arr = df["low"].values.astype(float)
+    low_arr   = df["low"].values.astype(float)
 
     # 2. Tính vectors ──────────────────────────────────────────────────────────
     try:
@@ -1537,8 +1896,8 @@ def _format_analog_backtest_result(res: dict) -> str:
 
 async def backtest_analog_cmd(update, context):
     """
-    /backtest_analog <MA> [days]
-    Test 15 combo x 7 nguong = 105 experiments.
+    /backtest_analog <MA> [days] [compare]
+    Them "compare" de so sanh 3 phuong an A/B/C.
     """
     try:
         from bot import is_allowed, _deny
@@ -1554,25 +1913,32 @@ async def backtest_analog_cmd(update, context):
 
     if not args:
         await update.message.reply_text(
-            "Cu phap: /backtest_analog <MA> [days]\n\n"
+            "Cu phap: /backtest_analog <MA> [days] [compare]\n\n"
             "Vi du:\n"
             "  /backtest_analog HPG\n"
-            "  /backtest_analog VCB 1500\n\n"
-            "105 experiments | Metrics: WR, Exp, MAE30, Worst, Sharpe, PF\n"
-            "Thoi gian: 4-10 phut."
+            "  /backtest_analog MWG compare\n"
+            "  /backtest_analog VCB 1500 compare\n\n"
+            "compare: so sanh 3 phuong an A/B/C (~3x lau hon)\n"
+            "Thoi gian: 4-10 phut (goc) | 12-30 phut (compare)."
         )
         return
 
     import re as _re
-    symbol = args[0].upper().strip()
+
+    do_compare = "compare" in [a.lower() for a in args]
+    raw_args   = [a for a in args if a.lower() != "compare"]
+
+    symbol = raw_args[0].upper().strip() if raw_args else ""
     if not _re.match(r'^[A-Z0-9]{2,10}$', symbol):
         await update.message.reply_text(f"Ma '{symbol}' khong hop le.")
         return
 
-    try:
-        days = max(500, min(int(args[1]), 2500)) if len(args) > 1 else 1800
-    except (ValueError, IndexError):
-        days = 1800
+    days = 1800
+    if len(raw_args) > 1:
+        try:
+            days = max(500, min(int(raw_args[1]), 2500))
+        except ValueError:
+            days = 1800
 
     user_id = str(update.effective_user.id) if update.effective_user else "unknown"
     since   = time.time() - _last_backtest_analog.get(user_id, 0)
@@ -1582,25 +1948,38 @@ async def backtest_analog_cmd(update, context):
         return
     _last_backtest_analog[user_id] = time.time()
 
-    chat_id = update.effective_chat.id
+    chat_id  = update.effective_chat.id
+    est_time = "12-30 phut" if do_compare else "4-10 phut"
+    mode_str = "so sanh 3 phuong an A/B/C" if do_compare else "105 experiments"
     msg = await update.message.reply_text(
         f"Backtest Analog T1: {symbol} ({days} ngay)\n"
-        f"15 combo x 7 nguong = 105 experiments\n"
-        f"Uoc tinh 4-10 phut, vui long doi..."
+        f"Mode: {mode_str}\n"
+        f"Uoc tinh {est_time}, vui long doi..."
     )
 
     async def _bg():
         try:
-            result = await asyncio.to_thread(_run_analog_backtest_sync, symbol, days)
-
-            if result["status"] == "error":
-                await context.bot.edit_message_text(
-                    chat_id=chat_id, message_id=msg.message_id,
-                    text=f"Loi: {result.get('error','?')[:300]}",
+            if do_compare:
+                result = await asyncio.to_thread(
+                    _run_analog_backtest_variants_sync, symbol, days
                 )
-                return
+                if result["status"] == "error":
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id, message_id=msg.message_id,
+                        text=f"Loi: {result.get('error','?')[:300]}",
+                    )
+                    return
+                summary = _format_analog_compare_result(result)
+            else:
+                result = await asyncio.to_thread(_run_analog_backtest_sync, symbol, days)
+                if result["status"] == "error":
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id, message_id=msg.message_id,
+                        text=f"Loi: {result.get('error','?')[:300]}",
+                    )
+                    return
+                summary = _format_analog_backtest_result(result)
 
-            summary = _format_analog_backtest_result(result)
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=msg.message_id,
                 text=_plain(summary)[:4096],
@@ -1621,204 +2000,6 @@ async def backtest_analog_cmd(update, context):
                     pass
 
     asyncio.create_task(_bg())
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BACKTEST ANALOG BATCH — nhiều mã một lượt
-# ══════════════════════════════════════════════════════════════════════════════
-
-BACKTEST_ANALOG_BATCH_COOLDOWN = 600   # 10 phút per user
-_last_backtest_analog_batch: dict[str, float] = {}
-BATCH_MAX_SYMBOLS = 10   # giới hạn tối đa để tránh timeout Render
-
-
-def _run_analog_batch_sync(symbols: list[str], days: int = 1800) -> dict:
-    """
-    Chạy _run_analog_backtest_sync tuần tự cho từng mã.
-    Trả về dict tổng hợp kết quả tất cả mã.
-    """
-    results = {}
-    for symbol in symbols:
-        try:
-            r = _run_analog_backtest_sync(symbol, days)
-            results[symbol] = r
-        except Exception as e:
-            results[symbol] = {"status": "error", "error": str(e)[:120]}
-    return results
-
-
-def _format_batch_result(batch: dict) -> str:
-    """
-    Format kết quả batch thành 2 phần:
-      1. Bảng tổng quan: mỗi mã 1 dòng
-      2. Nhận xét cross-symbol: combo nào nhất quán nhất
-    """
-    from collections import Counter
-
-    sep  = "=" * 32
-    sep2 = "-" * 32
-
-    # ── Gom dữ liệu từng mã ──────────────────────────────────────────────────
-    rows        = []   # dữ liệu cho bảng tổng quan
-    all_top1    = []   # top combo của mỗi mã (để phân tích nhất quán)
-    good_syms   = []   # mã Sharpe >= 1.0
-    weak_syms   = []   # mã Sharpe < 1.0 hoặc lỗi
-
-    for symbol, res in batch.items():
-        if res.get("status") == "error":
-            rows.append({
-                "symbol": symbol, "ok": False,
-                "error": res.get("error", "?")[:60],
-            })
-            weak_syms.append(symbol)
-            continue
-
-        top     = res.get("top_results", [])
-        bl      = res.get("baseline")
-        n_valid = res.get("n_valid", 0)
-
-        if not top:
-            rows.append({
-                "symbol": symbol, "ok": False,
-                "error": f"Khong du tin hieu ({n_valid} exp hop le)",
-            })
-            weak_syms.append(symbol)
-            continue
-
-        best = top[0]
-        bl_sharpe = bl["sharpe"] if bl else 0.0
-
-        row = {
-            "symbol":    symbol,
-            "ok":        True,
-            "combo":     best["combo"],
-            "threshold": best["threshold"],
-            "wr":        best["wr"],
-            "mean_exp":  best["mean_exp"],
-            "mae30":     best["mae30"],
-            "max_dd":    best["max_dd"],
-            "sharpe":    best["sharpe"],
-            "pf":        best["pf"],
-            "n":         best["n_signals"],
-            "bl_sharpe": bl_sharpe,
-            "vs_bl":     round(best["sharpe"] - bl_sharpe, 2),
-            "group":     best.get("group", ""),
-            "n_valid":   n_valid,
-        }
-        rows.append(row)
-        all_top1.append(best["combo"])
-
-        # Bộ lọc cứng: Exp > 0 và PF >= 1.5 (WR chỉ tham khảo tâm lý)
-        if best["mean_exp"] > 0 and best["pf"] >= 1.5:
-            good_syms.append(symbol)
-        else:
-            weak_syms.append(symbol)
-
-    # ── Bảng tổng quan ───────────────────────────────────────────────────────
-    lines = [
-        f"BACKTEST ANALOG BATCH — {len(batch)} ma",
-        f"Days: 1800 | 105 experiments/ma",
-        sep,
-        "MA      TOP COMBO            WR   Exp   Sharpe  n   vsBase",
-        sep2,
-    ]
-
-    for r in rows:
-        if not r["ok"]:
-            lines.append(f"{r['symbol']:<7} LOI: {r['error']}")
-            continue
-
-        # Emoji — dựa trên Exp và PF, không dùng WR
-        if r["mean_exp"] > 1.0 and r["pf"] >= 2.0:
-            em = "✅"
-        elif r["mean_exp"] > 0 and r["pf"] >= 1.5:
-            em = "🟡"
-        else:
-            em = "🔴"
-
-        vs = f"{r['vs_bl']:+.2f}"
-        combo_short = r["combo"][:18]   # cắt ngắn để vừa dòng
-
-        lines.append(
-            f"{em}{r['symbol']:<6} "
-            f"{combo_short:<20} "
-            f"{r['wr']:.0f}%  "
-            f"{r['mean_exp']:+.1f}%  "
-            f"{r['sharpe']:.2f}   "
-            f"{r['n']:<4} "
-            f"{vs}"
-        )
-
-    lines.append(sep2)
-
-    # ── Phân tích cross-symbol ────────────────────────────────────────────────
-    lines.append("")
-    lines.append("PHAN TICH CHUNG:")
-
-    # Mã nên/không nên dùng analog
-    if good_syms:
-        lines.append(f"  Nen dung analog : {', '.join(good_syms)}")
-    if weak_syms:
-        lines.append(f"  Nen bo qua      : {', '.join(weak_syms)}")
-
-    lines.append("")
-
-    # Combo nhất quán nhất
-    if all_top1:
-        combo_counts = Counter(all_top1)
-        top_combos   = combo_counts.most_common(3)
-        lines.append("  Combo nhat quan tren nhieu ma:")
-        for combo, count in top_combos:
-            pct = count / len(all_top1) * 100
-            lines.append(f"    {combo}: {count}/{len(all_top1)} ma ({pct:.0f}%)")
-
-        # Nhóm thống trị
-        ok_rows = [r for r in rows if r.get("ok")]
-        if ok_rows:
-            groups = Counter(r["group"] for r in ok_rows)
-            group_labels = {
-                "momentum":  "Momentum", "trend": "Trend Following",
-                "reversion": "Mean Reversion", "volume": "Volume",
-                "volatility":"Volatility", "crossover": "Combo giao thoa",
-                "baseline":  "Baseline",
-            }
-            top_group = groups.most_common(1)[0]
-            lines.append(
-                f"  Nhom thong tri: "
-                f"{group_labels.get(top_group[0], top_group[0])} "
-                f"({top_group[1]}/{len(ok_rows)} ma)"
-            )
-
-            # Threshold phổ biến
-            thresholds = Counter(r["threshold"] for r in ok_rows)
-            top_thresh = thresholds.most_common(1)[0]
-            lines.append(
-                f"  Nguong pho bien: {top_thresh[0]:.2f} "
-                f"({top_thresh[1]}/{len(ok_rows)} ma)"
-            )
-
-    lines.append("")
-
-    # Khuyến nghị walk-forward — config riêng cho từng mã
-    good_rows = [r for r in rows if r.get("ok") and r["symbol"] in good_syms]
-    if good_rows:
-        lines.append("  → BUOC TIEP THEO:")
-        lines.append("     Chay detail de chon nguong chinh xac:")
-        for r in good_rows:
-            lines.append(
-                f"     /backtest_analog_detail {r['symbol']} "
-                f"{r['combo'].split()[0].lower()}"
-            )
-    else:
-        lines.append("  → Khong co ma nao du dieu kien.")
-        lines.append("     Thu tang days hoac kiem tra lai data.")
-
-    lines.append("")
-    lines.append("Ket qua IN-SAMPLE. Walk-forward 2025 moi la kiem chung thuc su.")
-    lines.append(sep)
-
-    return "\n".join(lines)
-
 
 async def backtest_analog_batch_cmd(update, context):
     """
@@ -2024,10 +2205,7 @@ def _run_analog_detail_sync(symbol: str, combo_name: str, days: int = 1800) -> d
     n_bars    = len(df)
     dates     = df["date"].values
     close_arr = df["close"].values.astype(float)
-    if "low" not in df.columns:
-        df["low"] = df["close"]
-        logger.warning(f"[Detail] {symbol}: khong co cot low, dung close thay the")
-    low_arr = df["low"].values.astype(float)
+    low_arr   = df["low"].values.astype(float)
 
     # Tính vectors
     try:
@@ -2556,9 +2734,9 @@ def _run_pipeline_wf_sync(symbol: str) -> dict:
             and r["max_dd"] >= _PIPELINE_MAX_DD
         ]
         if thresh_rows:
-            max_exp         = max(r["mean_exp"] for r in thresh_rows)
-            top_thresh      = [r for r in thresh_rows if r["mean_exp"] >= max_exp * 0.90]
-            best_thresh_row = max(top_thresh, key=lambda x: x["max_dd"])
+            # Chọn threshold cho Exp cao nhất, PF làm tiebreak
+            # Không dùng risk-adjusted để tránh pick threshold Exp thấp hơn
+            best_thresh_row = max(thresh_rows, key=lambda x: (x["mean_exp"], x["pf"]))
             threshold       = best_thresh_row["threshold"]
         else:
             threshold = best_bt["threshold"]
@@ -2654,9 +2832,6 @@ def _run_walkforward_sync(symbol: str) -> dict:
     n_bars         = len(df)
     dates          = df["date"].values
     close_arr      = df["close"].values.astype(float)
-    if "low" not in df.columns:
-        df["low"] = df["close"]
-        logger.warning(f"[WF] {symbol}: khong co cot low, dung close thay the")
     low_arr        = df["low"].values.astype(float)
     vector_indices = sorted(vectors.keys())
 
@@ -3281,10 +3456,8 @@ def _run_pipeline_sync(symbol: str, days: int = 1800) -> dict:
             and r["max_dd"] >= _PIPELINE_MAX_DD
         ]
         if thresh_rows:
-            # Chọn threshold: Exp cao nhất, PF tiebreak, MaxDD tốt nhất trong 90% Exp max
-            max_exp    = max(r["mean_exp"] for r in thresh_rows)
-            top_thresh = [r for r in thresh_rows if r["mean_exp"] >= max_exp * 0.90]
-            best_thresh_row = max(top_thresh, key=lambda x: x["max_dd"])  # MaxDD ít âm nhất
+            # Chọn threshold: Exp cao nhất, PF làm tiebreak — nhất quán với ranking T1
+            best_thresh_row = max(thresh_rows, key=lambda x: (x["mean_exp"], x["pf"]))
             best_threshold  = best_thresh_row["threshold"]
             best_bt_detail  = best_thresh_row
         else:
@@ -3327,9 +3500,6 @@ def _run_pipeline_sync(symbol: str, days: int = 1800) -> dict:
     n_bars         = len(df)
     dates          = df["date"].values
     close_arr      = df["close"].values.astype(float)
-    if "low" not in df.columns:
-        df["low"] = df["close"]
-        logger.warning(f"[Pipeline] {symbol}: khong co cot low")
     low_arr        = df["low"].values.astype(float)
     vector_indices = sorted(vectors.keys())
     date_series    = pd.to_datetime(df["date"])
