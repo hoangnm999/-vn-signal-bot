@@ -1571,7 +1571,9 @@ def _run_analog_backtest_sync(symbol: str, days: int = 1800) -> dict:
 
     # 105 experiments
     all_results = []
-    for combo in _ANALOG_COMBOS:
+    logger.info(f"[BacktestAnalog] {symbol}: {len(vectors)} vectors, {n_bars} bars, running 105 experiments...")
+    for ci, combo in enumerate(_ANALOG_COMBOS):
+        logger.info(f"[BacktestAnalog] {symbol}: combo {ci+1}/{len(_ANALOG_COMBOS)} [{combo['name']}]")
         for thr in _ANALOG_THRESHOLDS:
             r = _run_one_experiment_v2(
                 combo, thr, vectors, vector_indices,
@@ -1580,6 +1582,7 @@ def _run_analog_backtest_sync(symbol: str, days: int = 1800) -> dict:
             )
             if not r.get("skip"):
                 all_results.append(r)
+    logger.info(f"[BacktestAnalog] {symbol}: done, {len(all_results)} valid experiments")
 
     if not all_results:
         return {"status": "error", "error": "Khong co experiment nao co du signal"}
@@ -2142,12 +2145,22 @@ async def backtest_analog_cmd(update, context):
 
     async def _bg():
         try:
-            res  = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: _run_analog_backtest_sync(symbol, days)
+            logger.info(f"[BacktestAnalog] Start {symbol} days={days}")
+            loop = asyncio.get_event_loop()
+            res  = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: _run_analog_backtest_sync(symbol, days)
+                ),
+                timeout=300,
             )
+            logger.info(f"[BacktestAnalog] Done {symbol}: status={res.get('status')}")
             text = _format_analog_backtest_result(res)
             await msg.edit_text(_plain(text))
+        except asyncio.TimeoutError:
+            logger.error(f"[BacktestAnalog] Timeout {symbol}")
+            await msg.edit_text(f"❌ Timeout sau 5 phút — thử: /backtest_analog {symbol} 500")
         except Exception as e:
+            logger.exception(f"[BacktestAnalog] Error {symbol}: {e}")
             await msg.edit_text(f"❌ Lỗi: {e}")
 
     asyncio.create_task(_bg())
