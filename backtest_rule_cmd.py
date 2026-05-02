@@ -2884,12 +2884,10 @@ def _run_walkforward_sync(symbol: str) -> dict:
     MDS_DAYS    = 43
     FWD_DAYS    = 30
     # LOOP_STEP = 1: check mỗi ngày như live trading thực tế
-    # Trước đây step=7 → cooldown không thể granular hơn bội số 7
-    # → n=42 (step=7, cooldown=7) hoặc n=21 (step=7, cooldown=10) đều cơ học
-    # Với step=1: threshold thực sự lọc ngày nào có/không có signal
-    # COOLDOWN_BARS = 20: 4 tuần, khớp SIGNAL_COOLDOWN_DAYS trong live trading
+    # COOLDOWN_BARS = 5: khớp đúng với live trading
+    # Live dùng SIGNAL_COOLDOWN_DAYS = 7 calendar days ≈ 5 trading bars
     LOOP_STEP     = 1
-    COOLDOWN_BARS = 20
+    COOLDOWN_BARS = 5
 
     oos_signals          = []
     train_signals        = []
@@ -3106,7 +3104,7 @@ def _format_wf_result(res: dict) -> str:
     n_skip_cooldown = res.get("n_skip_cooldown", 0)
     cooldown_bars   = res.get("cooldown_bars", 10)
     lines.append(f"OUT-OF-SAMPLE ({wf_start} → hom nay):")
-    lines.append(f"  [Simulate cooldown {cooldown_bars} bars (~2 tuan) — giong live trading]")
+    lines.append(f"  [Simulate cooldown {cooldown_bars} bars (~1 tuan) — giong live trading]")
     if oos_m:
         lines.append(
             f"  WR {oos_m['wr']:.0f}%  "
@@ -3355,7 +3353,7 @@ def _run_random_baseline(symbol: str, n_trials: int = 500) -> dict:
     n_skip_cooldown = res.get("n_skip_cooldown", 0)
     cooldown_bars   = res.get("cooldown_bars", 10)
     lines.append(f"OUT-OF-SAMPLE ({wf_start} → hom nay):")
-    lines.append(f"  [Simulate cooldown {cooldown_bars} bars (~2 tuan) — giong live trading]")
+    lines.append(f"  [Simulate cooldown {cooldown_bars} bars (~1 tuan) — giong live trading]")
     if oos_m:
         lines.append(
             f"  WR {oos_m['wr']:.0f}%  "
@@ -4544,9 +4542,10 @@ def _run_pipeline_sync(symbol: str, days: int = 1800) -> dict:
     # MDS_DAYS: 43 calendar days ≈ 30 trading days
     MDS_DAYS    = 43
     FWD_DAYS    = 30
-    # LOOP_STEP=1, COOLDOWN_BARS=20: đồng bộ với _run_walkforward_sync
+    # LOOP_STEP=1, COOLDOWN_BARS=5: đồng bộ với _run_walkforward_sync
+    # 5 bars ≈ 7 calendar days = SIGNAL_COOLDOWN_DAYS trong live trading
     LOOP_STEP     = 1
-    COOLDOWN_BARS = 20
+    COOLDOWN_BARS = 5
 
     oos_signals          = []
     train_signals        = []
