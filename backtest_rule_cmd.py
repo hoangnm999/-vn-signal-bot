@@ -2912,6 +2912,12 @@ def _run_walkforward_sync(symbol: str) -> dict:
                 continue
 
         target_vec = vectors[t_idx]
+
+        # Hard filter — lọc ngày T không đúng regime của combo
+        # Thiếu filter này → mọi ngày sau cooldown đều pass → n cơ học
+        if not _check_hard_filter(target_vec, combo_name):
+            continue
+
         target_arr = np.array([target_vec.get(d, 0.0) for d in dims], dtype=float)
         t_norm     = np.linalg.norm(target_arr)
         if t_norm < 1e-9:
@@ -4563,6 +4569,11 @@ def _run_pipeline_sync(symbol: str, days: int = 1800) -> dict:
                 continue
 
         target_vec = vectors[t_idx]
+
+        # Hard filter — lọc ngày T không đúng regime của combo
+        if not _check_hard_filter(target_vec, combo_name):
+            continue
+
         target_arr = np.array([target_vec.get(d, 0.0) for d in dims], dtype=float)
         t_norm     = np.linalg.norm(target_arr)
         if t_norm < 1e-9:
