@@ -23,8 +23,8 @@ from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 FWD_DAYS     = 15     # hold 15 ngày
-GOOD_THRESH  = 2.0    # % tăng để gán nhãn GOOD
-BAD_THRESH   = -2.0   # % giảm để gán nhãn BAD
+GOOD_THRESH  = 5.0    # % tăng để gán nhãn GOOD
+BAD_THRESH   = -3.0   # % giảm để gán nhãn BAD
 TRAIN_END    = "2024-12-31"
 TRAIN_START  = "2019-01-01"
 
