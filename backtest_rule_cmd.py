@@ -2882,11 +2882,15 @@ def _run_walkforward_sync(symbol: str) -> dict:
     MIN_SAMPLES = 5
     MDS_DAYS    = 30
     FWD_DAYS    = 30
+    # Cooldown simulate: phải khớp SIGNAL_COOLDOWN_DAYS trong analog_signal.py
+    COOLDOWN_DAYS = 7
 
-    oos_signals   = []   # tín hiệu trong OOS
-    train_signals = []   # tín hiệu trong training (để so sánh)
-    n_skip_oos    = 0
-    n_skip_train  = 0
+    oos_signals      = []
+    train_signals    = []
+    n_skip_oos       = 0
+    n_skip_train     = 0
+    n_skip_cooldown  = 0          # đếm riêng để báo cáo
+    last_oos_signal_date = None   # track ngày OOS signal cuối
 
     for t_idx in range(120, n_bars - FWD_DAYS - 1, 7):
         if t_idx not in vectors:
@@ -2894,6 +2898,13 @@ def _run_walkforward_sync(symbol: str) -> dict:
 
         t_date    = pd.Timestamp(dates[t_idx])
         is_oos    = t_date >= wf_start
+
+        # Simulate cooldown cho OOS — giống live trading thực tế
+        if is_oos and last_oos_signal_date is not None:
+            days_since = (t_date - last_oos_signal_date).days
+            if days_since < COOLDOWN_DAYS:
+                n_skip_cooldown += 1
+                continue
 
         target_vec = vectors[t_idx]
         target_arr = np.array([target_vec.get(d, 0.0) for d in dims], dtype=float)
@@ -2989,6 +3000,7 @@ def _run_walkforward_sync(symbol: str) -> dict:
 
         if is_oos:
             oos_signals.append(signal)
+            last_oos_signal_date = t_date   # cập nhật cooldown tracker
         else:
             train_signals.append(signal)
 
@@ -3029,17 +3041,19 @@ def _run_walkforward_sync(symbol: str) -> dict:
     train_metrics = _calc_metrics(train_signals)
 
     return {
-        "status":        "ok",
-        "symbol":        symbol,
-        "combo":         combo_name,
-        "threshold":     threshold,
-        "wf_start":      _WF_START_DATE,
-        "n_oos_bars":    n_oos_bars,
-        "n_skip_oos":    n_skip_oos,
-        "n_skip_train":  n_skip_train,
-        "oos_signals":   oos_signals,
-        "oos_metrics":   oos_metrics,
-        "train_metrics": train_metrics,
+        "status":           "ok",
+        "symbol":           symbol,
+        "combo":            combo_name,
+        "threshold":        threshold,
+        "wf_start":         _WF_START_DATE,
+        "n_oos_bars":       n_oos_bars,
+        "n_skip_oos":       n_skip_oos,
+        "n_skip_train":     n_skip_train,
+        "n_skip_cooldown":  n_skip_cooldown,
+        "cooldown_days":    COOLDOWN_DAYS,
+        "oos_signals":      oos_signals,
+        "oos_metrics":      oos_metrics,
+        "train_metrics":    train_metrics,
     }
 
 
@@ -3082,7 +3096,10 @@ def _format_wf_result(res: dict) -> str:
     lines.append(sep2)
 
     # ── OOS metrics ───────────────────────────────────────────────────────────
+    n_skip_cooldown = res.get("n_skip_cooldown", 0)
+    cooldown_days   = res.get("cooldown_days", 7)
     lines.append(f"OUT-OF-SAMPLE ({wf_start} → hom nay):")
+    lines.append(f"  [Simulate cooldown {cooldown_days} ngay — giong live trading]")
     if oos_m:
         lines.append(
             f"  WR {oos_m['wr']:.0f}%  "
@@ -3095,6 +3112,11 @@ def _format_wf_result(res: dict) -> str:
         lines.append(
             f"  MAE30 {oos_m['mae30']:.1f}%  Worst {oos_m['max_dd']:.1f}%"
         )
+        if n_skip_cooldown:
+            lines.append(
+                f"  (Bo qua {n_skip_cooldown} nut scan vi cooldown — "
+                f"giu lai {oos_m['n']} tin hieu thuc su)"
+            )
     else:
         lines.append(
             f"  Chua du tin hieu OOS (can >= 3 tin hieu hoan thanh)."
@@ -3583,6 +3605,305 @@ def _run_walkforward_sync_with_df(symbol: str) -> dict:
         res["df"] = df
 
     return res
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIMILARITY DISTRIBUTION — chẩn đoán ngưỡng threshold
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_sim_distribution_sync(symbol: str) -> dict:
+    """
+    Tính distribution cosine similarity của ngày hôm nay vs toàn bộ lịch sử.
+    Mục đích: chẩn đoán xem threshold có quá dễ pass không.
+    """
+    import numpy as np
+    import pandas as pd
+
+    symbol = symbol.upper()
+    if symbol not in _WF_SYMBOL_CONFIG:
+        return {"status": "error", "error": f"{symbol} chua co config"}
+
+    cfg       = _WF_SYMBOL_CONFIG[symbol]
+    combo_name = cfg["combo"]
+    threshold  = cfg["threshold"]
+
+    combo = _find_combo(combo_name)
+    if combo is None:
+        return {"status": "error", "error": f"Khong tim thay combo '{combo_name}'"}
+    dims = combo["dims"]
+
+    try:
+        from vn_loader import load_vn_ohlcv
+        df = load_vn_ohlcv(symbol, days=1800, min_bars=200)
+    except Exception as e:
+        return {"status": "error", "error": f"Load data fail: {e}"}
+
+    if df is None or len(df) < 200:
+        return {"status": "error", "error": "Khong du du lieu"}
+
+    try:
+        from state_vector import compute_state_vector_from_df, compute_state_vector_for_date
+    except ImportError as e:
+        return {"status": "error", "error": f"Thieu state_vector: {e}"}
+
+    # Vector ngày hôm nay
+    target_vec = compute_state_vector_from_df(df)
+    if target_vec is None:
+        return {"status": "error", "error": "Khong tinh duoc vector hom nay"}
+
+    target_arr = np.array([target_vec.get(d, 0.0) for d in dims], dtype=float)
+    t_norm     = np.linalg.norm(target_arr)
+    if t_norm < 1e-9:
+        return {"status": "error", "error": "Vector hom nay = 0"}
+
+    n_bars         = len(df)
+    exclude_cutoff = n_bars - 90
+    dates          = df["date"].values
+
+    # Tính similarity tất cả ngày lịch sử
+    all_sims  = []
+    all_dates = []
+    for i in range(59, exclude_cutoff):
+        vec = compute_state_vector_for_date(df, i)
+        if vec is None:
+            continue
+        arr  = np.array([vec.get(d, 0.0) for d in dims], dtype=float)
+        norm = np.linalg.norm(arr)
+        if norm < 1e-9:
+            continue
+        sim = float(np.dot(target_arr, arr) / (t_norm * norm))
+        all_sims.append(sim)
+        all_dates.append(str(dates[i])[:10])
+
+    if not all_sims:
+        return {"status": "error", "error": "Khong tinh duoc similarity"}
+
+    sims = np.array(all_sims)
+    n_total = len(sims)
+
+    # % pass từng mức threshold
+    thresholds_test = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+    pct_pass = {t: float((sims >= t).mean() * 100) for t in thresholds_test}
+
+    # Sau MDS 30 ngày: đếm analog độc lập thực sự pass threshold hiện tại
+    pass_indices = [i for i, s in enumerate(all_sims) if s >= threshold]
+    kept_mds = []
+    for idx in sorted(pass_indices, key=lambda i: -all_sims[i]):
+        d = pd.Timestamp(all_dates[idx])
+        too_close = any(
+            abs((d - pd.Timestamp(all_dates[k])).days) < 30
+            for k in kept_mds
+        )
+        if not too_close:
+            kept_mds.append(idx)
+
+    # Phân bố sim theo bucket
+    buckets = {}
+    for lo in [x/10 for x in range(0, 10)]:
+        hi  = lo + 0.1
+        cnt = int(((sims >= lo) & (sims < hi)).sum())
+        buckets[f"{lo:.1f}-{hi:.1f}"] = cnt
+
+    return {
+        "status":       "ok",
+        "symbol":       symbol,
+        "combo":        combo_name,
+        "threshold":    threshold,
+        "n_dims":       len(dims),
+        "n_total":      n_total,
+        "sim_median":   round(float(np.median(sims)), 3),
+        "sim_mean":     round(float(np.mean(sims)), 3),
+        "sim_p25":      round(float(np.percentile(sims, 25)), 3),
+        "sim_p75":      round(float(np.percentile(sims, 75)), 3),
+        "sim_p90":      round(float(np.percentile(sims, 90)), 3),
+        "sim_p95":      round(float(np.percentile(sims, 95)), 3),
+        "pct_pass":     pct_pass,
+        "n_pass_raw":   int((sims >= threshold).sum()),
+        "n_pass_mds":   len(kept_mds),
+        "buckets":      buckets,
+        "dims":         dims,
+    }
+
+
+def _format_sim_distribution(res: dict) -> str:
+    """Format kết quả sim distribution thành Telegram message."""
+    import numpy as np
+
+    symbol    = res["symbol"]
+    combo     = res["combo"]
+    threshold = res["threshold"]
+    n_total   = res["n_total"]
+    n_dims    = res["n_dims"]
+    sep  = "=" * 36
+    sep2 = "-" * 36
+
+    lines = [
+        f"SIM DISTRIBUTION — {symbol}",
+        f"Combo: {combo} ({n_dims} chieu) | nguong {threshold}",
+        f"Tong ngay lich su: {n_total}",
+        sep,
+    ]
+
+    # Phân bố similarity
+    lines.append("PHAN BO COSINE SIMILARITY:")
+    lines.append(f"  Median : {res['sim_median']:.3f}")
+    lines.append(f"  P25/P75: {res['sim_p25']:.3f} / {res['sim_p75']:.3f}")
+    lines.append(f"  P90/P95: {res['sim_p90']:.3f} / {res['sim_p95']:.3f}")
+    lines.append("")
+
+    # Histogram đơn giản
+    lines.append("HISTOGRAM (bucket 0.1):")
+    buckets = res["buckets"]
+    max_cnt = max(buckets.values()) if buckets else 1
+    for rng, cnt in sorted(buckets.items()):
+        bar_len = int(cnt / max_cnt * 20)
+        bar     = "█" * bar_len + "░" * (20 - bar_len)
+        marker  = " ← nguong" if abs(float(rng.split("-")[0]) - threshold) < 0.05 else ""
+        lines.append(f"  {rng}  {bar}  {cnt:>4}{marker}")
+    lines.append(sep2)
+
+    # % pass từng threshold
+    lines.append("% NGAY PASS TUNG NGUONG (truoc MDS):")
+    pct_pass = res["pct_pass"]
+    for t, pct in sorted(pct_pass.items()):
+        marker = " ◄ hien tai" if t == threshold else ""
+        em     = "🔴" if pct > 30 else "⚠️" if pct > 15 else "✅"
+        lines.append(f"  {t:.2f}: {pct:>5.1f}% ngay pass  {em}{marker}")
+    lines.append(sep2)
+
+    # Sau MDS
+    n_pass_raw = res["n_pass_raw"]
+    n_pass_mds = res["n_pass_mds"]
+    pct_raw    = n_pass_raw / n_total * 100
+    pct_mds    = n_pass_mds / n_total * 100
+
+    lines.append(f"SAU KHI LOC:")
+    lines.append(f"  Pass threshold  : {n_pass_raw:>4} ngay ({pct_raw:.1f}%)")
+    lines.append(f"  Sau MDS 30 ngay : {n_pass_mds:>4} analog doc lap ({pct_mds:.1f}%)")
+    lines.append(sep2)
+
+    # Chẩn đoán
+    lines.append("CHAN DOAN:")
+    pct_at_threshold = pct_pass.get(threshold, 0)
+
+    if pct_at_threshold > 30:
+        lines.append(f"  🔴 THRESHOLD QUA THAP — {pct_at_threshold:.1f}% ngay pass")
+        lines.append(f"     Gan nhu ngay nao cung co the ra signal")
+        # Gợi ý threshold hợp lý hơn (chỉ 10-15% ngày pass)
+        suggested = next(
+            (t for t, p in sorted(pct_pass.items()) if p <= 15.0),
+            None
+        )
+        if suggested:
+            lines.append(f"     Goi y: tang nguong len {suggested:.2f} (chi {pct_pass[suggested]:.1f}% pass)")
+    elif pct_at_threshold > 15:
+        lines.append(f"  ⚠️  THRESHOLD HƠI RONG — {pct_at_threshold:.1f}% ngay pass")
+        lines.append(f"     Signal kha pho bien, nen ket hop them dieu kien")
+    else:
+        lines.append(f"  ✅ THRESHOLD HOP LY — {pct_at_threshold:.1f}% ngay pass")
+        lines.append(f"     Signal co tinh chon loc tot")
+
+    lines.append("")
+    lines.append(f"  Analog doc lap sau MDS: {n_pass_mds} ({pct_mds:.1f}% lich su)")
+    if n_pass_mds < 20:
+        lines.append(f"  ⚠️  It analog — co the threshold qua cao, n < 20")
+    elif n_pass_mds > 100:
+        lines.append(f"  ⚠️  Qua nhieu analog — signal khong co tinh chon loc")
+    else:
+        lines.append(f"  ✅ So analog hop ly cho backtest co y nghia thong ke")
+
+    lines.append(sep)
+    return "\n".join(lines)
+
+
+_last_sim_dist: dict[str, float] = {}
+SIM_DIST_COOLDOWN = 120
+
+async def analog_sim_dist_cmd(update, context):
+    """
+    /analog_sim_dist <MA>
+
+    Chẩn đoán threshold: cosine similarity của hôm nay vs lịch sử.
+    Trả lời câu hỏi: threshold có quá thấp không?
+    Bao nhiêu % ngày lịch sử pass threshold hiện tại?
+    Thời gian: ~1 phút.
+    """
+    try:
+        from bot import is_allowed, _deny
+    except ImportError:
+        def is_allowed(_): return True
+        async def _deny(_): pass
+
+    if not is_allowed(update):
+        await _deny(update)
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Cu phap: /analog_sim_dist <MA>\n\n"
+            "Vi du:\n"
+            "  /analog_sim_dist MWG\n"
+            "  /analog_sim_dist DPM\n\n"
+            "Chan doan: threshold co qua thap khong?\n"
+            "Bao nhieu % ngay lich su pass threshold hien tai?\n\n"
+            f"Ma co config: {', '.join(_WF_SYMBOL_CONFIG)}"
+        )
+        return
+
+    import re as _re
+    symbol = args[0].upper().strip()
+    if not _re.match(r'^[A-Z0-9]{2,10}$', symbol):
+        await update.message.reply_text(f"Ma khong hop le: {symbol}")
+        return
+
+    if symbol not in _WF_SYMBOL_CONFIG:
+        await update.message.reply_text(
+            f"{symbol} chua co config.\n"
+            f"Ma co config: {', '.join(_WF_SYMBOL_CONFIG)}"
+        )
+        return
+
+    user_id = str(update.effective_user.id) if update.effective_user else "unknown"
+    since   = time.time() - _last_sim_dist.get(user_id, 0)
+    if since < SIM_DIST_COOLDOWN:
+        wait = int(SIM_DIST_COOLDOWN - since)
+        await update.message.reply_text(f"Vui long cho {wait}s truoc khi chay tiep.")
+        return
+    _last_sim_dist[user_id] = time.time()
+
+    cfg     = _WF_SYMBOL_CONFIG[symbol]
+    chat_id = update.effective_chat.id
+    msg     = await update.message.reply_text(
+        f"Sim Distribution: {symbol}\n"
+        f"Combo: {cfg['combo']} | nguong {cfg['threshold']}\n"
+        f"Dang tinh similarity vs {1800} ngay lich su (~1 phut)..."
+    )
+
+    async def _bg():
+        try:
+            res  = await asyncio.to_thread(_run_sim_distribution_sync, symbol)
+            if res["status"] == "error":
+                text = f"❌ {symbol}: {res.get('error','?')[:300]}"
+            else:
+                text = _format_sim_distribution(res)
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg.message_id,
+                text=_plain(text)[:4096],
+            )
+        except Exception as e:
+            import traceback
+            logger.error(f"analog_sim_dist_cmd error: {e}\n{traceback.format_exc()}")
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg.message_id,
+                    text=f"Loi: {str(e)[:200]}"
+                )
+            except Exception:
+                pass
+
+    asyncio.create_task(_bg())
 
 
 async def walkforward_analog_cmd(update, context):
