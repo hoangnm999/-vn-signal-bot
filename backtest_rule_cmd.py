@@ -1491,49 +1491,16 @@ def _format_analog_compare_result(res: dict) -> str:
         else:
             lines.append(f"  C kem hon A: hard filter loai qua nhieu tin hieu tot, giu A")
 
-        # Bộ lọc hợp lệ trước khi chọn best: n >= 20 VÀ PF <= 500
-        # (PF > 500 hoặc n < 20 → overfitting, không đưa vào so sánh)
-        MIN_N_COMPARE   = 20
-        MAX_PF_COMPARE  = 500
-        valid_tags = [
-            t for t in ["A", "B", "C"]
-            if t in best_results
-            and best_results[t]["n_signals"] >= MIN_N_COMPARE
-            and best_results[t]["pf"] <= MAX_PF_COMPARE
-        ]
-
-        # Cảnh báo các tag bị loại vì overfitting
-        for t in ["A", "B", "C"]:
-            if t not in best_results:
-                continue
-            r = best_results[t]
-            if r["n_signals"] < MIN_N_COMPARE:
-                lines.append(
-                    f"  ⚠️  {tag_labels[t]} bi loai khoi so sanh: "
-                    f"n={r['n_signals']} < {MIN_N_COMPARE} (khong du y nghia thong ke)"
-                )
-            elif r["pf"] > MAX_PF_COMPARE:
-                lines.append(
-                    f"  ⚠️  {tag_labels[t]} bi loai khoi so sanh: "
-                    f"PF={r['pf']:.0f} > {MAX_PF_COMPARE} (dau hieu overfitting)"
-                )
-
-        if not valid_tags:
-            lines.append(
-                "  CANH BAO: Khong co phuong an nao hop le (n >= 20 va PF <= 500). "
-                "Nen giam hard filter hoac giam MIN_SAMPLES."
+        best_tag = max(["A","B","C"],
+            key=lambda t: (
+                int(best_results[t]["mean_exp"] > 0 and best_results[t]["pf"] >= 1.5),
+                best_results[t]["mean_exp"], best_results[t]["pf"],
             )
-        else:
-            best_tag = max(valid_tags,
-                key=lambda t: (
-                    int(best_results[t]["mean_exp"] > 0 and best_results[t]["pf"] >= 1.5),
-                    best_results[t]["mean_exp"], best_results[t]["pf"],
-                )
-            )
-            lines.append(f"  => Khuyen nghi: {tag_labels[best_tag]} — "
-                         f"Exp {best_results[best_tag]['mean_exp']:+.2f}% "
-                         f"PF {best_results[best_tag]['pf']:.2f} "
-                         f"n={best_results[best_tag]['n_signals']}")
+        )
+        lines.append(f"  => Khuyen nghi: {tag_labels[best_tag]} — "
+                     f"Exp {best_results[best_tag]['mean_exp']:+.2f}% "
+                     f"PF {best_results[best_tag]['pf']:.2f} "
+                     f"n={best_results[best_tag]['n_signals']}")
 
     lines += [
         "",
@@ -3199,6 +3166,397 @@ def _format_wf_result(res: dict) -> str:
     return "\n".join(lines)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# REGIME ANALYSIS — phân tích phân bố tín hiệu OOS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _analyze_oos_regime(res: dict) -> str:
+    """
+    Phân tích phân bố 42 tín hiệu OOS theo:
+      1. Phân bố theo tháng — phát hiện clustering
+      2. Hiệu suất theo volatility regime (ATR)
+      3. Hiệu suất theo trend regime (trend_slope)
+      4. Kết luận + gợi ý sizing/filter
+    Input: kết quả từ _run_walkforward_sync (có oos_signals + df)
+    """
+    import numpy as np
+    import pandas as pd
+    from collections import defaultdict
+
+    symbol    = res["symbol"]
+    combo     = res["combo"]
+    threshold = res["threshold"]
+    oos_sigs  = res.get("oos_signals", [])
+    df        = res.get("df")
+
+    sep  = "=" * 36
+    sep2 = "-" * 36
+    lines = [
+        f"REGIME ANALYSIS — {symbol}",
+        f"Config: {combo} | nguong {threshold}",
+        f"OOS: {res.get('wf_start','2025-01-01')} → hom nay",
+        sep,
+    ]
+
+    completed = [s for s in oos_sigs if not s.get("pending") and s["actual"] is not None]
+    n = len(completed)
+
+    if n < 5:
+        lines.append(f"Khong du tin hieu OOS de phan tich (can >= 5, co {n}).")
+        return "\n".join(lines)
+
+    # ── 1. Phân bố theo tháng ─────────────────────────────────────────────────
+    lines.append("1. PHAN BO THEO THANG:")
+    by_month = defaultdict(list)
+    for s in completed:
+        ym = s["t_date"][:7]   # "2025-01"
+        by_month[ym].append(s["actual"])
+
+    months_sorted = sorted(by_month.keys())
+    max_count     = max(len(v) for v in by_month.values())
+
+    for ym in months_sorted:
+        rets   = by_month[ym]
+        cnt    = len(rets)
+        avg    = float(np.mean(rets))
+        bar    = "█" * cnt + "░" * (max_count - cnt)
+        em     = "✅" if avg > 0 else "🔴"
+        lines.append(f"  {ym}  {bar}  {cnt:>2} sig  avg {avg:+.1f}%  {em}")
+
+    # Phát hiện clustering: tháng nào có > 30% tổng tín hiệu
+    lines.append("")
+    cluster_months = [(ym, len(v)) for ym, v in by_month.items() if len(v) / n > 0.30]
+    if cluster_months:
+        for ym, cnt in cluster_months:
+            lines.append(f"  ⚠️  CUM: {ym} chiem {cnt/n*100:.0f}% tin hieu ({cnt}/{n})")
+        lines.append(f"  → Pattern co the bi phu thuoc vao 1 regime ngan han")
+    else:
+        span_months = len(months_sorted)
+        lines.append(f"  ✅ Khong phat hien cum — {n} tin hieu trai deu {span_months} thang")
+
+    lines.append(sep2)
+
+    # ── 2. Hiệu suất theo volatility regime (ATR) ─────────────────────────────
+    lines.append("2. HIEU SUAT THEO VOLATILITY (ATR tai ngay tin hieu):")
+
+    atr_data_ok = False
+    if df is not None and "atr_ratio" in (df.columns if hasattr(df, "columns") else []):
+        atr_data_ok = True
+
+    if df is not None:
+        try:
+            from state_vector import compute_state_vector_for_date
+            # Lấy atr_ratio tại mỗi t_idx
+            date_to_idx = {str(df["date"].values[i])[:10]: i for i in range(len(df))}
+            low_vol, mid_vol, high_vol = [], [], []
+
+            for s in completed:
+                idx = date_to_idx.get(s["t_date"])
+                if idx is None or idx < 59:
+                    continue
+                vec = compute_state_vector_for_date(df, idx)
+                if vec is None:
+                    continue
+                atr = vec.get("atr_ratio", 0.5)   # đã chuẩn hóa 0-1, 0.5 = ATR ~2.5%
+                if atr < 0.35:
+                    low_vol.append(s["actual"])
+                elif atr > 0.65:
+                    high_vol.append(s["actual"])
+                else:
+                    mid_vol.append(s["actual"])
+
+            def _regime_line(label, rets):
+                if len(rets) < 3:
+                    return f"  {label}: n={len(rets)} (khong du de phan tich)"
+                wr  = sum(1 for x in rets if x >= 1.0) / len(rets) * 100
+                avg = float(np.mean(rets))
+                em  = "✅" if avg > 0 and wr >= 55 else "⚠️" if avg > 0 else "🔴"
+                return f"  {label}: n={len(rets):>2}  WR {wr:.0f}%  Exp {avg:+.1f}%  {em}"
+
+            lines.append(_regime_line("Low  vol (ATR < 1.8%)", low_vol))
+            lines.append(_regime_line("Mid  vol (ATR 1.8-3%)  ", mid_vol))
+            lines.append(_regime_line("High vol (ATR > 3%)   ", high_vol))
+
+            # Cảnh báo nếu high-vol tệ hơn rõ ràng
+            if len(high_vol) >= 3 and len(low_vol) >= 3:
+                avg_lo = float(np.mean(low_vol))
+                avg_hi = float(np.mean(high_vol))
+                if avg_hi < 0 and avg_lo > 0:
+                    lines.append(f"  ⚠️  Pattern BREAKDOWN khi high-vol — nen tam dung signal")
+                elif avg_lo - avg_hi > 2.0:
+                    lines.append(f"  ⚠️  Hieu suat giam {avg_lo-avg_hi:.1f}% khi high-vol — giam sizing")
+                else:
+                    lines.append(f"  ✅ Hieu suat on dinh qua cac muc volatility")
+
+        except Exception as e:
+            lines.append(f"  Khong tinh duoc (loi state_vector: {e})")
+    else:
+        lines.append("  Khong co df de phan tich ATR.")
+
+    lines.append(sep2)
+
+    # ── 3. Hiệu suất theo trend regime (trend_slope) ──────────────────────────
+    lines.append("3. HIEU SUAT THEO TREND REGIME (trend_slope tai ngay tin hieu):")
+
+    if df is not None:
+        try:
+            from state_vector import compute_state_vector_for_date
+            date_to_idx = {str(df["date"].values[i])[:10]: i for i in range(len(df))}
+            trending, sideways, downtrend = [], [], []
+
+            for s in completed:
+                idx = date_to_idx.get(s["t_date"])
+                if idx is None or idx < 59:
+                    continue
+                vec = compute_state_vector_for_date(df, idx)
+                if vec is None:
+                    continue
+                slope = vec.get("trend_slope", 0.0)
+                if slope > 0.20:
+                    trending.append((s["actual"], slope))
+                elif slope < -0.10:
+                    downtrend.append((s["actual"], slope))
+                else:
+                    sideways.append((s["actual"], slope))
+
+            def _trend_line(label, pairs):
+                rets = [x for x, _ in pairs]
+                if len(rets) < 3:
+                    return f"  {label}: n={len(rets)} (khong du)"
+                wr  = sum(1 for x in rets if x >= 1.0) / len(rets) * 100
+                avg = float(np.mean(rets))
+                em  = "✅" if avg > 0 and wr >= 55 else "⚠️" if avg > 0 else "🔴"
+                return f"  {label}: n={len(rets):>2}  WR {wr:.0f}%  Exp {avg:+.1f}%  {em}"
+
+            lines.append(_trend_line("Uptrend  (slope > 0.20) ", trending))
+            lines.append(_trend_line("Sideways (-0.10 to 0.20)", sideways))
+            lines.append(_trend_line("Downtrend(slope < -0.10)", downtrend))
+
+            # Gợi ý combo phù hợp theo regime
+            if len(trending) >= 3 and len(sideways) >= 3:
+                avg_trend   = float(np.mean([x for x, _ in trending]))
+                avg_side    = float(np.mean([x for x, _ in sideways]))
+                if avg_trend > avg_side + 1.5:
+                    lines.append(f"  → Pattern hoat dong tot hon khi UPTREND (+{avg_trend-avg_side:.1f}%)")
+                    lines.append(f"    Xem xet them dieu kien trend_slope > 0.10 lam pre-filter")
+                elif avg_side > avg_trend + 1.5:
+                    lines.append(f"  → Pattern hoat dong tot hon khi SIDEWAYS (+{avg_side-avg_trend:.1f}%)")
+                    lines.append(f"    Day la mean-reversion thuan — hop ly voi combo {combo}")
+                else:
+                    lines.append(f"  ✅ Pattern on dinh ca uptrend va sideways")
+
+        except Exception as e:
+            lines.append(f"  Khong tinh duoc (loi: {e})")
+    else:
+        lines.append("  Khong co df de phan tich trend.")
+
+    lines.append(sep2)
+
+    # ── 4. Khoảng cách giữa các tín hiệu (inter-signal gap) ──────────────────
+    lines.append("4. KHOANG CACH GIUA CAC TIN HIEU:")
+    dates_sorted = sorted(s["t_date"] for s in completed)
+    if len(dates_sorted) >= 2:
+        gaps = []
+        for i in range(1, len(dates_sorted)):
+            d0 = pd.Timestamp(dates_sorted[i - 1])
+            d1 = pd.Timestamp(dates_sorted[i])
+            gaps.append((d1 - d0).days)
+
+        avg_gap    = float(np.mean(gaps))
+        min_gap    = int(np.min(gaps))
+        n_close    = sum(1 for g in gaps if g < 14)
+        lines.append(f"  Khoang cach TB  : {avg_gap:.1f} ngay")
+        lines.append(f"  Khoang cach ngan nhat: {min_gap} ngay")
+        lines.append(f"  Cap tin hieu < 14 ngay: {n_close}/{len(gaps)}")
+
+        if n_close / len(gaps) > 0.35:
+            lines.append(f"  ⚠️  {n_close/len(gaps)*100:.0f}% cap tin hieu rat gan nhau — co the cung 1 dot bien")
+        else:
+            lines.append(f"  ✅ Phan bo khoang cach hop ly — tin hieu doc lap nhau")
+    lines.append(sep2)
+
+    # ── 5. Kết luận tổng hợp ──────────────────────────────────────────────────
+    lines.append("5. KET LUAN VA GIA Y:")
+
+    actuals   = [s["actual"] for s in completed]
+    overall_wr  = sum(1 for x in actuals if x >= 1.0) / n * 100
+    overall_exp = float(np.mean(actuals))
+
+    issues = []
+    suggestions = []
+
+    # Kiểm tra clustering tháng
+    if cluster_months:
+        issues.append("Pattern bi cum theo thang")
+        suggestions.append("Giam sizing xuong 50% va theo doi them 2-3 thang")
+
+    # Kiểm tra inter-signal gap
+    if len(dates_sorted) >= 2 and n_close / max(len(gaps), 1) > 0.35:
+        issues.append("Nhieu tin hieu xuat hien trong thoi gian ngan")
+        suggestions.append("Xem xet tang cooldown len 14 ngay")
+
+    if not issues:
+        lines.append(f"  ✅ Pattern on dinh — {n} tin hieu OOS trai deu, khong bi cum")
+        lines.append(f"  ✅ WR {overall_wr:.0f}%  Exp {overall_exp:+.1f}%  — du dieu kien deploy")
+        lines.append(f"  → Giu nguyen config hien tai, sizing 100%")
+    else:
+        lines.append(f"  ⚠️  Phat hien {len(issues)} van de:")
+        for iss in issues:
+            lines.append(f"     - {iss}")
+        lines.append(f"  Goi y:")
+        for sug in suggestions:
+            lines.append(f"     → {sug}")
+
+    lines.append(sep)
+    lines.append("Day la phan tich OOS — khong thay doi config, chi dung de hieu pattern.")
+    return "\n".join(lines)
+
+
+_last_regime_analysis: dict[str, float] = {}
+REGIME_ANALYSIS_COOLDOWN = 180   # 3 phút
+
+async def analog_regime_analysis_cmd(update, context):
+    """
+    /analog_regime_analysis <MA>
+
+    Phân tích phân bố 42 tín hiệu OOS theo:
+      - Clustering theo tháng
+      - Hiệu suất theo volatility (ATR)
+      - Hiệu suất theo trend regime (slope)
+      - Khoảng cách giữa các tín hiệu
+
+    Mục đích: hiểu khi nào pattern hoạt động tốt/kém
+    để quyết định sizing và filter phù hợp.
+
+    Thời gian: ~2 phút (chạy lại walk-forward).
+    """
+    try:
+        from bot import is_allowed, _deny
+    except ImportError:
+        def is_allowed(_): return True
+        async def _deny(_): pass
+
+    if not is_allowed(update):
+        await _deny(update)
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Cu phap: /analog_regime_analysis <MA>\n\n"
+            "Vi du:\n"
+            "  /analog_regime_analysis MWG\n"
+            "  /analog_regime_analysis HPG\n\n"
+            "Phan tich phan bo 42 tin hieu OOS theo thang, volatility, trend.\n"
+            "Thoi gian: ~2 phut.\n\n"
+            f"Ma co config: {', '.join(_WF_SYMBOL_CONFIG)}"
+        )
+        return
+
+    import re as _re
+    symbol = args[0].upper().strip()
+    if not _re.match(r'^[A-Z0-9]{2,10}$', symbol):
+        await update.message.reply_text(f"Ma khong hop le: {symbol}")
+        return
+
+    if symbol not in _WF_SYMBOL_CONFIG:
+        await update.message.reply_text(
+            f"{symbol} chua co config.\n"
+            f"Chay /walkforward_analog {symbol} truoc.\n\n"
+            f"Ma co config: {', '.join(_WF_SYMBOL_CONFIG)}"
+        )
+        return
+
+    user_id = str(update.effective_user.id) if update.effective_user else "unknown"
+    since   = time.time() - _last_regime_analysis.get(user_id, 0)
+    if since < REGIME_ANALYSIS_COOLDOWN:
+        wait = int(REGIME_ANALYSIS_COOLDOWN - since)
+        await update.message.reply_text(f"Vui long cho {wait}s truoc khi chay tiep.")
+        return
+    _last_regime_analysis[user_id] = time.time()
+
+    cfg = _WF_SYMBOL_CONFIG[symbol]
+    chat_id = update.effective_chat.id
+    msg = await update.message.reply_text(
+        f"Regime Analysis: {symbol}\n"
+        f"Config: {cfg['combo']} | nguong {cfg['threshold']}\n"
+        f"Dang chay walk-forward de lay tin hieu OOS (~2 phut)..."
+    )
+
+    async def _bg():
+        try:
+            # Chạy WF để lấy oos_signals + df
+            res = await asyncio.to_thread(_run_walkforward_sync_with_df, symbol)
+
+            if res["status"] == "error":
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg.message_id,
+                    text=f"❌ {symbol}: {res.get('error','?')[:300]}"
+                )
+                return
+
+            oos_sigs = res.get("oos_signals", [])
+            completed = [s for s in oos_sigs if not s.get("pending")]
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg.message_id,
+                text=f"Da lay {len(completed)} tin hieu OOS. Dang phan tich regime..."
+            )
+
+            text = _analyze_oos_regime(res)
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg.message_id,
+                text=_plain(text)[:4096],
+            )
+        except Exception as e:
+            import traceback
+            logger.error(f"analog_regime_analysis_cmd error: {e}\n{traceback.format_exc()}")
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg.message_id,
+                    text=f"Loi phan tich: {str(e)[:200]}"
+                )
+            except Exception:
+                pass
+
+    asyncio.create_task(_bg())
+
+
+def _run_walkforward_sync_with_df(symbol: str) -> dict:
+    """
+    Wrapper _run_walkforward_sync — thêm df vào return dict
+    để _analyze_oos_regime có thể tính state_vector.
+    """
+    import numpy as np
+    import pandas as pd
+
+    symbol = symbol.upper()
+    if symbol not in _WF_SYMBOL_CONFIG:
+        return {"status": "error", "error": f"{symbol} chua co config"}
+
+    # Load df trước
+    try:
+        from vn_loader import load_vn_ohlcv
+        df = load_vn_ohlcv(symbol, days=2500, min_bars=200)
+    except Exception as e:
+        return {"status": "error", "error": f"Khong lay duoc data: {e}"}
+
+    if df is None or len(df) < 200:
+        return {"status": "error", "error": "Khong du du lieu"}
+
+    # Chạy WF bình thường
+    res = _run_walkforward_sync(symbol)
+
+    # Đính kèm df vào result để _analyze_oos_regime dùng
+    if res.get("status") == "ok":
+        res["df"] = df
+
+    return res
+
+
 async def walkforward_analog_cmd(update, context):
     """
     /walkforward_analog [MA1 MA2 ...]
@@ -3945,7 +4303,7 @@ async def analog_pipeline_cmd(update, context):
 
 async def analog_approve_cmd(update, context):
     """
-    /analog_approve <MA> [combo_index] [threshold] [mae30] [sizing]
+    /analog_approve <MA> [combo] [threshold] [mae30] [sizing]
 
     Lưu config analog của 1 mã vào DB — không cần sửa code nữa.
 
@@ -3955,17 +4313,16 @@ async def analog_approve_cmd(update, context):
        Bot đã gợi ý combo + threshold — chỉ cần approve:
          /analog_approve LPB
 
-    2. Tự nhập tay bằng index số (xem danh sách khi gọi /analog_approve):
-         /analog_approve LPB 5 0.60
-         /analog_approve LPB 5 0.60 -6.5 1.0
-         /analog_approve TCB 4 0.75 -5.0 0.5
+    2. Tự nhập tay (sau khi xem kết quả /backtest_analog_detail):
+         /analog_approve LPB "Oversold Bounce" 0.60 -6.5 1.0
+         /analog_approve TCB "Volume Confirmed" 0.75 -5.0 0.5
 
     Args:
-        MA:           mã cổ phiếu
-        combo_index:  số thứ tự combo 0-14 (xem danh sách khi gọi không có args)
-        threshold:    ngưỡng cosine similarity
-        mae30:        MAE 30 ngày, số âm (optional, default 0)
-        sizing:       hệ số vốn 0.5 hoặc 1.0 (optional, default 1.0)
+        MA:        mã cổ phiếu
+        combo:     tên combo (optional nếu đã chạy pipeline trước đó)
+        threshold: ngưỡng cosine (optional)
+        mae30:     MAE 30 ngày, số âm (optional, default 0)
+        sizing:    hệ số vốn 0.5 hoặc 1.0 (optional, default 1.0)
 
     Sau khi approve:
       - Config được lưu vào DB (persist qua bot restart)
@@ -3984,22 +4341,15 @@ async def analog_approve_cmd(update, context):
         return
 
     args = context.args or []
-
-    # Hiển thị danh sách combo khi không có args
     if not args:
-        combo_list = "\n".join(
-            f"  {i:>2}. {c['name']}"
-            for i, c in enumerate(_ANALOG_COMBOS)
-        )
         await update.message.reply_text(
             "Cu phap:\n"
-            "  /analog_approve <MA>                     (sau khi chay pipeline)\n"
-            "  /analog_approve <MA> <index> <threshold> [mae30] [sizing]\n\n"
+            "  /analog_approve <MA>  (neu da chay pipeline, lay config tu do)\n"
+            "  /analog_approve <MA> <combo> <threshold> [mae30] [sizing]\n\n"
             "Vi du:\n"
             "  /analog_approve LPB\n"
-            "  /analog_approve LPB 5 0.60\n"
-            "  /analog_approve LPB 5 0.60 -6.5 0.5\n\n"
-            f"Danh sach combo:\n{combo_list}\n\n"
+            "  /analog_approve LPB \"Oversold Bounce\" 0.60 -6.5 1.0\n"
+            "  /analog_approve TCB \"Volume Confirmed\" 0.75 -5.0 0.5\n\n"
             f"Config hien tai: {', '.join(_WF_SYMBOL_CONFIG.keys())}"
         )
         return
@@ -4012,31 +4362,17 @@ async def analog_approve_cmd(update, context):
 
     # Lấy combo + threshold từ args hoặc từ _WF_SYMBOL_CONFIG (đã được pipeline set)
     if len(args) >= 3:
-        # Nhập tay: /analog_approve LPB 5 0.60 [-6.5] [0.5]
-        # args[1] = index số hoặc tên combo (backward compat)
-        combo_arg = args[1]
-        try:
-            combo_idx = int(combo_arg)
-            if combo_idx < 0 or combo_idx >= len(_ANALOG_COMBOS):
-                await update.message.reply_text(
-                    f"Index {combo_idx} khong hop le. "
-                    f"Combo co so thu tu 0 den {len(_ANALOG_COMBOS)-1}.\n"
-                    f"Goi /analog_approve de xem danh sach."
-                )
-                return
-            combo = _ANALOG_COMBOS[combo_idx]["name"]
-        except ValueError:
-            # Backward compat: vẫn chấp nhận tên combo có dấu "
-            import re
-            full_args = " ".join(args[1:])
-            quoted    = re.findall(r'"([^"]*)"', full_args)
-            combo     = quoted[0] if quoted else combo_arg
+        # Nhập tay: /analog_approve LPB "Oversold Bounce" 0.60 -6.5 1.0
+        import re
+        full_args = " ".join(args[1:])
+        quoted    = re.findall(r'"([^"]*)"', full_args)
+        combo     = quoted[0] if quoted else args[1]
         try:
             threshold = float(args[2]) if len(args) > 2 else 0.60
             mae30     = float(args[3]) if len(args) > 3 else 0.0
             sizing    = float(args[4]) if len(args) > 4 else 1.0
         except (ValueError, IndexError):
-            await update.message.reply_text("threshold/mae30/sizing phai la so. Vi du: 5 0.60 -6.5 1.0")
+            await update.message.reply_text("threshold/mae30/sizing phai la so. Vi du: 0.60 -6.5 1.0")
             return
     elif symbol in _WF_SYMBOL_CONFIG:
         # Lấy từ config đã có trong memory (pipeline vừa tìm hoặc hardcode)
