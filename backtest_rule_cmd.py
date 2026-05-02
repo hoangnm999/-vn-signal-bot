@@ -2880,17 +2880,22 @@ def _run_walkforward_sync(symbol: str) -> dict:
 
     WIN_THRESH  = 1.0
     MIN_SAMPLES = 5
-    MDS_DAYS    = 30
+    # MDS_DAYS: dùng calendar days — 30 trading days ≈ 43 calendar days
+    # để tránh analog pool bị correlation cao do lấy ngày quá gần nhau
+    MDS_DAYS    = 43
     FWD_DAYS    = 30
-    # Cooldown simulate: phải khớp SIGNAL_COOLDOWN_DAYS trong analog_signal.py
-    COOLDOWN_DAYS = 7
+    # Cooldown simulate: dùng BAR INDEX thay calendar days
+    # Lý do: loop step=7 bars ≈ 10 cal days > COOLDOWN 7 cal days
+    # → nếu dùng cal days thì cooldown KHÔNG BAO GIỜ kick in
+    # 10 bars ≈ 2 tuần trading ~ khớp SIGNAL_COOLDOWN_DAYS trong analog_signal.py
+    COOLDOWN_BARS = 10
 
-    oos_signals      = []
-    train_signals    = []
-    n_skip_oos       = 0
-    n_skip_train     = 0
-    n_skip_cooldown  = 0          # đếm riêng để báo cáo
-    last_oos_signal_date = None   # track ngày OOS signal cuối
+    oos_signals          = []
+    train_signals        = []
+    n_skip_oos           = 0
+    n_skip_train         = 0
+    n_skip_cooldown      = 0   # đếm riêng để báo cáo
+    last_oos_signal_idx  = None   # track bar index OOS signal cuối (không dùng date)
 
     for t_idx in range(120, n_bars - FWD_DAYS - 1, 7):
         if t_idx not in vectors:
@@ -2899,10 +2904,11 @@ def _run_walkforward_sync(symbol: str) -> dict:
         t_date    = pd.Timestamp(dates[t_idx])
         is_oos    = t_date >= wf_start
 
-        # Simulate cooldown cho OOS — giống live trading thực tế
-        if is_oos and last_oos_signal_date is not None:
-            days_since = (t_date - last_oos_signal_date).days
-            if days_since < COOLDOWN_DAYS:
+        # Simulate cooldown cho OOS — dùng bar index để chính xác
+        # (calendar days không dùng được vì 7 bars ≈ 10 cal days > cooldown 7 ngày)
+        if is_oos and last_oos_signal_idx is not None:
+            bars_since = t_idx - last_oos_signal_idx
+            if bars_since < COOLDOWN_BARS:
                 n_skip_cooldown += 1
                 continue
 
@@ -2935,7 +2941,7 @@ def _run_walkforward_sync(symbol: str) -> dict:
         if not sim_list:
             continue
 
-        # MDS
+        # MDS — dùng calendar days, 43 cal ≈ 30 trading days
         sim_list.sort(key=lambda x: -x[1])
         kept = []
         for c_idx, sim in sim_list:
@@ -3000,7 +3006,7 @@ def _run_walkforward_sync(symbol: str) -> dict:
 
         if is_oos:
             oos_signals.append(signal)
-            last_oos_signal_date = t_date   # cập nhật cooldown tracker
+            last_oos_signal_idx = t_idx   # cập nhật bar index (không dùng date)
         else:
             train_signals.append(signal)
 
@@ -3050,14 +3056,79 @@ def _run_walkforward_sync(symbol: str) -> dict:
         "n_skip_oos":       n_skip_oos,
         "n_skip_train":     n_skip_train,
         "n_skip_cooldown":  n_skip_cooldown,
-        "cooldown_days":    COOLDOWN_DAYS,
+        "cooldown_bars":    COOLDOWN_BARS,
         "oos_signals":      oos_signals,
         "oos_metrics":      oos_metrics,
         "train_metrics":    train_metrics,
     }
 
 
-def _format_wf_result(res: dict) -> str:
+def _run_random_baseline(symbol: str, n_trials: int = 500) -> dict:
+    """
+    Null hypothesis test: chọn ngày OOS ngẫu nhiên (không dùng analog signal),
+    tính WR/Exp/PF 30D để đo market drift tự nhiên.
+
+    So sánh với WF result → đo alpha thực sự của analog system.
+    Nếu random baseline ≈ WF → không có edge, chỉ là market drift.
+    """
+    import numpy as np
+    import pandas as pd
+    import random
+
+    symbol = symbol.upper()
+    try:
+        from vn_loader import load_vn_ohlcv
+        df = load_vn_ohlcv(symbol, days=2500, min_bars=200)
+    except Exception as e:
+        return {"status": "error", "error": f"Khong lay duoc data: {e}"}
+
+    if df is None or len(df) < 200:
+        return {"status": "error", "error": "Khong du du lieu"}
+
+    close_arr   = df["close"].values.astype(float)
+    date_series = pd.to_datetime(df["date"])
+    wf_start    = pd.Timestamp(_WF_START_DATE)
+
+    # Chỉ sample trong OOS period
+    oos_indices = [
+        i for i, d in enumerate(date_series)
+        if pd.Timestamp(d) >= wf_start and i + 30 < len(df)
+    ]
+
+    if len(oos_indices) < 10:
+        return {"status": "error", "error": "Khong du ngay OOS de chay baseline"}
+
+    WIN_THRESH = 1.0
+    random.seed(42)   # reproducible
+
+    actuals = []
+    for _ in range(n_trials):
+        t_idx  = random.choice(oos_indices)
+        entry  = close_arr[t_idx]
+        fwd    = close_arr[t_idx + 30]
+        ret    = (fwd - entry) / entry * 100
+        actuals.append(ret)
+
+    wins    = [x for x in actuals if x >= WIN_THRESH]
+    losses  = [x for x in actuals if x < WIN_THRESH]
+    wr      = len(wins) / len(actuals) * 100
+    mean_exp = float(np.mean(actuals))
+    pos_sum  = sum(wins)
+    neg_sum  = abs(sum(losses)) if losses else 1e-9
+    pf       = pos_sum / neg_sum if neg_sum > 0 else 99.0
+
+    return {
+        "status":    "ok",
+        "symbol":    symbol,
+        "n_trials":  n_trials,
+        "wr":        round(wr, 1),
+        "mean_exp":  round(mean_exp, 2),
+        "pf":        round(pf, 2),
+        "n_oos_bars": len(oos_indices),
+    }
+
+
+
     """Format kết quả walk-forward so sánh OOS vs Training."""
     symbol    = res["symbol"]
     combo     = res["combo"]
@@ -3097,9 +3168,9 @@ def _format_wf_result(res: dict) -> str:
 
     # ── OOS metrics ───────────────────────────────────────────────────────────
     n_skip_cooldown = res.get("n_skip_cooldown", 0)
-    cooldown_days   = res.get("cooldown_days", 7)
+    cooldown_bars   = res.get("cooldown_bars", 10)
     lines.append(f"OUT-OF-SAMPLE ({wf_start} → hom nay):")
-    lines.append(f"  [Simulate cooldown {cooldown_days} ngay — giong live trading]")
+    lines.append(f"  [Simulate cooldown {cooldown_bars} bars (~2 tuan) — giong live trading]")
     if oos_m:
         lines.append(
             f"  WR {oos_m['wr']:.0f}%  "
@@ -3193,6 +3264,38 @@ def _format_wf_result(res: dict) -> str:
             lines.append(
                 f"  ⚠️  Chi co {oos_m['n']} tin hieu OOS — "
                 f"ket qua co the chua on dinh, can them thoi gian."
+            )
+
+    # ── Random Baseline (null hypothesis) ─────────────────────────────────────
+    baseline = _run_random_baseline(symbol)
+    if baseline.get("status") == "ok" and oos_m:
+        lines.append(sep2)
+        lines.append("NULL HYPOTHESIS (random entry baseline):")
+        lines.append(
+            f"  Random {baseline['n_trials']} entry OOS: "
+            f"WR {baseline['wr']:.0f}%  Exp {baseline['mean_exp']:+.2f}%  PF {baseline['pf']:.2f}"
+        )
+        # Tính alpha thực sự
+        alpha_exp = oos_m["mean_exp"] - baseline["mean_exp"]
+        alpha_pf  = oos_m["pf"] - baseline["pf"]
+        alpha_em  = "✅" if alpha_exp > 0.5 else ("⚠️" if alpha_exp > 0 else "🔴")
+        lines.append(
+            f"  Alpha thuc (WF - Random): "
+            f"Exp {alpha_em} {alpha_exp:+.2f}%  PF {alpha_pf:+.2f}"
+        )
+        if alpha_exp <= 0:
+            lines.append(
+                "  🔴 CANH BAO: WF OOS khong tot hon random entry "
+                "→ co the chi la market drift, khong co edge pattern."
+            )
+        elif alpha_exp < 0.5:
+            lines.append(
+                "  ⚠️  Alpha nho (<0.5%) — can them n de xac nhan edge thuc su."
+            )
+        else:
+            lines.append(
+                f"  ✅ Alpha duong ro rang ({alpha_exp:+.2f}%) — "
+                "co bang chung pattern matching them gia tri ngoai drift."
             )
 
     lines.append("")
@@ -4253,17 +4356,27 @@ def _run_pipeline_sync(symbol: str, days: int = 1800) -> dict:
 
     WIN_THRESH  = 1.0
     MIN_SAMPLES = 5
-    MDS_DAYS    = 30
+    # MDS_DAYS: 43 calendar days ≈ 30 trading days (fix: trước đây dùng 30 cal = ~21 trading)
+    MDS_DAYS    = 43
     FWD_DAYS    = 30
+    # Cooldown dùng bar index — 10 bars ≈ 2 tuần trading
+    # (Không dùng calendar days vì 7-bar step > 7-day cooldown → không bao giờ block)
+    COOLDOWN_BARS = 10
 
-    oos_signals   = []
-    train_signals = []
+    oos_signals          = []
+    train_signals        = []
+    last_oos_signal_idx  = None   # track bar index để simulate cooldown
 
     for t_idx in range(120, n_bars - FWD_DAYS - 1, 7):
         if t_idx not in vectors:
             continue
         t_date = pd.Timestamp(dates[t_idx])
         is_oos = t_date >= wf_start
+
+        # Simulate cooldown OOS — dùng bar index
+        if is_oos and last_oos_signal_idx is not None:
+            if t_idx - last_oos_signal_idx < COOLDOWN_BARS:
+                continue
 
         target_vec = vectors[t_idx]
         target_arr = np.array([target_vec.get(d, 0.0) for d in dims], dtype=float)
@@ -4294,6 +4407,7 @@ def _run_pipeline_sync(symbol: str, days: int = 1800) -> dict:
         kept = []
         for c_idx, sim in sim_list:
             c_date    = pd.Timestamp(dates[c_idx])
+            # MDS: 43 calendar days ≈ 30 trading days
             too_close = any(
                 abs((c_date - pd.Timestamp(dates[k])).days) < MDS_DAYS
                 for k, _ in kept
@@ -4333,6 +4447,7 @@ def _run_pipeline_sync(symbol: str, days: int = 1800) -> dict:
         }
         if is_oos:
             oos_signals.append(sig)
+            last_oos_signal_idx = t_idx   # cập nhật cooldown tracker
         else:
             train_signals.append(sig)
 
