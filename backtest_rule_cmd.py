@@ -2880,24 +2880,25 @@ def _run_walkforward_sync(symbol: str) -> dict:
 
     WIN_THRESH  = 1.0
     MIN_SAMPLES = 5
-    # MDS_DAYS: dùng calendar days — 30 trading days ≈ 43 calendar days
-    # để tránh analog pool bị correlation cao do lấy ngày quá gần nhau
+    # MDS_DAYS: 43 calendar days ≈ 30 trading days
     MDS_DAYS    = 43
     FWD_DAYS    = 30
-    # Cooldown simulate: dùng BAR INDEX thay calendar days
-    # Lý do: loop step=7 bars ≈ 10 cal days > COOLDOWN 7 cal days
-    # → nếu dùng cal days thì cooldown KHÔNG BAO GIỜ kick in
-    # 10 bars ≈ 2 tuần trading ~ khớp SIGNAL_COOLDOWN_DAYS trong analog_signal.py
-    COOLDOWN_BARS = 10
+    # LOOP_STEP = 1: check mỗi ngày như live trading thực tế
+    # Trước đây step=7 → cooldown không thể granular hơn bội số 7
+    # → n=42 (step=7, cooldown=7) hoặc n=21 (step=7, cooldown=10) đều cơ học
+    # Với step=1: threshold thực sự lọc ngày nào có/không có signal
+    # COOLDOWN_BARS = 20: 4 tuần, khớp SIGNAL_COOLDOWN_DAYS trong live trading
+    LOOP_STEP     = 1
+    COOLDOWN_BARS = 20
 
     oos_signals          = []
     train_signals        = []
     n_skip_oos           = 0
     n_skip_train         = 0
-    n_skip_cooldown      = 0   # đếm riêng để báo cáo
-    last_oos_signal_idx  = None   # track bar index OOS signal cuối (không dùng date)
+    n_skip_cooldown      = 0
+    last_oos_signal_idx  = None
 
-    for t_idx in range(120, n_bars - FWD_DAYS - 1, 7):
+    for t_idx in range(120, n_bars - FWD_DAYS - 1, LOOP_STEP):
         if t_idx not in vectors:
             continue
 
@@ -4540,18 +4541,18 @@ def _run_pipeline_sync(symbol: str, days: int = 1800) -> dict:
 
     WIN_THRESH  = 1.0
     MIN_SAMPLES = 5
-    # MDS_DAYS: 43 calendar days ≈ 30 trading days (fix: trước đây dùng 30 cal = ~21 trading)
+    # MDS_DAYS: 43 calendar days ≈ 30 trading days
     MDS_DAYS    = 43
     FWD_DAYS    = 30
-    # Cooldown dùng bar index — 10 bars ≈ 2 tuần trading
-    # (Không dùng calendar days vì 7-bar step > 7-day cooldown → không bao giờ block)
-    COOLDOWN_BARS = 10
+    # LOOP_STEP=1, COOLDOWN_BARS=20: đồng bộ với _run_walkforward_sync
+    LOOP_STEP     = 1
+    COOLDOWN_BARS = 20
 
     oos_signals          = []
     train_signals        = []
-    last_oos_signal_idx  = None   # track bar index để simulate cooldown
+    last_oos_signal_idx  = None
 
-    for t_idx in range(120, n_bars - FWD_DAYS - 1, 7):
+    for t_idx in range(120, n_bars - FWD_DAYS - 1, LOOP_STEP):
         if t_idx not in vectors:
             continue
         t_date = pd.Timestamp(dates[t_idx])
