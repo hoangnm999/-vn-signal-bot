@@ -60,6 +60,7 @@ try:
         walkforward_analog_cmd,
         analog_pipeline_cmd,
         analog_approve_cmd,
+        analog_approve_callback,
         analog_configs_cmd,
         analog_remove_cmd,
         analog_regime_analysis_cmd,
@@ -79,6 +80,7 @@ except ImportError:
     analog_remove_cmd          = None
     analog_regime_analysis_cmd = None
     analog_sim_dist_cmd        = None
+    analog_approve_callback    = None
     _load_wf_config_from_db    = None
     logger.warning("backtest_rule_cmd.py chua co — /backtest_rule bi tat")
 
@@ -1611,6 +1613,10 @@ def main():
         app.add_handler(CommandHandler("analog_approve",         analog_approve_cmd))
         app.add_handler(CommandHandler("analog_configs",         analog_configs_cmd))
         app.add_handler(CommandHandler("analog_remove",          analog_remove_cmd))
+        from telegram.ext import CallbackQueryHandler
+        app.add_handler(CallbackQueryHandler(
+            analog_approve_callback, pattern=r"^approve_(yes|no)_"
+        ))
         app.add_handler(CommandHandler("analog_regime_analysis", analog_regime_analysis_cmd))
         app.add_handler(CommandHandler("analog_sim_dist",        analog_sim_dist_cmd))
         if _ANALOG:

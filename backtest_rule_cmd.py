@@ -2236,10 +2236,15 @@ async def analog_pipeline_cmd(update, context):
 # /analog_approve, /analog_configs, /analog_remove
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Pending approve state ────────────────────────────────────────────────────
+_pending_approve: dict[str, dict] = {}  # user_id -> {symbol, combo, threshold}
+
+
 async def analog_approve_cmd(update, context):
     """
-    /analog_approve <MA> [combo] [threshold]
-    Lưu config vào DB sau khi xem kết quả pipeline.
+    /analog_approve <MA>              — tu dong tim config tot nhat tu backtest
+    /analog_approve <MA> <combo> <thr> — chi dinh tay
+    Hien thi confirm button Yes/No truoc khi luu DB.
     """
     try:
         from bot import is_allowed, _deny
@@ -2251,48 +2256,148 @@ async def analog_approve_cmd(update, context):
         await _deny(update)
         return
 
-    args = context.args or []
+    args    = context.args or []
+    user_id = str(update.effective_user.id)
+
     if not args:
         await update.message.reply_text(
-            "Cú pháp: /analog_approve <MA> [combo] [threshold]\n"
-            "Ví dụ: /analog_approve MWG \"Oversold Bounce\" 0.65"
+            "Cach dung:\n"
+            "  /analog_approve <MA>                - tu tim config\n"
+            "  /analog_approve <MA> <combo> <thr>  - chi dinh tay\n"
+            "Vi du: /analog_approve MWG\n"
+            "       /analog_approve MWG Volatility_Aware 0.75"
         )
         return
 
     symbol = args[0].upper()
 
-    # Nếu có combo + threshold tay
+    # ── Truong hop 1: chi dinh combo + threshold tay ──────────────────────────
     if len(args) >= 3:
-        combo_name = " ".join(args[1:-1]).strip('"')
+        combo_name = " ".join(args[1:-1]).strip('"').strip("'")
         try:
             threshold = float(args[-1])
         except ValueError:
-            await update.message.reply_text("❌ Threshold phải là số (ví dụ: 0.65)")
+            await update.message.reply_text("Threshold phai la so, vi du: 0.75")
             return
         combo = _find_combo(combo_name)
         if combo is None:
-            await update.message.reply_text(f"❌ Không tìm thấy combo '{combo_name}'")
+            await update.message.reply_text(f"Khong tim thay combo '{combo_name}'")
             return
         cfg = {"combo": combo["name"], "threshold": threshold}
-    elif symbol in _WF_SYMBOL_CONFIG:
-        cfg = _WF_SYMBOL_CONFIG[symbol]
+
+    # ── Truong hop 2: tu tim config tot nhat tu backtest ─────────────────────
     else:
-        await update.message.reply_text(
-            f"❌ {symbol} chưa có config. Chạy /analog_pipeline {symbol} trước."
+        msg = await update.message.reply_text(
+            f"Dang chay backtest de tim config cho {symbol}..."
+        )
+        try:
+            loop = asyncio.get_event_loop()
+            bt_res = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: _run_analog_backtest_sync(symbol)
+                ),
+                timeout=300,
+            )
+        except asyncio.TimeoutError:
+            await msg.edit_text("Timeout — thu lai sau.")
+            return
+        except Exception as e:
+            await msg.edit_text(f"Loi backtest: {e}")
+            return
+
+        if bt_res.get("status") == "error":
+            await msg.edit_text(f"Loi: {bt_res['error']}")
+            return
+
+        valid = [
+            r for r in bt_res.get("top_results", [])
+            if not r.get("skip")
+            and r.get("mean_exp", 0) > 0
+            and r.get("pf", 0) >= 1.3
+            and r.get("n_signals", 0) >= 5
+        ]
+        if not valid:
+            top = bt_res.get("top_results", [{}])[0]
+            await msg.edit_text(
+                "Khong co combo nao du tieu chuan.\n"
+                f"Top: [{top.get('combo','?')}] "
+                f"Exp={top.get('mean_exp',0):+.2f}% PF={top.get('pf',0):.2f}"
+            )
+            return
+
+        best = valid[0]
+        cfg  = {"combo": best["combo"], "threshold": best["threshold"]}
+        await msg.delete()
+
+    # ── Hien thi confirm button Yes/No ────────────────────────────────────────
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    _pending_approve[user_id] = {
+        "symbol":    symbol,
+        "combo":     cfg["combo"],
+        "threshold": cfg["threshold"],
+    }
+
+    old_cfg = _WF_SYMBOL_CONFIG.get(symbol)
+    old_txt = (
+        f"Config cu: [{old_cfg['combo']}] thr={old_cfg['threshold']}\n"
+        if old_cfg else "Config cu: (chua co)\n"
+    )
+
+    text = (
+        f"XAC NHAN LUU CONFIG — {symbol}\n"
+        f"{'─' * 32}\n"
+        f"{old_txt}"
+        f"Config moi: [{cfg['combo']}] thr={cfg['threshold']}\n"
+        f"{'─' * 32}\n"
+        "Luu config nay vao DB khong?"
+    )
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Yes", callback_data=f"approve_yes_{user_id}"),
+        InlineKeyboardButton("No",  callback_data=f"approve_no_{user_id}"),
+    ]])
+    await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def analog_approve_callback(update, context):
+    """Xu ly nut Yes/No tu analog_approve_cmd."""
+    query   = update.callback_query
+    await query.answer()
+    data    = query.data
+    user_id = str(query.from_user.id)
+
+    if not data.endswith(f"_{user_id}"):
+        await query.answer("Khong phai lenh cua ban.", show_alert=True)
+        return
+
+    pending = _pending_approve.pop(user_id, None)
+    if pending is None:
+        await query.edit_message_text("Phien xac nhan da het han. Chay lai /analog_approve.")
+        return
+
+    symbol    = pending["symbol"]
+    combo     = pending["combo"]
+    threshold = pending["threshold"]
+
+    if data.startswith("approve_no_"):
+        await query.edit_message_text(
+            f"Da huy — config {symbol} [{combo}] thr={threshold} khong duoc luu."
         )
         return
 
     try:
         from db import save_analog_config
-        save_analog_config(symbol, cfg)
-        _WF_SYMBOL_CONFIG[symbol] = cfg
-        await update.message.reply_text(
-            f"✅ Đã lưu config {symbol}:\n"
-            f"  Combo: {cfg['combo']}\n"
-            f"  Threshold: {cfg['threshold']}"
+        save_analog_config(symbol, {"combo": combo, "threshold": threshold})
+        _WF_SYMBOL_CONFIG[symbol] = {"combo": combo, "threshold": threshold}
+        await query.edit_message_text(
+            f"Da luu config {symbol}:\n"
+            f"  Combo    : {combo}\n"
+            f"  Threshold: {threshold}\n\n"
+            f"Chay /walkforward_analog {symbol} de validate OOS voi config moi."
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Lỗi lưu DB: {e}")
+        await query.edit_message_text(f"Loi luu DB: {e}")
 
 
 async def analog_configs_cmd(update, context):
@@ -2354,30 +2459,19 @@ async def analog_remove_cmd(update, context):
     await update.message.reply_text(f"{flag} {symbol}: {status}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STUBS — giữ tương thích với bot.py imports
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Stubs tương thích bot.py ──────────────────────────────────────────────────
 
 async def backtest_analog_batch_cmd(update, context):
-    """/backtest_analog_batch — Dùng /analog_pipeline thay thế."""
     await update.message.reply_text(
-        "⚠️ /backtest_analog_batch đã được thay bằng /analog_pipeline\n"
-        "Cú pháp: /analog_pipeline <MA1> <MA2> ...\n"
-        "Ví dụ: /analog_pipeline MWG STB DPM"
+        "Dung /analog_pipeline thay the.\nVi du: /analog_pipeline MWG STB DPM"
     )
-
 
 async def analog_regime_analysis_cmd(update, context):
-    """/analog_regime_analysis — Đã gộp vào /walkforward_analog."""
     await update.message.reply_text(
-        "⚠️ /analog_regime_analysis đã được gộp vào /walkforward_analog\n"
-        "Dùng: /walkforward_analog <MA> để xem đầy đủ kết quả OOS."
+        "Da gop vao /walkforward_analog.\nDung: /walkforward_analog <MA>"
     )
 
-
 async def analog_sim_dist_cmd(update, context):
-    """/analog_sim_dist — Đã loại bỏ trong V2."""
     await update.message.reply_text(
-        "⚠️ /analog_sim_dist không còn trong V2.\n"
-        "Dùng /backtest_analog_detail <MA> \"<combo>\" để xem phân bố threshold."
+        "Da loai bo trong V2.\nDung /backtest_analog_detail <MA> de xem phan bo threshold."
     )
