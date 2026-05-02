@@ -1260,14 +1260,39 @@ def _load_wf_config_from_db():
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _find_combo(name_query: str) -> dict | None:
-    """Tìm combo theo tên (exact hoặc prefix, case-insensitive)."""
-    q = name_query.strip().lower()
+    """
+    Tìm combo theo tên — robust với mọi cách user gõ:
+      - Exact / prefix match (case-insensitive)
+      - Normalize dấu câu: dash/underscore/space đều như nhau
+      - Token subset: 'short term' tìm được 'Short-term Signal'
+      - Strip quotes thừa từ Telegram args
+    """
+    import re
+    # Strip tất cả quotes (Telegram đôi khi giữ lại dấu nháy trong args)
+    q = name_query.strip().strip('"').strip("'").strip()
+    q_lower = q.lower()
+
+    # 1. Exact
     for c in _ANALOG_COMBOS:
-        if c["name"].lower() == q:
+        if c["name"].lower() == q_lower:
             return c
+    # 2. Prefix
     for c in _ANALOG_COMBOS:
-        if c["name"].lower().startswith(q):
+        if c["name"].lower().startswith(q_lower):
             return c
+    # 3. Normalize punctuation (dash = underscore = space)
+    q_norm = re.sub(r"[-_\s]+", " ", q_lower).strip()
+    for c in _ANALOG_COMBOS:
+        c_norm = re.sub(r"[-_\s]+", " ", c["name"].lower()).strip()
+        if c_norm == q_norm or c_norm.startswith(q_norm):
+            return c
+    # 4. Token subset: mọi token của query phải có trong combo name
+    q_tokens = set(re.split(r"[-_\s]+", q_lower)) - {""}
+    if q_tokens:
+        for c in _ANALOG_COMBOS:
+            c_tokens = set(re.split(r"[-_\s]+", c["name"].lower()))
+            if q_tokens.issubset(c_tokens):
+                return c
     return None
 
 
@@ -1277,12 +1302,43 @@ def _build_target_arr(vec: dict, dims: list) -> "np.ndarray | None":
     return arr if np.linalg.norm(arr) >= 1e-9 else None
 
 
+# Dims [0,1] trong state vector V2 — cần center về 0 trước khi tính cosine
+# để tránh bias dương làm threshold vô nghĩa
+_DIMS_01 = {
+    "bb_position", "trend_consistency", "atr_ratio",
+    "atr_trend", "range_position_60d",
+}
+
+
+def _center_arr(arr: "np.ndarray", dims: list) -> "np.ndarray":
+    """
+    Center dims [0,1] về [-0.5, 0.5] để cosine similarity không bị bias dương.
+    Dims [-1,1] đã centered tự nhiên, không cần xử lý.
+    """
+    import numpy as np
+    offsets = np.array([0.5 if d in _DIMS_01 else 0.0 for d in dims])
+    return arr - offsets
+
+
 def _cosine(a, b):
+    """Raw cosine — KHÔNG dùng trực tiếp, dùng _cosine_centered."""
     import numpy as np
     na, nb = np.linalg.norm(a), np.linalg.norm(b)
     if na < 1e-9 or nb < 1e-9:
         return 0.0
     return float(np.dot(a, b) / (na * nb))
+
+
+def _cosine_centered(a: "np.ndarray", b: "np.ndarray", dims: list) -> float:
+    """
+    Cosine similarity sau khi center dims [0,1] về 0.
+    Phân biệt vectors tốt hơn raw cosine:
+      - Random vectors: P(sim>=0.65) giảm từ 6% → 1.4%
+      - Threshold thực sự có ý nghĩa lọc
+    """
+    ac = _center_arr(a, dims)
+    bc = _center_arr(b, dims)
+    return _cosine(ac, bc)
 
 
 def _apply_mds(sim_list: list, dates, mds_days: int) -> list:
@@ -1371,7 +1427,7 @@ def _run_one_experiment_v2(
             c_arr = _build_target_arr(vectors[c_idx], dims)
             if c_arr is None:
                 continue
-            sim = _cosine(target_arr, c_arr)
+            sim = _cosine_centered(target_arr, c_arr, dims)
             if sim >= threshold:
                 sim_list.append((c_idx, sim))
 
@@ -1692,7 +1748,7 @@ def _run_walkforward_sync(symbol: str) -> dict:
             c_arr = _build_target_arr(vectors[c_idx], dims)
             if c_arr is None:
                 continue
-            sim = _cosine(target_arr, c_arr)
+            sim = _cosine_centered(target_arr, c_arr, dims)
             if sim >= threshold:
                 sim_list.append((c_idx, sim))
 
@@ -2352,33 +2408,3 @@ async def analog_remove_cmd(update, context):
 
     flag = "✅" if deleted else "⚠️"
     await update.message.reply_text(f"{flag} {symbol}: {status}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STUBS — giữ tương thích với bot.py imports
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def backtest_analog_batch_cmd(update, context):
-    """/backtest_analog_batch — Dùng /analog_pipeline thay thế."""
-    await update.message.reply_text(
-        "⚠️ /backtest_analog_batch đã được thay bằng /analog_pipeline\n"
-        "Cú pháp: /analog_pipeline <MA1> <MA2> ...\n"
-        "Ví dụ: /analog_pipeline MWG STB DPM"
-    )
-
-
-async def analog_regime_analysis_cmd(update, context):
-    """/analog_regime_analysis — Đã gộp vào /walkforward_analog."""
-    await update.message.reply_text(
-        "⚠️ /analog_regime_analysis đã được gộp vào /walkforward_analog\n"
-        "Dùng: /walkforward_analog <MA> để xem đầy đủ kết quả OOS."
-    )
-
-
-async def analog_sim_dist_cmd(update, context):
-    """/analog_sim_dist — Đã loại bỏ trong V2."""
-    await update.message.reply_text(
-        "⚠️ /analog_sim_dist không còn trong V2.\n"
-        "Dùng /backtest_analog_detail <MA> \"<combo>\" để xem "
-        "phân bố threshold theo từng combo."
-    )
