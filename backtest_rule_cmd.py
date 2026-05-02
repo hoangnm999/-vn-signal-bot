@@ -1029,141 +1029,132 @@ _last_backtest_analog: dict[str, float] = {}
 
 # ── 15 combo (12 đơn + 3 giao thoa) ─────────────────────────────────────────
 _ANALOG_COMBOS = [
-    # ── 12 combo đơn ─────────────────────────────────────────────────────────
+    # ── Baseline ─────────────────────────────────────────────────────────────
     {
         "name":       "Full Baseline",
         "group":      "baseline",
         "dims":       [
-            "rsi_norm", "macd_hist_norm", "bb_position", "volume_spike",
-            "trend_slope", "price_vs_sma20", "price_vs_sma50", "atr_ratio",
-            "stoch_k_norm", "ema_cross", "momentum_5d", "momentum_20d",
-            "high_low_pos", "vol_trend", "candle_body",
+            "momentum_5d", "momentum_20d", "macd_hist_norm",
+            "bb_position", "rsi_slope",
+            "trend_slope", "trend_consistency",
+            "atr_ratio", "atr_trend",
+            "volume_spike", "vol_trend", "volume_price_confirm",
+            "range_position_60d",
         ],
-        "hypothesis": "Tat ca 15 chieu — dung lam baseline so sanh",
+        "hypothesis": "Tat ca 13 chieu V2 — baseline so sanh",
     },
+    # ── Momentum ─────────────────────────────────────────────────────────────
     {
         "name":       "Pure Momentum",
         "group":      "momentum",
-        "dims":       ["rsi_norm", "stoch_k_norm", "momentum_5d", "momentum_20d", "macd_hist_norm"],
-        "hypothesis": "Chi dong luc ngan/trung han",
-    },
-    {
-        "name":       "Trend Following",
-        "group":      "trend",
-        "dims":       ["trend_slope", "price_vs_sma20", "price_vs_sma50", "ema_cross", "momentum_20d"],
-        "hypothesis": "Xu huong trung han",
-    },
-    {
-        "name":       "Mean Reversion",
-        "group":      "reversion",
-        "dims":       ["bb_position", "high_low_pos", "rsi_norm", "stoch_k_norm", "price_vs_sma20"],
-        "hypothesis": "Hoi phuc ve trung binh",
-    },
-    {
-        "name":       "Volume Confirmed",
-        "group":      "volume",
-        "dims":       ["volume_spike", "vol_trend", "momentum_5d", "momentum_20d", "rsi_norm"],
-        "hypothesis": "Breakout co volume xac nhan",
-    },
-    {
-        "name":       "Oversold Bounce",
-        "group":      "reversion",
-        "dims":       ["rsi_norm", "stoch_k_norm", "bb_position", "high_low_pos", "momentum_5d"],
-        "hypothesis": "Mua vung oversold",
-    },
-    {
-        "name":       "Trend + Volume",
-        "group":      "trend",
-        "dims":       ["trend_slope", "price_vs_sma50", "ema_cross", "volume_spike", "vol_trend"],
-        "hypothesis": "Xu huong + dong tien",
-    },
-    {
-        "name":       "Volatility Aware",
-        "group":      "volatility",
-        "dims":       ["atr_ratio", "bb_position", "candle_body", "rsi_norm", "momentum_20d"],
-        "hypothesis": "Dieu chinh theo bien dong",
-    },
-    {
-        "name":       "No Volume",
-        "group":      "momentum",
-        "dims":       [
-            "rsi_norm", "macd_hist_norm", "bb_position", "trend_slope",
-            "price_vs_sma20", "price_vs_sma50", "stoch_k_norm", "momentum_20d",
-        ],
-        "hypothesis": "Bo qua volume — ky thuat thuan",
-    },
-    {
-        "name":       "Momentum + Trend",
-        "group":      "momentum",
-        "dims":       ["momentum_5d", "momentum_20d", "trend_slope", "ema_cross", "price_vs_sma50"],
-        "hypothesis": "Momentum trong xu huong",
+        "dims":       ["momentum_5d", "momentum_20d", "macd_hist_norm", "rsi_slope"],
+        "hypothesis": "Chi dong luc ngan/trung han — RSI slope xac nhan huong",
     },
     {
         "name":       "Short-term Signal",
         "group":      "momentum",
-        "dims":       ["rsi_norm", "momentum_5d", "volume_spike", "candle_body", "bb_position", "stoch_k_norm"],
-        "hypothesis": "Tin hieu ngan han thuan",
-    },
-    {
-        "name":       "Macro Trend",
-        "group":      "trend",
-        "dims":       ["trend_slope", "price_vs_sma50", "momentum_20d", "high_low_pos", "atr_ratio"],
-        "hypothesis": "Buc tranh dai han",
-    },
-    # ── 3 combo giao thoa ────────────────────────────────────────────────────
-    {
-        "name":       "Oversold + Momentum",
-        "group":      "crossover",
-        "dims":       [
-            "rsi_norm", "stoch_k_norm", "bb_position", "high_low_pos",
-            "momentum_5d", "momentum_20d", "macd_hist_norm",
-        ],
-        "hypothesis": "Oversold NHUNG van co momentum tang — pullback trong uptrend",
-    },
-    {
-        "name":       "Trend + Oversold",
-        "group":      "crossover",
-        "dims":       [
-            "trend_slope", "price_vs_sma50", "ema_cross",
-            "rsi_norm", "stoch_k_norm", "bb_position",
-        ],
-        "hypothesis": "Xu huong tang, dang pullback oversold — diem mua tot nhat",
+        "dims":       ["momentum_5d", "rsi_slope", "volume_spike", "bb_position", "volume_price_confirm"],
+        "hypothesis": "Tin hieu ngan han: momentum + volume xac nhan + oversold",
     },
     {
         "name":       "Momentum + Volume",
         "group":      "crossover",
-        "dims":       [
-            "momentum_5d", "momentum_20d", "macd_hist_norm",
-            "volume_spike", "vol_trend",
-        ],
+        "dims":       ["momentum_5d", "momentum_20d", "macd_hist_norm", "volume_spike", "vol_trend"],
         "hypothesis": "Momentum co volume xac nhan — breakout chat luong cao",
+    },
+    # ── Mean Reversion ───────────────────────────────────────────────────────
+    {
+        "name":       "Oversold Bounce",
+        "group":      "reversion",
+        "dims":       ["bb_position", "rsi_slope", "momentum_5d", "range_position_60d"],
+        "hypothesis": "Mua vung oversold: BB thap + RSI dang hoi phuc",
+    },
+    {
+        "name":       "Mean Reversion",
+        "group":      "reversion",
+        "dims":       ["bb_position", "rsi_slope", "range_position_60d", "momentum_20d"],
+        "hypothesis": "Hoi phuc ve trung binh — gia o vung thap trong range dai han",
+    },
+    # ── Trend ────────────────────────────────────────────────────────────────
+    {
+        "name":       "Trend Following",
+        "group":      "trend",
+        "dims":       ["trend_slope", "trend_consistency", "momentum_20d", "range_position_60d"],
+        "hypothesis": "Xu huong trung han on dinh: SMA20>SMA50 + nhieu ngay above MA",
+    },
+    {
+        "name":       "Macro Trend",
+        "group":      "trend",
+        "dims":       ["trend_slope", "trend_consistency", "momentum_20d", "atr_ratio"],
+        "hypothesis": "Buc tranh dai han: xu huong manh + bien dong binh thuong",
+    },
+    {
+        "name":       "Trend + Volume",
+        "group":      "trend",
+        "dims":       ["trend_slope", "trend_consistency", "volume_spike", "vol_trend", "volume_price_confirm"],
+        "hypothesis": "Xu huong + dong tien xac nhan",
+    },
+    # ── Volatility ───────────────────────────────────────────────────────────
+    {
+        "name":       "Volatility Aware",
+        "group":      "volatility",
+        "dims":       ["atr_ratio", "atr_trend", "bb_position", "momentum_20d"],
+        "hypothesis": "Bien dong tang (atr_trend>0.5) + gia o vung thap BB",
+    },
+    # ── Volume ───────────────────────────────────────────────────────────────
+    {
+        "name":       "Volume Confirmed",
+        "group":      "volume",
+        "dims":       ["volume_spike", "vol_trend", "volume_price_confirm", "momentum_5d"],
+        "hypothesis": "Breakout co volume xac nhan huong gia",
+    },
+    # ── Crossover ────────────────────────────────────────────────────────────
+    {
+        "name":       "Oversold + Momentum",
+        "group":      "crossover",
+        "dims":       ["bb_position", "rsi_slope", "momentum_5d", "momentum_20d", "macd_hist_norm"],
+        "hypothesis": "Oversold NHUNG RSI dang hoi phuc + momentum bat dau tang",
+    },
+    {
+        "name":       "Trend + Oversold",
+        "group":      "crossover",
+        "dims":       ["trend_slope", "trend_consistency", "bb_position", "rsi_slope", "range_position_60d"],
+        "hypothesis": "Xu huong tang, dang pullback oversold — diem mua tot nhat",
+    },
+    {
+        "name":       "Momentum + Trend",
+        "group":      "momentum",
+        "dims":       ["momentum_5d", "momentum_20d", "trend_slope", "trend_consistency", "volume_price_confirm"],
+        "hypothesis": "Momentum ngan han trong xu huong dai han",
+    },
+    {
+        "name":       "Structure Break",
+        "group":      "structure",
+        "dims":       ["range_position_60d", "bb_position", "atr_trend", "volume_spike", "momentum_5d"],
+        "hypothesis": "Gia thoat day 60 ngay + bien dong tang + volume dot bien",
     },
 ]
 
-# ── Hard filter (optional, dùng khi use_hard_filter=True) ───────────────────
-# Format: {dim: (min, max)} — vector value phải trong khoảng [min, max]
-# Ngưỡng dựa trên ý nghĩa kinh tế:
-#   rsi_norm < -0.30    → RSI < 35
-#   trend_slope > 0.20  → SMA20 > SMA50 + 2%
-#   volume_spike > 0.25 → vol > 150% MA20
-#   atr_ratio > 0.50    → ATR > 2.5% giá
-#   momentum_5d < -0.20 → giảm > 2% trong 5 ngày
+# ── Hard filter V2 (optional, dùng khi use_hard_filter=True) ─────────────────
+# Dùng dims V2: bb_position [0,1], rsi_slope [-1,1], trend_slope [-1,1],
+#   trend_consistency [0,1], atr_ratio [0,1], atr_trend [0,1],
+#   volume_spike [-1,1], momentum_5d [-1,1], range_position_60d [0,1]
 _COMBO_HARD_FILTERS = {
     "Full Baseline":       {},
-    "Mean Reversion":      {"rsi_norm": (-1.0,-0.30), "bb_position": (0.0,0.25)},
-    "Oversold Bounce":     {"rsi_norm": (-1.0,-0.30), "stoch_k_norm": (-1.0,-0.30)},
-    "Oversold + Momentum": {"rsi_norm": (-1.0,-0.30), "stoch_k_norm": (-1.0,-0.30)},
-    "Trend + Oversold":    {"trend_slope": (0.20,1.0), "rsi_norm": (-1.0,-0.30)},
-    "Trend Following":     {"trend_slope": (0.20,1.0), "price_vs_sma50": (0.05,1.0)},
-    "Trend + Volume":      {"trend_slope": (0.20,1.0), "volume_spike": (0.25,1.0)},
-    "Momentum + Trend":    {"trend_slope": (0.20,1.0), "momentum_20d": (0.10,1.0)},
-    "Macro Trend":         {"trend_slope": (0.20,1.0), "price_vs_sma50": (0.05,1.0)},
-    "Volume Confirmed":    {"volume_spike": (0.25,1.0)},
-    "Momentum + Volume":   {"volume_spike": (0.25,1.0), "momentum_5d": (-1.0,-0.20)},
-    "Short-term Signal":   {"momentum_5d": (-1.0,-0.20), "volume_spike": (0.25,1.0)},
-    "Volatility Aware":    {"atr_ratio": (0.50,1.0), "bb_position": (0.0,0.25)},
-    "Pure Momentum":       {"momentum_5d": (-1.0,-0.20), "momentum_20d": (-1.0,-0.10)},
-    "No Volume":           {"rsi_norm": (-1.0,-0.30), "bb_position": (0.0,0.25)},
+    "Pure Momentum":       {"momentum_5d": (-1.0, -0.10), "rsi_slope": (0.0, 1.0)},
+    "Short-term Signal":   {"momentum_5d": (-1.0, -0.10), "volume_spike": (0.10, 1.0)},
+    "Momentum + Volume":   {"volume_spike": (0.10, 1.0), "volume_price_confirm": (0.0, 1.0)},
+    "Oversold Bounce":     {"bb_position": (0.0, 0.25), "rsi_slope": (0.0, 1.0)},
+    "Mean Reversion":      {"bb_position": (0.0, 0.30), "range_position_60d": (0.0, 0.35)},
+    "Trend Following":     {"trend_slope": (0.10, 1.0), "trend_consistency": (0.60, 1.0)},
+    "Macro Trend":         {"trend_slope": (0.10, 1.0), "trend_consistency": (0.55, 1.0)},
+    "Trend + Volume":      {"trend_slope": (0.10, 1.0), "volume_spike": (0.10, 1.0)},
+    "Volatility Aware":    {"atr_trend": (0.55, 1.0), "bb_position": (0.0, 0.30)},
+    "Volume Confirmed":    {"volume_spike": (0.10, 1.0), "volume_price_confirm": (0.0, 1.0)},
+    "Oversold + Momentum": {"bb_position": (0.0, 0.30), "rsi_slope": (0.0, 1.0)},
+    "Trend + Oversold":    {"trend_slope": (0.10, 1.0), "bb_position": (0.0, 0.30)},
+    "Momentum + Trend":    {"trend_slope": (0.10, 1.0), "momentum_5d": (-1.0, -0.05)},
+    "Structure Break":     {"range_position_60d": (0.0, 0.25), "atr_trend": (0.50, 1.0)},
 }
 
 
@@ -1205,8 +1196,8 @@ def _check_hard_filter(vec: dict, combo_name: str) -> bool:
 
 # ── Constants ────────────────────────────────────────────────────────────────
 _FWD_DAYS        = 30     # forward return window (bars)
-_MDS_DAYS        = 43     # minimum distance sampling (cal days ≈ 30 trading)
-_MIN_SAMPLES     = 15     # analog pool tối thiểu sau MDS
+_MDS_DAYS        = 15     # minimum distance sampling (15 trading days ≈ 3 tuần)
+_MIN_SAMPLES     = 8      # analog pool tối thiểu sau MDS
 _WIN_THRESH      = 1.0    # win = actual_ret > 1%
 _MIN_POOL_MEDIAN = 1.0    # gate: median(pool fwd_rets) > 1% mới tạo signal
 _ANALOG_THRESHOLDS = [0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
@@ -1260,39 +1251,14 @@ def _load_wf_config_from_db():
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _find_combo(name_query: str) -> dict | None:
-    """
-    Tìm combo theo tên — robust với mọi cách user gõ:
-      - Exact / prefix match (case-insensitive)
-      - Normalize dấu câu: dash/underscore/space đều như nhau
-      - Token subset: 'short term' tìm được 'Short-term Signal'
-      - Strip quotes thừa từ Telegram args
-    """
-    import re
-    # Strip tất cả quotes (Telegram đôi khi giữ lại dấu nháy trong args)
-    q = name_query.strip().strip('"').strip("'").strip()
-    q_lower = q.lower()
-
-    # 1. Exact
+    """Tìm combo theo tên (exact hoặc prefix, case-insensitive)."""
+    q = name_query.strip().lower()
     for c in _ANALOG_COMBOS:
-        if c["name"].lower() == q_lower:
+        if c["name"].lower() == q:
             return c
-    # 2. Prefix
     for c in _ANALOG_COMBOS:
-        if c["name"].lower().startswith(q_lower):
+        if c["name"].lower().startswith(q):
             return c
-    # 3. Normalize punctuation (dash = underscore = space)
-    q_norm = re.sub(r"[-_\s]+", " ", q_lower).strip()
-    for c in _ANALOG_COMBOS:
-        c_norm = re.sub(r"[-_\s]+", " ", c["name"].lower()).strip()
-        if c_norm == q_norm or c_norm.startswith(q_norm):
-            return c
-    # 4. Token subset: mọi token của query phải có trong combo name
-    q_tokens = set(re.split(r"[-_\s]+", q_lower)) - {""}
-    if q_tokens:
-        for c in _ANALOG_COMBOS:
-            c_tokens = set(re.split(r"[-_\s]+", c["name"].lower()))
-            if q_tokens.issubset(c_tokens):
-                return c
     return None
 
 
@@ -1302,42 +1268,26 @@ def _build_target_arr(vec: dict, dims: list) -> "np.ndarray | None":
     return arr if np.linalg.norm(arr) >= 1e-9 else None
 
 
-# Dims [0,1] trong state vector V2 — cần center về 0 trước khi tính cosine
+# Dims [0,1] trong V2 cần center về 0 trước khi tính cosine
 # để tránh bias dương làm threshold vô nghĩa
 _DIMS_01 = {
     "bb_position", "trend_consistency", "atr_ratio",
     "atr_trend", "range_position_60d",
 }
 
-
-def _center_arr(arr: "np.ndarray", dims: list) -> "np.ndarray":
-    """
-    Center dims [0,1] về [-0.5, 0.5] để cosine similarity không bị bias dương.
-    Dims [-1,1] đã centered tự nhiên, không cần xử lý.
-    """
-    import numpy as np
-    offsets = np.array([0.5 if d in _DIMS_01 else 0.0 for d in dims])
-    return arr - offsets
-
-
 def _cosine(a, b):
-    """Raw cosine — KHÔNG dùng trực tiếp, dùng _cosine_centered."""
     import numpy as np
     na, nb = np.linalg.norm(a), np.linalg.norm(b)
     if na < 1e-9 or nb < 1e-9:
         return 0.0
     return float(np.dot(a, b) / (na * nb))
 
-
-def _cosine_centered(a: "np.ndarray", b: "np.ndarray", dims: list) -> float:
-    """
-    Cosine similarity sau khi center dims [0,1] về 0.
-    Phân biệt vectors tốt hơn raw cosine:
-      - Random vectors: P(sim>=0.65) giảm từ 6% → 1.4%
-      - Threshold thực sự có ý nghĩa lọc
-    """
-    ac = _center_arr(a, dims)
-    bc = _center_arr(b, dims)
+def _cosine_centered(a, b, dims: list) -> float:
+    """Cosine sau khi center dims [0,1] về 0 — threshold có ý nghĩa thực."""
+    import numpy as np
+    offsets = np.array([0.5 if d in _DIMS_01 else 0.0 for d in dims])
+    ac = a - offsets
+    bc = b - offsets
     return _cosine(ac, bc)
 
 
@@ -1427,7 +1377,7 @@ def _run_one_experiment_v2(
             c_arr = _build_target_arr(vectors[c_idx], dims)
             if c_arr is None:
                 continue
-            sim = _cosine_centered(target_arr, c_arr, dims)
+            sim = _cosine(target_arr, c_arr)
             if sim >= threshold:
                 sim_list.append((c_idx, sim))
 
@@ -1571,9 +1521,7 @@ def _run_analog_backtest_sync(symbol: str, days: int = 1800) -> dict:
 
     # 105 experiments
     all_results = []
-    logger.info(f"[BacktestAnalog] {symbol}: {len(vectors)} vectors, {n_bars} bars, running 105 experiments...")
-    for ci, combo in enumerate(_ANALOG_COMBOS):
-        logger.info(f"[BacktestAnalog] {symbol}: combo {ci+1}/{len(_ANALOG_COMBOS)} [{combo['name']}]")
+    for combo in _ANALOG_COMBOS:
         for thr in _ANALOG_THRESHOLDS:
             r = _run_one_experiment_v2(
                 combo, thr, vectors, vector_indices,
@@ -1582,7 +1530,6 @@ def _run_analog_backtest_sync(symbol: str, days: int = 1800) -> dict:
             )
             if not r.get("skip"):
                 all_results.append(r)
-    logger.info(f"[BacktestAnalog] {symbol}: done, {len(all_results)} valid experiments")
 
     if not all_results:
         return {"status": "error", "error": "Khong co experiment nao co du signal"}
@@ -1751,7 +1698,7 @@ def _run_walkforward_sync(symbol: str) -> dict:
             c_arr = _build_target_arr(vectors[c_idx], dims)
             if c_arr is None:
                 continue
-            sim = _cosine_centered(target_arr, c_arr, dims)
+            sim = _cosine(target_arr, c_arr)
             if sim >= threshold:
                 sim_list.append((c_idx, sim))
 
@@ -2145,22 +2092,12 @@ async def backtest_analog_cmd(update, context):
 
     async def _bg():
         try:
-            logger.info(f"[BacktestAnalog] Start {symbol} days={days}")
-            loop = asyncio.get_event_loop()
-            res  = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, lambda: _run_analog_backtest_sync(symbol, days)
-                ),
-                timeout=300,
+            res  = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: _run_analog_backtest_sync(symbol, days)
             )
-            logger.info(f"[BacktestAnalog] Done {symbol}: status={res.get('status')}")
             text = _format_analog_backtest_result(res)
             await msg.edit_text(_plain(text))
-        except asyncio.TimeoutError:
-            logger.error(f"[BacktestAnalog] Timeout {symbol}")
-            await msg.edit_text(f"❌ Timeout sau 5 phút — thử: /backtest_analog {symbol} 500")
         except Exception as e:
-            logger.exception(f"[BacktestAnalog] Error {symbol}: {e}")
             await msg.edit_text(f"❌ Lỗi: {e}")
 
     asyncio.create_task(_bg())
