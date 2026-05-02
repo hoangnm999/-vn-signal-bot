@@ -1491,16 +1491,49 @@ def _format_analog_compare_result(res: dict) -> str:
         else:
             lines.append(f"  C kem hon A: hard filter loai qua nhieu tin hieu tot, giu A")
 
-        best_tag = max(["A","B","C"],
-            key=lambda t: (
-                int(best_results[t]["mean_exp"] > 0 and best_results[t]["pf"] >= 1.5),
-                best_results[t]["mean_exp"], best_results[t]["pf"],
+        # Bộ lọc hợp lệ trước khi chọn best: n >= 20 VÀ PF <= 500
+        # (PF > 500 hoặc n < 20 → overfitting, không đưa vào so sánh)
+        MIN_N_COMPARE   = 20
+        MAX_PF_COMPARE  = 500
+        valid_tags = [
+            t for t in ["A", "B", "C"]
+            if t in best_results
+            and best_results[t]["n_signals"] >= MIN_N_COMPARE
+            and best_results[t]["pf"] <= MAX_PF_COMPARE
+        ]
+
+        # Cảnh báo các tag bị loại vì overfitting
+        for t in ["A", "B", "C"]:
+            if t not in best_results:
+                continue
+            r = best_results[t]
+            if r["n_signals"] < MIN_N_COMPARE:
+                lines.append(
+                    f"  ⚠️  {tag_labels[t]} bi loai khoi so sanh: "
+                    f"n={r['n_signals']} < {MIN_N_COMPARE} (khong du y nghia thong ke)"
+                )
+            elif r["pf"] > MAX_PF_COMPARE:
+                lines.append(
+                    f"  ⚠️  {tag_labels[t]} bi loai khoi so sanh: "
+                    f"PF={r['pf']:.0f} > {MAX_PF_COMPARE} (dau hieu overfitting)"
+                )
+
+        if not valid_tags:
+            lines.append(
+                "  CANH BAO: Khong co phuong an nao hop le (n >= 20 va PF <= 500). "
+                "Nen giam hard filter hoac giam MIN_SAMPLES."
             )
-        )
-        lines.append(f"  => Khuyen nghi: {tag_labels[best_tag]} — "
-                     f"Exp {best_results[best_tag]['mean_exp']:+.2f}% "
-                     f"PF {best_results[best_tag]['pf']:.2f} "
-                     f"n={best_results[best_tag]['n_signals']}")
+        else:
+            best_tag = max(valid_tags,
+                key=lambda t: (
+                    int(best_results[t]["mean_exp"] > 0 and best_results[t]["pf"] >= 1.5),
+                    best_results[t]["mean_exp"], best_results[t]["pf"],
+                )
+            )
+            lines.append(f"  => Khuyen nghi: {tag_labels[best_tag]} — "
+                         f"Exp {best_results[best_tag]['mean_exp']:+.2f}% "
+                         f"PF {best_results[best_tag]['pf']:.2f} "
+                         f"n={best_results[best_tag]['n_signals']}")
 
     lines += [
         "",
@@ -3912,7 +3945,7 @@ async def analog_pipeline_cmd(update, context):
 
 async def analog_approve_cmd(update, context):
     """
-    /analog_approve <MA> [combo] [threshold] [mae30] [sizing]
+    /analog_approve <MA> [combo_index] [threshold] [mae30] [sizing]
 
     Lưu config analog của 1 mã vào DB — không cần sửa code nữa.
 
@@ -3922,16 +3955,17 @@ async def analog_approve_cmd(update, context):
        Bot đã gợi ý combo + threshold — chỉ cần approve:
          /analog_approve LPB
 
-    2. Tự nhập tay (sau khi xem kết quả /backtest_analog_detail):
-         /analog_approve LPB "Oversold Bounce" 0.60 -6.5 1.0
-         /analog_approve TCB "Volume Confirmed" 0.75 -5.0 0.5
+    2. Tự nhập tay bằng index số (xem danh sách khi gọi /analog_approve):
+         /analog_approve LPB 5 0.60
+         /analog_approve LPB 5 0.60 -6.5 1.0
+         /analog_approve TCB 4 0.75 -5.0 0.5
 
     Args:
-        MA:        mã cổ phiếu
-        combo:     tên combo (optional nếu đã chạy pipeline trước đó)
-        threshold: ngưỡng cosine (optional)
-        mae30:     MAE 30 ngày, số âm (optional, default 0)
-        sizing:    hệ số vốn 0.5 hoặc 1.0 (optional, default 1.0)
+        MA:           mã cổ phiếu
+        combo_index:  số thứ tự combo 0-14 (xem danh sách khi gọi không có args)
+        threshold:    ngưỡng cosine similarity
+        mae30:        MAE 30 ngày, số âm (optional, default 0)
+        sizing:       hệ số vốn 0.5 hoặc 1.0 (optional, default 1.0)
 
     Sau khi approve:
       - Config được lưu vào DB (persist qua bot restart)
@@ -3950,15 +3984,22 @@ async def analog_approve_cmd(update, context):
         return
 
     args = context.args or []
+
+    # Hiển thị danh sách combo khi không có args
     if not args:
+        combo_list = "\n".join(
+            f"  {i:>2}. {c['name']}"
+            for i, c in enumerate(_ANALOG_COMBOS)
+        )
         await update.message.reply_text(
             "Cu phap:\n"
-            "  /analog_approve <MA>  (neu da chay pipeline, lay config tu do)\n"
-            "  /analog_approve <MA> <combo> <threshold> [mae30] [sizing]\n\n"
+            "  /analog_approve <MA>                     (sau khi chay pipeline)\n"
+            "  /analog_approve <MA> <index> <threshold> [mae30] [sizing]\n\n"
             "Vi du:\n"
             "  /analog_approve LPB\n"
-            "  /analog_approve LPB \"Oversold Bounce\" 0.60 -6.5 1.0\n"
-            "  /analog_approve TCB \"Volume Confirmed\" 0.75 -5.0 0.5\n\n"
+            "  /analog_approve LPB 5 0.60\n"
+            "  /analog_approve LPB 5 0.60 -6.5 0.5\n\n"
+            f"Danh sach combo:\n{combo_list}\n\n"
             f"Config hien tai: {', '.join(_WF_SYMBOL_CONFIG.keys())}"
         )
         return
@@ -3971,17 +4012,31 @@ async def analog_approve_cmd(update, context):
 
     # Lấy combo + threshold từ args hoặc từ _WF_SYMBOL_CONFIG (đã được pipeline set)
     if len(args) >= 3:
-        # Nhập tay: /analog_approve LPB "Oversold Bounce" 0.60 -6.5 1.0
-        import re
-        full_args = " ".join(args[1:])
-        quoted    = re.findall(r'"([^"]*)"', full_args)
-        combo     = quoted[0] if quoted else args[1]
+        # Nhập tay: /analog_approve LPB 5 0.60 [-6.5] [0.5]
+        # args[1] = index số hoặc tên combo (backward compat)
+        combo_arg = args[1]
+        try:
+            combo_idx = int(combo_arg)
+            if combo_idx < 0 or combo_idx >= len(_ANALOG_COMBOS):
+                await update.message.reply_text(
+                    f"Index {combo_idx} khong hop le. "
+                    f"Combo co so thu tu 0 den {len(_ANALOG_COMBOS)-1}.\n"
+                    f"Goi /analog_approve de xem danh sach."
+                )
+                return
+            combo = _ANALOG_COMBOS[combo_idx]["name"]
+        except ValueError:
+            # Backward compat: vẫn chấp nhận tên combo có dấu "
+            import re
+            full_args = " ".join(args[1:])
+            quoted    = re.findall(r'"([^"]*)"', full_args)
+            combo     = quoted[0] if quoted else combo_arg
         try:
             threshold = float(args[2]) if len(args) > 2 else 0.60
             mae30     = float(args[3]) if len(args) > 3 else 0.0
             sizing    = float(args[4]) if len(args) > 4 else 1.0
         except (ValueError, IndexError):
-            await update.message.reply_text("threshold/mae30/sizing phai la so. Vi du: 0.60 -6.5 1.0")
+            await update.message.reply_text("threshold/mae30/sizing phai la so. Vi du: 5 0.60 -6.5 1.0")
             return
     elif symbol in _WF_SYMBOL_CONFIG:
         # Lấy từ config đã có trong memory (pipeline vừa tìm hoặc hardcode)
