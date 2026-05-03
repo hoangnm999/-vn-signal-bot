@@ -372,7 +372,6 @@ if __name__ == "__main__":
         summary = {}  # fwd_days -> list of (indicator, cohen_d)
 
         for fwd in windows:
-            global FWD_DAYS, GOOD_THRESH, BAD_THRESH
             FWD_DAYS = fwd
 
             # Load data 1 lần
