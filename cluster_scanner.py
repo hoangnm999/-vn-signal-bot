@@ -73,34 +73,45 @@ MIN_TRIGGERS = 2
 # Per-symbol WF stats (từ walk forward results Session 30)
 # Format: symbol → {wr, exp, wfe, n_wf}
 SYMBOL_STATS = {
-    # Mean Reversion
-    "DCM": {"wr": 65, "exp": 7.0,  "wfe": 0.73, "n": 31,  "cluster": "Mean Reversion"},
-    "NKG": {"wr": 60, "exp": 6.0,  "wfe": 0.80, "n": 39,  "cluster": "Mean Reversion"},
-    "DPM": {"wr": 56, "exp": 4.1,  "wfe": 0.47, "n": 33,  "cluster": "Mean Reversion"},
-    "HAH": {"wr": 62, "exp": 3.2,  "wfe": 0.97, "n": 40,  "cluster": "Mean Reversion"},
-    "HCM": {"wr": 55, "exp": 3.2,  "wfe": 0.51, "n": 41,  "cluster": "Mean Reversion"},
-    "HSG": {"wr": 52, "exp": 2.5,  "wfe": 0.30, "n": 46,  "cluster": "Mean Reversion"},
-    "DGC": {"wr": 50, "exp": 1.6,  "wfe": 0.43, "n": 46,  "cluster": "Mean Reversion"},
-    "GAS": {"wr": 48, "exp": 0.9,  "wfe": 0.30, "n": 28,  "cluster": "Mean Reversion"},
+    # Mean Reversion                                              pf = estimated từ WR+Exp (S31)
+    "DCM": {"wr": 65, "exp": 7.0,  "wfe": 0.73, "n": 31,  "pf": 2.17, "cluster": "Mean Reversion"},
+    "NKG": {"wr": 60, "exp": 6.0,  "wfe": 0.80, "n": 39,  "pf": 1.75, "cluster": "Mean Reversion"},
+    "DPM": {"wr": 56, "exp": 4.1,  "wfe": 0.47, "n": 33,  "pf": 1.49, "cluster": "Mean Reversion"},
+    "HAH": {"wr": 62, "exp": 3.2,  "wfe": 0.97, "n": 40,  "pf": 1.91, "cluster": "Mean Reversion"},
+    "HCM": {"wr": 55, "exp": 3.2,  "wfe": 0.51, "n": 41,  "pf": 1.43, "cluster": "Mean Reversion"},
+    "HSG": {"wr": 52, "exp": 2.5,  "wfe": 0.30, "n": 46,  "pf": 1.27, "cluster": "Mean Reversion"},
+    "DGC": {"wr": 50, "exp": 1.6,  "wfe": 0.43, "n": 46,  "pf": 1.17, "cluster": "Mean Reversion"},
+    "GAS": {"wr": 48, "exp": 0.9,  "wfe": 0.30, "n": 28,  "pf": 1.08, "cluster": "Mean Reversion"},
     # Momentum
-    "VCB": {"wr": 54, "exp": 1.0,  "wfe": 4.64, "n": 48,  "cluster": "Momentum"},
-    "BID": {"wr": 53, "exp": 2.9,  "wfe": 1.59, "n": 53,  "cluster": "Momentum"},
-    "MBB": {"wr": 50, "exp": 1.4,  "wfe": 1.11, "n": 67,  "cluster": "Momentum"},
-    "MWG": {"wr": 43, "exp": 1.3,  "wfe": 1.39, "n": 61,  "cluster": "Momentum"},
-    "CTG": {"wr": 56, "exp": 0.9,  "wfe": 0.49, "n": 51,  "cluster": "Momentum"},
-    "FRT": {"wr": 60, "exp": 0.6,  "wfe": 0.39, "n": 59,  "cluster": "Momentum"},
-    "REE": {"wr": 53, "exp": 1.2,  "wfe": 0.44, "n": 54,  "cluster": "Momentum"},
-    "FPT": {"wr": 25, "exp": 0.9,  "wfe": 0.43, "n": 49,  "cluster": "Momentum"},
-    "GMD": {"wr": 44, "exp": 0.4,  "wfe": 0.66, "n": 50,  "cluster": "Momentum"},
-    "STB": {"wr": 43, "exp": 0.9,  "wfe": 0.00, "n": 73,  "cluster": "Momentum"},
-    "PNJ": {"wr": 47, "exp": 0.4,  "wfe": 3.27, "n": 57,  "cluster": "Momentum"},
-    "TCB": {"wr": 54, "exp": 0.3,  "wfe": 0.70, "n": 68,  "cluster": "Momentum"},
+    "VCB": {"wr": 54, "exp": 1.0,  "wfe": 4.64, "n": 48,  "pf": 1.63, "cluster": "Momentum"},
+    "BID": {"wr": 53, "exp": 2.9,  "wfe": 1.59, "n": 53,  "pf": 1.57, "cluster": "Momentum"},
+    "MBB": {"wr": 50, "exp": 1.4,  "wfe": 1.11, "n": 67,  "pf": 1.39, "cluster": "Momentum"},
+    "MWG": {"wr": 43, "exp": 1.3,  "wfe": 1.39, "n": 61,  "pf": 1.05, "cluster": "Momentum"},
+    "CTG": {"wr": 56, "exp": 0.9,  "wfe": 0.49, "n": 51,  "pf": 1.77, "cluster": "Momentum"},
+    "FRT": {"wr": 60, "exp": 0.6,  "wfe": 0.39, "n": 59,  "pf": 2.08, "cluster": "Momentum"},
+    "REE": {"wr": 53, "exp": 1.2,  "wfe": 0.44, "n": 54,  "pf": 1.57, "cluster": "Momentum"},
+    "FPT": {"wr": 25, "exp": 0.9,  "wfe": 0.43, "n": 49,  "pf": 1.00, "cluster": "Momentum"},
+    "GMD": {"wr": 44, "exp": 0.4,  "wfe": 0.66, "n": 50,  "pf": 1.09, "cluster": "Momentum"},
+    "STB": {"wr": 43, "exp": 0.9,  "wfe": 0.00, "n": 73,  "pf": 1.05, "cluster": "Momentum"},
+    "PNJ": {"wr": 47, "exp": 0.4,  "wfe": 3.27, "n": 57,  "pf": 1.23, "cluster": "Momentum"},
+    "TCB": {"wr": 54, "exp": 0.3,  "wfe": 0.70, "n": 68,  "pf": 1.63, "cluster": "Momentum"},
 }
 
 # SL từ MAE p25 analysis
 SL_CONFIG = {
     "Mean Reversion": -13.5,  # p25 MAE
     "Momentum":       -6.4,   # p25 MAE
+}
+
+# Trailing Stop config — validated từ backtest + walk forward (S31)
+# Chỉ áp dụng cho 4 mã đã pass validation, còn lại dùng Time Stop thuần
+# activation_pct: % gain tối thiểu để kích hoạt trailing
+# mult: SL trail = peak_price - mult × ATR14
+TRAIL_CONFIG = {
+    "GAS": {"mult": 3.0, "activation_pct": 9.25},   # MR  | WFE=7.42 consistency=80%
+    "CTG": {"mult": 2.5, "activation_pct": 3.97},   # MOM | WFE=1.53 consistency=100%
+    "REE": {"mult": 1.5, "activation_pct": 4.19},   # MOM | WFE=0.85 consistency=60%
+    "GMD": {"mult": 2.0, "activation_pct": 6.15},   # MOM | WFE=3.63 consistency=100%
 }
 
 # In-memory signal cache (tồn tại trong session)
@@ -427,18 +438,36 @@ def _format_signal(sig: dict, vni_info: dict) -> str:
     if cluster == "Mean Reversion":
         lines.append(f"*VNI ATR:* {vni_info['status']}")
 
+    # Profit Factor
+    pf = stats.get("pf", 0)
+    pf_str = f"{pf:.2f}" if pf else "?"
+
     lines += [
         f"",
         f"*📊 Walk Forward OOS (2022→nay):*",
         f"  WR={stats.get('wr', '?')}% | Exp={stats.get('exp', '?'):+.1f}% | "
-        f"WFE={wfe:.2f} | n={stats.get('n', '?')} signals",
+        f"PF={pf_str} | WFE={wfe:.2f} | n={stats.get('n', '?')}",
         f"",
         f"*🎯 Trade Plan:*",
         f"  Entry: Close hôm nay ~{sig['entry_price']:,.0f}",
         f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%) — Catastrophic stop",
-        f"  Exit: Time Stop T+{fwd}d (~{sig['tp_date']})",
-        f"  Size: Risk 1-2% account",
     ]
+
+    # Trailing stop nếu có config cho mã này
+    trail_cfg = TRAIL_CONFIG.get(sym)
+    if trail_cfg:
+        atr_val  = sig.get("ind", {}).get("atr", 0)
+        trail_sl = round(sig["entry_price"] - trail_cfg["mult"] * atr_val, 0)
+        lines += [
+            f"  Exit: Time Stop T+{fwd}d (~{sig['tp_date']})",
+            f"  *🔔 Trailing Stop:* Kích hoạt khi lãi ≥{trail_cfg['activation_pct']}%",
+            f"    → SL trail = đỉnh - {trail_cfg['mult']}×ATR "
+            f"(≈{trail_sl:,.0f} từ entry)",
+        ]
+    else:
+        lines.append(f"  Exit: Time Stop T+{fwd}d (~{sig['tp_date']})")
+
+    lines.append(f"  Size: Risk 1-2% account")
 
     return "\n".join(lines)
 
