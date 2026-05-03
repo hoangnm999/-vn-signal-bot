@@ -633,7 +633,7 @@ async def healthcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("DATA SOURCE")
     try:
         from vn_loader import load_vn_ohlcv
-        df = load_vn_ohlcv("VCB", n_bars=5)
+        df = load_vn_ohlcv("VCB", days=5)
         if df is not None and len(df) > 0:
             last_date = str(df.index[-1])[:10]
             lines.append(f"  {ok} vn_loader: VCB OK (last={last_date})")
@@ -656,6 +656,97 @@ async def healthcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  {ok} {len(cmd_names)} lenh: {', '.join(cmd_names)}")
     except Exception as e:
         lines.append(f"  {err} Commands: {str(e)[:60]}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+# ── /journal ──────────────────────────────────────────────────────────────────
+async def journal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /journal          — active signals + stats 90 ngày
+    /journal stats    — chỉ stats
+    /journal active   — chỉ active signals
+    /journal close <id> <gia> <WIN|LOSS|EXPIRED>  — đóng signal thủ công
+    """
+    if not is_allowed(update): await _deny(update); return
+
+    try:
+        from db import journal_get_active, journal_get_stats, journal_close_signal
+    except ImportError as e:
+        await update.message.reply_text(f"Loi import journal: {e}"); return
+
+    args = context.args or []
+    sub  = args[0].lower() if args else "all"
+
+    # ── close <id> <gia> <outcome> ──────────────────────────────────────────
+    if sub == "close":
+        if len(args) < 4:
+            await update.message.reply_text(
+                "Dung: /journal close <id> <gia> <WIN|LOSS|EXPIRED>"
+            ); return
+        try:
+            jid     = int(args[1])
+            price   = float(args[2])
+            outcome = args[3].upper()
+            if outcome not in ("WIN","LOSS","EXPIRED"):
+                await update.message.reply_text("outcome phai la WIN, LOSS hoac EXPIRED"); return
+            ok = journal_close_signal(jid, price, outcome)
+            if ok:
+                await update.message.reply_text(f"Da dong signal #{jid} — {outcome} @ {price:,.0f}")
+            else:
+                await update.message.reply_text(f"Khong tim thay signal #{jid}")
+        except ValueError:
+            await update.message.reply_text("id va gia phai la so")
+        return
+
+    lines = []
+
+    # ── ACTIVE SIGNALS ───────────────────────────────────────────────────────
+    if sub in ("all", "active"):
+        active = journal_get_active()
+        lines.append(f"ACTIVE SIGNALS ({len(active)})")
+        lines.append("─" * 30)
+        if not active:
+            lines.append("  Chua co signal nao dang mo")
+        else:
+            from datetime import date
+            today = date.today()
+            for s in active:
+                days_left = (s["exit_date"] - today).days if s["exit_date"] else "?"
+                cluster_s = "MR" if "Reversion" in s["cluster"] else "MOM"
+                sl_str    = f"SL={s['sl_price']:,.0f}" if s["sl_price"] else "no SL"
+                vni_str   = f" [{s['vni_atr_soft']}]" if s["vni_atr_soft"] else ""
+                lines.append(
+                    f"  #{s['id']} {s['symbol']} {cluster_s}{vni_str}"
+                    f"\n    Entry={s['entry_price']:,.0f} {sl_str}"
+                    f"\n    Exit={s['exit_date']} (con {days_left} ngay)"
+                )
+        lines.append("")
+
+    # ── STATS ────────────────────────────────────────────────────────────────
+    if sub in ("all", "stats"):
+        stats = journal_get_stats(days=90)
+        lines.append("PERFORMANCE (90 ngay)")
+        lines.append("─" * 30)
+        if not stats or stats.get("total", 0) == 0:
+            lines.append("  Chua co du lieu (can dong it nhat 1 signal)")
+        else:
+            lines.append(
+                f"  Tong: {stats['total']} trades  "
+                f"WR: {stats['win_rate']}%  "
+                f"({stats['wins']}W/{stats['losses']}L)"
+            )
+            for cluster, cs in stats.get("by_cluster", {}).items():
+                cluster_s = "MR" if "Reversion" in cluster else "MOM"
+                lines.append(
+                    f"\n  {cluster_s} ({cs['total']} trades)"
+                    f"\n    WR={cs['win_rate']}%  Avg={cs['avg_pnl']:+.2f}%"
+                    f"\n    Best={cs['best']:+.2f}%  Worst={cs['worst']:+.2f}%"
+                )
+
+    if not lines:
+        lines.append("Dung: /journal | /journal active | /journal stats")
+        lines.append("      /journal close <id> <gia> <WIN|LOSS|EXPIRED>")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -1755,6 +1846,7 @@ def main():
         app.add_handler(CommandHandler("buy",       buy_cmd))
         app.add_handler(CommandHandler("sell",      sell_cmd))
         app.add_handler(CommandHandler("portfolio", portfolio_cmd))
+    app.add_handler(CommandHandler("journal",   journal_cmd))
     # /morning disabled S31
     app.add_error_handler(_error_handler)
 

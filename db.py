@@ -204,6 +204,12 @@ def init_db():
     except Exception as e:
         logger.warning(f"init_portfolio_schema failed (non-critical): {e}")
 
+    # Khởi tạo bảng cluster_journal (S31)
+    try:
+        init_cluster_journal_schema()
+    except Exception as e:
+        logger.warning(f"init_cluster_journal_schema failed (non-critical): {e}")
+
     return True
 
 
@@ -989,3 +995,195 @@ def get_last_scan_result(scan_type: str = "watchlist") -> dict | None:
     except Exception as e:
         logger.warning(f"[ScanCache] DB load fail (non-critical): {e}")
     return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLUSTER JOURNAL — track live signals từ cluster_scanner (S31)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CLUSTER_JOURNAL_SQL = """
+CREATE TABLE IF NOT EXISTS cluster_journal (
+    id              SERIAL PRIMARY KEY,
+    symbol          VARCHAR(10)  NOT NULL,
+    cluster         VARCHAR(20)  NOT NULL,
+    entry_date      DATE         NOT NULL,
+    exit_date       DATE         NOT NULL,
+    entry_price     FLOAT        NOT NULL,
+    sl_price        FLOAT,
+    exit_price      FLOAT,
+    outcome         VARCHAR(10)  NOT NULL DEFAULT 'PENDING',
+    pnl_pct         FLOAT,
+    vni_atr_soft    VARCHAR(10),
+    trigger_str     TEXT,
+    notes           TEXT,
+    created_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_cj_symbol      ON cluster_journal(symbol);
+CREATE INDEX IF NOT EXISTS idx_cj_outcome     ON cluster_journal(outcome);
+CREATE INDEX IF NOT EXISTS idx_cj_entry_date  ON cluster_journal(entry_date);
+CREATE INDEX IF NOT EXISTS idx_cj_exit_date   ON cluster_journal(exit_date);
+"""
+
+
+def init_cluster_journal_schema() -> bool:
+    """Tạo bảng cluster_journal nếu chưa có. Gọi từ init_db()."""
+    conn = None
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute(_CLUSTER_JOURNAL_SQL)
+        conn.commit()
+        logger.info("[ClusterJournal] Schema initialized OK")
+        return True
+    except Exception as e:
+        logger.error(f"init_cluster_journal_schema error: {e}")
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+        return False
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
+
+
+def journal_add_signal(
+    symbol, cluster, entry_date, entry_price, fwd_days,
+    sl_price=None, vni_atr_soft=None, trigger_str=None,
+) -> int:
+    """Ghi 1 signal mới vào journal. Trả về id hoặc -1 nếu lỗi."""
+    conn = None
+    try:
+        from datetime import timedelta
+        exit_date = entry_date + timedelta(days=fwd_days)
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            INSERT INTO cluster_journal
+              (symbol, cluster, entry_date, exit_date, entry_price,
+               sl_price, vni_atr_soft, trigger_str)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            symbol.upper()[:10], cluster[:20], entry_date, exit_date,
+            float(entry_price),
+            float(sl_price) if sl_price else None,
+            vni_atr_soft[:10] if vni_atr_soft else None,
+            trigger_str[:500] if trigger_str else None,
+        ))
+        row = cur.fetchone()
+        jid = int(row[0]) if row else -1
+        conn.commit()
+        logger.info(f"[ClusterJournal] Added #{jid} {symbol} {cluster} entry={entry_date}")
+        return jid
+    except Exception as e:
+        logger.error(f"journal_add_signal error: {e}")
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+        return -1
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
+
+
+def journal_close_signal(journal_id, exit_price, outcome, notes=None) -> bool:
+    """Cập nhật outcome khi signal đến exit_date hoặc chạm SL."""
+    conn = None
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("SELECT entry_price FROM cluster_journal WHERE id=%s", (journal_id,))
+        row = cur.fetchone()
+        if not row:
+            return False
+        pnl_pct = (exit_price - float(row[0])) / float(row[0]) * 100
+        cur.execute("""
+            UPDATE cluster_journal
+               SET exit_price=%s, outcome=%s, pnl_pct=%s,
+                   notes=COALESCE(%s, notes), updated_at=NOW()
+             WHERE id=%s
+        """, (float(exit_price), outcome[:10], round(pnl_pct,2), notes, journal_id))
+        conn.commit()
+        logger.info(f"[ClusterJournal] Closed #{journal_id} {outcome} pnl={pnl_pct:.2f}%")
+        return True
+    except Exception as e:
+        logger.error(f"journal_close_signal error: {e}")
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+        return False
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
+
+
+def journal_get_active() -> list:
+    """Trả về tất cả signals đang PENDING."""
+    conn = None
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT id, symbol, cluster, entry_date, exit_date,
+                   entry_price, sl_price, vni_atr_soft, trigger_str
+              FROM cluster_journal
+             WHERE outcome = 'PENDING'
+             ORDER BY entry_date DESC
+        """)
+        cols = ["id","symbol","cluster","entry_date","exit_date",
+                "entry_price","sl_price","vni_atr_soft","trigger_str"]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+    except Exception as e:
+        logger.error(f"journal_get_active error: {e}")
+        return []
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
+
+
+def journal_get_stats(days=90) -> dict:
+    """Thống kê performance trong N ngày gần nhất."""
+    conn = None
+    try:
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT cluster,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN outcome='WIN'  THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END) AS losses,
+                   ROUND(AVG(pnl_pct)::numeric, 2) AS avg_pnl,
+                   ROUND(MAX(pnl_pct)::numeric, 2) AS best,
+                   ROUND(MIN(pnl_pct)::numeric, 2) AS worst
+              FROM cluster_journal
+             WHERE outcome IN ('WIN','LOSS','EXPIRED')
+               AND entry_date >= CURRENT_DATE - INTERVAL '1 day' * %s
+             GROUP BY cluster
+        """, (days,))
+        by_cluster = {}
+        total_all = wins_all = losses_all = 0
+        for cluster, total, wins, losses, avg_pnl, best, worst in cur.fetchall():
+            by_cluster[cluster] = {
+                "total": total, "wins": wins, "losses": losses,
+                "win_rate": round(wins/total*100,1) if total else 0,
+                "avg_pnl": float(avg_pnl or 0),
+                "best": float(best or 0), "worst": float(worst or 0),
+            }
+            total_all += total; wins_all += wins; losses_all += losses
+        return {
+            "total": total_all, "wins": wins_all, "losses": losses_all,
+            "win_rate": round(wins_all/total_all*100,1) if total_all else 0,
+            "by_cluster": by_cluster, "days": days,
+        }
+    except Exception as e:
+        logger.error(f"journal_get_stats error: {e}")
+        return {}
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
