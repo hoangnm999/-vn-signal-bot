@@ -378,15 +378,22 @@ def run():
     for idx, sym in enumerate(candidates, 1):
         print(f"[{idx:>3}/{total}] {sym}", end=" ... ", flush=True)
 
-        # Load data
-        try:
-            df = load_vn_ohlcv(sym, days=2500, min_bars=400)
-            if df is None or len(df) < 400:
-                print("skip (data)")
-                skipped.append(sym)
-                continue
-        except Exception as e:
-            print(f"skip ({e})")
+        # Load data (với retry nếu rate limit)
+        df = None
+        for attempt in range(3):
+            try:
+                df = load_vn_ohlcv(sym, days=2500, min_bars=400)
+                break
+            except Exception as e:
+                err_str = str(e).lower()
+                if "rate limit" in err_str or "60" in err_str:
+                    wait = 65 * (attempt + 1)
+                    print(f"rate limit, wait {wait}s...", end=" ", flush=True)
+                    time.sleep(wait)
+                else:
+                    break
+        if df is None or len(df) < 400:
+            print("skip (data)")
             skipped.append(sym)
             continue
 
@@ -440,7 +447,7 @@ def run():
             failed.append({"sym": sym, "cluster": cluster,
                            "reason": f"WF {wf['status']}", "bt": bt, "wf": wf})
 
-        time.sleep(0.5)  # tránh rate limit
+        time.sleep(1.1)  # rate limit: 60 req/phút
 
     # ── Final Report ──────────────────────────────────────────────────────────
     print(f"\n\n{'='*65}")
@@ -544,18 +551,26 @@ def _get_hose_universe(load_vn_ohlcv) -> list[str]:
     for i, sym in enumerate(all_symbols):
         if i % 50 == 0:
             logger.info(f"  Progress: {i}/{len(all_symbols)}...")
-        try:
-            df = load_vn_ohlcv(sym, days=40, min_bars=20)
-            if df is None or len(df) < 20:
-                continue
-            close = df["close"].values[-20:].astype(float)
-            vol   = df["volume"].values[-20:].astype(float)
-            avg_vnd = float((vol * close).mean()) * 1000  # × 1000 vì giá lưu dạng nghìn
-            if avg_vnd >= MIN_VOL_BILLION * 1e9:
-                vol_map[sym] = avg_vnd
-        except Exception:
-            continue
-        time.sleep(0.1)
+        for attempt in range(3):  # retry tối đa 3 lần
+            try:
+                df = load_vn_ohlcv(sym, days=40, min_bars=20)
+                if df is None or len(df) < 20:
+                    break
+                close = df["close"].values[-20:].astype(float)
+                vol   = df["volume"].values[-20:].astype(float)
+                avg_vnd = float((vol * close).mean()) * 1000
+                if avg_vnd >= MIN_VOL_BILLION * 1e9:
+                    vol_map[sym] = avg_vnd
+                break  # thành công → thoát retry loop
+            except Exception as e:
+                err_str = str(e).lower()
+                if "rate limit" in err_str or "60" in err_str:
+                    wait = 65 * (attempt + 1)  # 65s, 130s, 195s
+                    logger.warning(f"  Rate limit hit at {sym}, waiting {wait}s...")
+                    time.sleep(wait)
+                else:
+                    break  # lỗi khác → bỏ qua
+        time.sleep(1.1)  # rate limit: 60 req/phút → 1.1s/req
 
     # Sort và lấy top N
     sorted_syms = sorted(vol_map, key=vol_map.get, reverse=True)  # lấy tất cả đủ volume
