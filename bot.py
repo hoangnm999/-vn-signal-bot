@@ -106,13 +106,6 @@ except ImportError:
     logger.warning("analog_cmd.py chua co — /analog bi tat")
 
 try:
-    from batch_scanner import scan_watchlist_cmd, _start_scan_cron, _start_hose_cron, scan_hose_cmd
-    _BATCH_SCANNER = True
-except ImportError:
-    _BATCH_SCANNER = False
-    logger.warning("batch_scanner.py chua co — /scan_watchlist bi tat")
-
-try:
     from cluster_scanner import cluster_scan_cmd, _start_cluster_scan_cron
     _CLUSTER_SCANNER = True
     logger.info("cluster_scanner.py loaded OK")
@@ -376,8 +369,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/scan              — Quet nhanh RSI + Volume watchlist\n"
         "/deepscan          — 16 engines toan watchlist (5-15 phut)\n"
         "/check_all         — Check nhanh tat ca ma trong watchlist\n"
-        "/scan_watchlist    — Scan co ban theo watchlist\n"
-        "/scan_hose         — Scan toan bo HOSE (top N ma)\n\n"
+        "/cluster_scan      — Scan cluster signals (MR + Momentum)\n\n"
 
         "🌊 SONG GIA & THI TRUONG\n"
         "──────────────────────\n"
@@ -1632,9 +1624,6 @@ def main():
     if _ANALOG_SIGNAL:
         app.add_handler(CommandHandler("signal_status",  signal_status_cmd))
         app.add_handler(CommandHandler("signal_history", signal_history_cmd))
-    if _BATCH_SCANNER:
-        app.add_handler(CommandHandler("scan_watchlist", scan_watchlist_cmd))
-        app.add_handler(CommandHandler("scan_hose",      scan_hose_cmd))
     if _CLUSTER_SCANNER:
         app.add_handler(CommandHandler("cluster_scan",   cluster_scan_cmd))
     if _WAVE_PATTERN:
@@ -1659,36 +1648,29 @@ def main():
 
     async def post_init(application):
         asyncio.create_task(_start_cron())
-        if _BATCH_SCANNER:
-            # Fix: đọc ALLOWED_CHAT_IDS (tên env var chuẩn theo _allowed_ids())
-            # Fallback: ALLOWED_IDS (tên cũ) và CHAT_ID (user chính)
-            _raw_ids = (
-                os.environ.get("ALLOWED_CHAT_IDS", "") or
-                os.environ.get("ALLOWED_IDS", "") or
-                os.environ.get("CHAT_ID", "")
-            )
-            _scan_ids = [
-                int(x.strip()) for x in _raw_ids.split(",")
-                if x.strip().lstrip("-").isdigit()
-            ]
-            if _scan_ids:
-                # Cluster scanner mới (08:30 + 12:30 VN) — thay thế scan cũ
-                if _CLUSTER_SCANNER:
-                    asyncio.create_task(_start_cluster_scan_cron(application.bot, _scan_ids))
-                    logger.info(f"ClusterScanCron: {len(_scan_ids)} chat_ids, 08:30+12:30 VN daily")
-                # Cron cũ — disabled (thay bằng cluster_scanner)
-                # asyncio.create_task(_start_scan_cron(application.bot, _scan_ids))
-                # asyncio.create_task(_start_hose_cron(application.bot, _scan_ids))
-            else:
-                logger.warning("ScanCron: khong co chat_id nao — set ALLOWED_CHAT_IDS de nhan bao cao sang")
+        # Cluster scanner — đọc chat_ids từ env vars
+        _raw_ids = (
+            os.environ.get("ALLOWED_CHAT_IDS", "") or
+            os.environ.get("ALLOWED_IDS", "") or
+            os.environ.get("CHAT_ID", "")
+        )
+        _scan_ids = [
+            int(x.strip()) for x in _raw_ids.split(",")
+            if x.strip().lstrip("-").isdigit()
+        ]
+        if _CLUSTER_SCANNER and _scan_ids:
+            asyncio.create_task(_start_cluster_scan_cron(application.bot, _scan_ids))
+            logger.info(f"ClusterScanCron: {len(_scan_ids)} chat_ids, 08:30+12:30 VN daily")
+        elif not _scan_ids:
+            logger.warning("ClusterScanCron: khong co chat_id — set ALLOWED_CHAT_IDS")
         if _ALERT_AVAILABLE:
             asyncio.create_task(_start_alert_cron(application))
         if _PORTFOLIO:
-            asyncio.create_task(_start_portfolio_cron(application.bot, _scan_ids if _BATCH_SCANNER else []))
+            asyncio.create_task(_start_portfolio_cron(application.bot, _scan_ids))
         if _MORNING:
-            asyncio.create_task(_start_morning_cron(application.bot, _scan_ids if _BATCH_SCANNER else []))
+            asyncio.create_task(_start_morning_cron(application.bot, _scan_ids))
         if _ANALOG_SIGNAL:
-            _signal_ids = _scan_ids if _BATCH_SCANNER else []
+            _signal_ids = _scan_ids
             if _signal_ids:
                 asyncio.create_task(_start_signal_cron(application.bot, _signal_ids))
                 logger.info(f"AnalogSignalCron: {len(_signal_ids)} chat_ids, 15:30 VN daily")
