@@ -31,13 +31,10 @@ from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CLUSTER_ASSIGNMENTS = {
-    "Mean Reversion": ["DCM", "NKG", "DPM", "HAH",
-                       "HCM", "HSG", "DGC", "GAS",
-                       "SSI", "VHM", "VND", "NVL"],
-    "Momentum":       ["VCB", "BID", "MBB", "MWG",
-                       "CTG", "FRT", "REE", "FPT",
-                       "GMD", "STB", "PNJ", "TCB",
-                       "HPG", "KDH", "PC1"],
+    # Clean watchlist — chỉ mã đã pass WF (WF_Exp > 0 và WFE > 0)
+    # Loại: VND, NVL (MR WF_Exp âm) | PC1, HPG, KDH (MOM WFE âm)
+    "Mean Reversion": ['DCM', 'NKG', 'DPM', 'HAH', 'HCM', 'HSG', 'DGC', 'GAS', 'SSI', 'VHM'],
+    "Momentum":       ['VCB', 'BID', 'MBB', 'MWG', 'CTG', 'FRT', 'REE', 'FPT', 'GMD', 'STB', 'PNJ', 'TCB'],
 }
 
 FWD_CONFIG = {
