@@ -113,6 +113,14 @@ except ImportError:
     logger.warning("batch_scanner.py chua co — /scan_watchlist bi tat")
 
 try:
+    from cluster_scanner import cluster_scan_cmd, _start_cluster_scan_cron
+    _CLUSTER_SCANNER = True
+    logger.info("cluster_scanner.py loaded OK")
+except ImportError:
+    _CLUSTER_SCANNER = False
+    logger.warning("cluster_scanner.py chua co — /cluster_scan bi tat")
+
+try:
     from wave_pattern import wave_cmd
     _WAVE_PATTERN = True
 except ImportError:
@@ -1627,6 +1635,8 @@ def main():
     if _BATCH_SCANNER:
         app.add_handler(CommandHandler("scan_watchlist", scan_watchlist_cmd))
         app.add_handler(CommandHandler("scan_hose",      scan_hose_cmd))
+    if _CLUSTER_SCANNER:
+        app.add_handler(CommandHandler("cluster_scan",   cluster_scan_cmd))
     if _WAVE_PATTERN:
         app.add_handler(CommandHandler("wave", wave_cmd))
     if _MARKET_REGIME:
@@ -1662,10 +1672,13 @@ def main():
                 if x.strip().lstrip("-").isdigit()
             ]
             if _scan_ids:
-                asyncio.create_task(_start_scan_cron(application.bot, _scan_ids))
-                logger.info(f"ScanCron: {len(_scan_ids)} chat_ids, 08:00 daily")
-                asyncio.create_task(_start_hose_cron(application.bot, _scan_ids))
-                logger.info(f"HoseCron: {len(_scan_ids)} chat_ids, 04:00 daily (HOSE top {os.environ.get('HOSE_TOP_N', 200)} ma)")
+                # Cluster scanner mới (08:30 + 12:30 VN) — thay thế scan cũ
+                if _CLUSTER_SCANNER:
+                    asyncio.create_task(_start_cluster_scan_cron(application.bot, _scan_ids))
+                    logger.info(f"ClusterScanCron: {len(_scan_ids)} chat_ids, 08:30+12:30 VN daily")
+                # Cron cũ — disabled (thay bằng cluster_scanner)
+                # asyncio.create_task(_start_scan_cron(application.bot, _scan_ids))
+                # asyncio.create_task(_start_hose_cron(application.bot, _scan_ids))
             else:
                 logger.warning("ScanCron: khong co chat_id nao — set ALLOWED_CHAT_IDS de nhan bao cao sang")
         if _ALERT_AVAILABLE:
