@@ -580,6 +580,54 @@ def _format_afternoon_update(
 
 # ── Main scan functions ───────────────────────────────────────────────────────
 
+
+# ── Journal auto-logging (S31) ────────────────────────────────────────────────
+
+def _journal_log_signals(signals: list, vni_info: dict) -> None:
+    """
+    Ghi danh sách signals vào cluster_journal.
+    Bỏ qua nếu symbol đã có PENDING entry hôm nay (tránh duplicate từ cron 08:30 + 12:30).
+    """
+    if not signals:
+        return
+    try:
+        from db import journal_add_signal, journal_get_active
+        from datetime import date as _date
+        today = _date.today()
+
+        # Lấy set symbols đang PENDING để tránh duplicate
+        active = journal_get_active()
+        pending_today = {
+            r["symbol"] for r in active
+            if r["entry_date"] == today
+        }
+
+        vni_strong = vni_info.get("is_high", None)
+        vni_soft   = "STRONG" if vni_strong else ("WEAK" if vni_strong is False else None)
+
+        for sig in signals:
+            sym = sig["symbol"]
+            if sym in pending_today:
+                logger.info(f"[Journal] {sym} da co PENDING hom nay, bo qua")
+                continue
+            jid = journal_add_signal(
+                symbol       = sym,
+                cluster      = sig["cluster"],
+                entry_date   = today,
+                entry_price  = sig["entry_price"],
+                fwd_days     = sig["fwd_days"],
+                sl_price     = sig.get("sl_price"),
+                vni_atr_soft = vni_soft if sig["cluster"] == "Mean Reversion" else None,
+                trigger_str  = sig.get("trigger_str"),
+            )
+            if jid > 0:
+                logger.info(f"[Journal] Logged #{jid} {sym} {sig['cluster']}")
+            else:
+                logger.warning(f"[Journal] Failed to log {sym}")
+    except Exception as e:
+        logger.warning(f"[Journal] Auto-log failed (non-critical): {e}")
+
+
 def run_morning_scan() -> tuple[list[str], dict]:
     """
     Chạy full scan cho cả 2 cluster.
@@ -618,6 +666,9 @@ def run_morning_scan() -> tuple[list[str], dict]:
             "scan_time":     sig["scan_time"],
             "last_date":     sig["last_date"],
         }
+
+    # Ghi vao cluster_journal (S31)
+    _journal_log_signals(mr_signals + mom_signals, vni_info)
 
     total = len(mr_signals) + len(mom_signals)
     logger.info(f"[Scanner] Morning scan done: {total} signals "
@@ -689,6 +740,8 @@ def run_afternoon_update() -> list[str] | None:
 
     if new_signals:
         logger.info(f"[Scanner] Afternoon: {len(new_signals)} new signals")
+        # Ghi signals moi buoi chieu vao journal (S31)
+        _journal_log_signals(new_signals, vni_info)
 
     return _format_afternoon_update(new_signals, morning_updates, vni_info)
 
