@@ -80,6 +80,13 @@ SIGNAL_CONFIG = {
 }
 
 
+# ── VNI Filter config ────────────────────────────────────────────────────────
+# Chỉ áp dụng cho MR cluster (Momentum không có VNI feature đủ mạnh)
+VNI_FILTER_CLUSTERS = {"Mean Reversion"}   # set các cluster dùng VNI filter
+VNI_FILTER_FEATURE  = "vni_atr_ratio"      # feature đã validate
+# Threshold tính từ median của training period mỗi fold (expanding window)
+
+
 # ── Indicator computation ─────────────────────────────────────────────────────
 
 def _ema(c, span):
@@ -159,6 +166,67 @@ def compute_thresholds(train_rows: list[dict], cfg: dict) -> dict:
     return {"reg_thresh": reg_thresh, "trig_thresh": trig_thresh}
 
 
+# ── VN-Index loader + ATR ratio ──────────────────────────────────────────────
+
+_vni_cache = {}   # cache để không load lại nhiều lần
+
+def load_vni_atr_ratio() -> dict[str, float] | None:
+    """
+    Load VN-Index, tính ATR ratio theo ngày.
+    Trả về dict: date_str → atr_ratio
+    Cache kết quả để dùng chung.
+    """
+    global _vni_cache
+    if _vni_cache:
+        return _vni_cache
+
+    try:
+        from vn_loader import load_vn_ohlcv
+        df = load_vn_ohlcv("VNINDEX", days=2500, min_bars=300)
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.reset_index(drop=True)
+
+        close = df["close"].values.astype(float) * 1000  # → điểm thật
+        h_prev= np.concatenate([[close[0]], close[:-1]])
+        tr    = np.abs(close - h_prev)
+        atr14 = pd.Series(tr).rolling(14, min_periods=14).mean().values
+
+        result = {}
+        for i, row in df.iterrows():
+            d = str(row["date"])[:10]
+            if np.isfinite(atr14[i]) and close[i] > 0:
+                result[d] = float(atr14[i] / close[i] * 100)
+            else:
+                result[d] = 0.0
+
+        _vni_cache = result
+        print(f"    VNI ATR loaded: {len(result)} days")
+        return result
+    except Exception as e:
+        print(f"    ERROR load VNI: {e}")
+        return None
+
+
+def get_vni_atr_for_dates(date_list: list[str],
+                           vni_atr_map: dict) -> dict[str, float]:
+    """
+    Forward-fill VNI ATR ratio cho danh sách dates của stock.
+    Nếu ngày T không có trong VNI (nghỉ lễ) → dùng ngày trading gần nhất.
+    """
+    if not vni_atr_map:
+        return {}
+    sorted_dates = sorted(vni_atr_map.keys())
+    result = {}
+    last_val = 0.0
+    vni_ptr  = 0
+    for d in sorted(date_list):
+        while vni_ptr < len(sorted_dates) and sorted_dates[vni_ptr] <= d:
+            last_val = vni_atr_map[sorted_dates[vni_ptr]]
+            vni_ptr += 1
+        result[d] = last_val
+    return result
+
+
 # ── Signal detection trên một period ─────────────────────────────────────────
 
 def run_period(
@@ -169,8 +237,13 @@ def run_period(
     cfg: dict,
     thresholds: dict,
     fwd_days: int,
+    date_map: dict | None = None,       # idx → date_str (cho VNI filter)
+    vni_date_atr: dict | None = None,   # date_str → vni_atr_ratio
+    vni_thresh: float | None = None,    # threshold VNI ATR (None = no filter)
 ) -> list[dict]:
-    """Chạy signal detection trên test_indices với threshold cho trước."""
+    """Chạy signal detection trên test_indices với threshold cho trước.
+    Nếu vni_thresh không None → check VNI ATR >= vni_thresh trước khi check regime.
+    """
     reg_ind    = cfg["regime_indicator"]
     reg_cond   = cfg["regime_condition"]
     trig_ind   = cfg["trigger_indicators"]
@@ -189,6 +262,13 @@ def run_period(
         # Cooldown
         if last_signal and (t_idx - last_signal) < WF_COOLDOWN:
             continue
+
+        # VNI ATR filter (chỉ cho MR cluster, nếu được bật)
+        if vni_thresh is not None and date_map and vni_date_atr:
+            date_str = date_map.get(t_idx, "")
+            vni_val  = vni_date_atr.get(date_str, 0.0)
+            if vni_val < vni_thresh:
+                continue  # skip toàn bộ ngày này
 
         # Regime
         val = row.get(reg_ind, np.nan)
@@ -297,11 +377,21 @@ def walk_forward_symbol(symbol: str, cluster: str) -> dict | None:
     all_rows = compute_indicators(df_full)
     ind_map  = {r["idx"]: r for r in all_rows}
 
-    # Tạo date → index map
+    # date → index map và index → date map
     date_to_idx = {str(row["date"])[:10]: i
+                   for i, row in df_full.iterrows()}
+    idx_to_date = {i: str(row["date"])[:10]
                    for i, row in df_full.iterrows()}
 
     folds = build_folds(df_full)
+
+    # VNI filter setup (chỉ cho MR cluster)
+    use_vni_filter = cluster in VNI_FILTER_CLUSTERS
+    vni_atr_map    = load_vni_atr_ratio() if use_vni_filter else None
+
+    # Forward-fill VNI ATR cho tất cả dates của stock
+    stock_dates      = [str(df_full["date"].iloc[i])[:10] for i in range(len(df_full))]
+    vni_date_atr_all = get_vni_atr_for_dates(stock_dates, vni_atr_map or {})                        if use_vni_filter and vni_atr_map else {}
 
     # Training baseline (toàn bộ 2019-2024, step=3)
     train_mask  = (df_full["date"] >= WF_TRAIN_START) & \
@@ -312,11 +402,25 @@ def walk_forward_symbol(symbol: str, cluster: str) -> dict | None:
     if len(train_rows) < MIN_TRAIN_BARS:
         return {"symbol": symbol, "error": "Khong du training data"}
 
-    train_thresh   = compute_thresholds(train_rows, cfg)
-    train_signals  = run_period(
-        ind_map, close_arr, train_idx[::3], n_bars, cfg, train_thresh, fwd
+    train_thresh = compute_thresholds(train_rows, cfg)
+
+    # VNI threshold từ training (median ATR ratio toàn training)
+    vni_train_thresh = None
+    if use_vni_filter and vni_date_atr_all:
+        train_vni_vals = [
+            vni_date_atr_all.get(str(df_full["date"].iloc[i])[:10], 0.0)
+            for i in train_idx
+            if vni_date_atr_all.get(str(df_full["date"].iloc[i])[:10], 0.0) > 0
+        ]
+        vni_train_thresh = float(np.median(train_vni_vals)) if train_vni_vals else None
+
+    train_signals = run_period(
+        ind_map, close_arr, train_idx[::3], n_bars, cfg, train_thresh, fwd,
+        date_map=idx_to_date,
+        vni_date_atr=vni_date_atr_all,
+        vni_thresh=vni_train_thresh,
     )
-    train_metrics  = calc_metrics(train_signals)
+    train_metrics = calc_metrics(train_signals)
 
     # Walk forward folds
     fold_results = []
@@ -339,9 +443,23 @@ def walk_forward_symbol(symbol: str, cluster: str) -> dict | None:
         if not fold_train_rows:
             continue
 
-        fold_thresh  = compute_thresholds(fold_train_rows, cfg)
+        fold_thresh = compute_thresholds(fold_train_rows, cfg)
+
+        # VNI threshold cho fold (median ATR từ training period của fold)
+        fold_vni_thresh = None
+        if use_vni_filter and vni_date_atr_all:
+            fold_vni_vals = [
+                vni_date_atr_all.get(str(df_full["date"].iloc[i])[:10], 0.0)
+                for i in fold_train_idx
+                if vni_date_atr_all.get(str(df_full["date"].iloc[i])[:10], 0.0) > 0
+            ]
+            fold_vni_thresh = float(np.median(fold_vni_vals)) if fold_vni_vals else None
+
         fold_signals = run_period(
-            ind_map, close_arr, fold_test_idx, n_bars, cfg, fold_thresh, fwd
+            ind_map, close_arr, fold_test_idx, n_bars, cfg, fold_thresh, fwd,
+            date_map=idx_to_date,
+            vni_date_atr=vni_date_atr_all,
+            vni_thresh=fold_vni_thresh,
         )
         fold_metrics = calc_metrics(fold_signals)
 
@@ -637,6 +755,8 @@ def main():
           f"First test: {WF_FIRST_TEST}")
     print(f"MR FWD={FWD_CONFIG['Mean Reversion']}d | "
           f"MOM FWD={FWD_CONFIG['Momentum']}d")
+    print(f"VNI Filter: ON for {VNI_FILTER_CLUSTERS} | "
+          f"Feature: {VNI_FILTER_FEATURE}")
     print(f"WFE target: >0.70")
     print(f"{'='*70}")
 
