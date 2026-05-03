@@ -25,9 +25,12 @@ logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MR_SYMBOLS  = ["DCM", "NKG", "DPM", "HAH", "HCM", "HSG", "DGC", "GAS"]
-MOM_SYMBOLS = ["VCB", "BID", "MBB", "MWG", "CTG", "FRT", "REE", "FPT",
-               "GMD", "STB", "PNJ", "TCB"]
+# Chỉ backtest 18 mã MỚI từ S31 expand (20 mã cũ đã có kết quả rồi)
+MR_SYMBOLS  = ["NLG", "HDB", "BMP"]
+MOM_SYMBOLS = [
+    "SSI", "VND", "VIX", "CTS", "VCI", "HAG", "BCM",
+    "ORS", "BSR", "VSC", "DIG", "LPB", "FTS", "APG", "VDS",
+]
 
 FWD_DAYS = {"Mean Reversion": 20, "Momentum": 10}
 
