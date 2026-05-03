@@ -358,5 +358,77 @@ def run_analysis(symbol: str) -> dict:
 
 if __name__ == "__main__":
     symbols = sys.argv[1:] if len(sys.argv) > 1 else ["MWG"]
+
+    # Chạy tất cả window để so sánh
+    windows = [2, 5, 10, 15]
+
     for sym in symbols:
-        run_analysis(sym.upper())
+        sym = sym.upper()
+        print(f"\n{'#'*60}")
+        print(f"# SO SANH FWD_DAYS — {sym}")
+        print(f"{'#'*60}")
+
+        # Summary table
+        summary = {}  # fwd_days -> list of (indicator, cohen_d)
+
+        for fwd in windows:
+            global FWD_DAYS, GOOD_THRESH, BAD_THRESH
+            FWD_DAYS = fwd
+
+            # Load data 1 lần
+            try:
+                from vn_loader import load_vn_ohlcv
+                import pandas as pd
+                df = load_vn_ohlcv(sym, days=2000, min_bars=200)
+                df["date"] = pd.to_datetime(df["date"])
+                train_df = df[
+                    (df["date"] >= TRAIN_START) &
+                    (df["date"] <= TRAIN_END)
+                ].reset_index(drop=True)
+            except Exception as e:
+                print(f"ERROR: {e}")
+                break
+
+            ind_df = compute_all_indicators(train_df)
+            full_close = train_df["close"].values.astype(float)
+            fwd_rets = []
+            for i in ind_df["idx"].values:
+                fwd_idx = i + fwd
+                if fwd_idx >= len(train_df):
+                    fwd_rets.append(float("nan"))
+                else:
+                    ret = (full_close[fwd_idx] - full_close[i]) / full_close[i] * 100
+                    fwd_rets.append(ret)
+
+            ind_df["fwd_return"] = fwd_rets
+            ind_df = ind_df.dropna(subset=["fwd_return"])
+            ind_df["label"] = ind_df["fwd_return"].apply(
+                lambda r: "GOOD" if r >= GOOD_THRESH else ("BAD" if r <= BAD_THRESH else "NEUTRAL")
+            )
+
+            n_good = (ind_df["label"] == "GOOD").sum()
+            n_bad  = (ind_df["label"] == "BAD").sum()
+            analysis = analyze_indicators(ind_df)
+            summary[fwd] = analysis
+
+            # In top 5 cho window này
+            print(f"\nFWD={fwd:2d}d | GOOD={n_good}({n_good/len(ind_df)*100:.0f}%) BAD={n_bad}({n_bad/len(ind_df)*100:.0f}%)")
+            print(f"  {'Indicator':<16} {'Cohen_d':>8}  {'Strength'}")
+            print(f"  {'-'*38}")
+            for r in analysis[:5]:
+                print(f"  {r['indicator']:<16} {r['cohen_d']:>+8.3f}  {r['strength']}")
+
+        # So sánh chỉ số nào ổn định nhất qua các window
+        print(f"\n{'='*55}")
+        print(f"ON DINH QUA CAC WINDOW — {sym}")
+        print(f"{'Indicator':<16} " + " ".join(f"FWD={w:2d}" for w in windows) + "  AVG_ABS")
+        print("-" * 55)
+        for ind in ALL_INDICATORS:
+            scores = []
+            for fwd in windows:
+                s = next((r["cohen_d"] for r in summary[fwd] if r["indicator"] == ind), 0)
+                scores.append(s)
+            avg_abs = sum(abs(s) for s in scores) / len(scores)
+            row = f"{ind:<16} " + " ".join(f"{s:>+7.3f}" for s in scores) + f"  {avg_abs:.3f}"
+            print(row)
+        print("="*55)
