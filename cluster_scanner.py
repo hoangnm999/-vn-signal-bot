@@ -138,14 +138,20 @@ SL_CONFIG = {
 }
 
 # Trailing Stop config — validated từ backtest + walk forward (S31)
-# Chỉ áp dụng cho 4 mã đã pass validation, còn lại dùng Time Stop thuần
 # activation_pct: % gain tối thiểu để kích hoạt trailing
 # mult: SL trail = peak_price - mult × ATR14
 TRAIL_CONFIG = {
-    "GAS": {"mult": 3.0, "activation_pct": 9.25},   # MR  | WFE=7.42 consistency=80%
-    "CTG": {"mult": 2.5, "activation_pct": 3.97},   # MOM | WFE=1.53 consistency=100%
-    "REE": {"mult": 1.5, "activation_pct": 4.19},   # MOM | WFE=0.85 consistency=60%
-    "GMD": {"mult": 2.0, "activation_pct": 6.15},   # MOM | WFE=3.63 consistency=100%
+    # S30 original (20 ma)
+    "GAS": {"mult": 3.0, "activation_pct": 9.25},   # MR  | WFE=7.42  consistency=80%
+    "CTG": {"mult": 2.5, "activation_pct": 3.97},   # MOM | WFE=1.53  consistency=100%
+    "REE": {"mult": 1.5, "activation_pct": 4.19},   # MOM | WFE=0.85  consistency=60%
+    "GMD": {"mult": 2.0, "activation_pct": 6.15},   # MOM | WFE=3.63  consistency=100%
+    # S31 expand (18 ma moi)
+    "BMP": {"mult": 2.0, "activation_pct": 5.01},   # MR  | WFE=1.51  consistency=80%
+    "CTS": {"mult": 2.5, "activation_pct": 5.26},   # MOM | WFE=2.89  consistency=80%
+    "HAG": {"mult": 2.0, "activation_pct": 4.60},   # MOM | WFE=357.5 consistency=80%
+    "BCM": {"mult": 1.0, "activation_pct": 5.75},   # MOM | WFE=3.52  consistency=80%
+    "APG": {"mult": 1.5, "activation_pct": 5.90},   # MOM | WFE=2.69  consistency=80%
 }
 
 # Account size để tính position sizing (VND)
