@@ -673,13 +673,25 @@ def run():
 
     for idx, sym in enumerate(universe, 1):
         print(f"  [{idx:>3}/{len(universe)}] {sym}...", end=" ", flush=True)
-        try:
-            df = load_vn_ohlcv(sym, days=2500, min_bars=400)
-            if df is None or len(df) < 400:
-                print("skip")
-                continue
-            df_cache[sym] = df
+        df = None
+        for attempt in range(3):
+            try:
+                df = load_vn_ohlcv(sym, days=2500, min_bars=400)
+                break
+            except Exception as e:
+                err = str(e).lower()
+                if "rate limit" in err or "60" in err:
+                    wait = 65 * (attempt + 1)
+                    print(f"rate limit, wait {wait}s...", end=" ", flush=True)
+                    time.sleep(wait)
+                else:
+                    break
+        if df is None or len(df) < 400:
+            print("skip")
+            continue
+        df_cache[sym] = df
 
+        try:
             df_feat = compute_features(df)
             if df_feat is None:
                 print("skip (features)")
@@ -694,7 +706,7 @@ def run():
             print(f"OK (short={sig['n_short']}, long={sig['n_long']})")
         except Exception as e:
             print(f"ERROR: {e}")
-        time.sleep(0.3)
+        time.sleep(1.1)  # 60 req/phút → 1.1s/req
 
     print(f"\n  → {len(signatures)} mã có đủ signature data")
 
@@ -856,18 +868,26 @@ def _get_universe(load_vn_ohlcv) -> list[str]:
     for i, sym in enumerate(all_symbols):
         if i % 50 == 0:
             logger.info(f"  {i}/{len(all_symbols)}...")
-        try:
-            df = load_vn_ohlcv(sym, days=40, min_bars=20)
-            if df is None or len(df) < 20:
-                continue
-            close = df["close"].values[-20:].astype(float)
-            vol   = df["volume"].values[-20:].astype(float)
-            avg_vnd = float((vol * close).mean()) * 1000
-            if avg_vnd >= MIN_VOL_BILLION * 1e9:
-                vol_map[sym] = avg_vnd
-        except Exception:
-            continue
-        time.sleep(0.1)
+        for attempt in range(3):
+            try:
+                df = load_vn_ohlcv(sym, days=40, min_bars=20)
+                if df is None or len(df) < 20:
+                    break
+                close = df["close"].values[-20:].astype(float)
+                vol   = df["volume"].values[-20:].astype(float)
+                avg_vnd = float((vol * close).mean()) * 1000
+                if avg_vnd >= MIN_VOL_BILLION * 1e9:
+                    vol_map[sym] = avg_vnd
+                break
+            except Exception as e:
+                err = str(e).lower()
+                if "rate limit" in err or "60" in err:
+                    wait = 65 * (attempt + 1)
+                    logger.warning(f"  Rate limit at {sym}, wait {wait}s...")
+                    time.sleep(wait)
+                else:
+                    break
+        time.sleep(1.1)
 
     return sorted(vol_map, key=vol_map.get, reverse=True)
 
