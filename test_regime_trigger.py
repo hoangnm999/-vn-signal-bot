@@ -56,7 +56,14 @@ REGIME_CONFIG = {
 }
 
 # Trigger: chỉ số nhanh báo hiệu đột biến
-TRIGGER_INDICATORS = ["volume_spike", "candle_body", "momentum_5d", "stoch_k"]
+TRIGGER_INDICATORS = [
+    # Triggers goc
+    "volume_spike", "candle_body", "momentum_5d", "stoch_k",
+    # Triggers moi
+    "vol_directional",  # volume co huong: +cao = mua manh, -cao = ban manh
+    "price_break_20",   # gia gan dinh 20 ngay
+    "price_break_60",   # gia gan dinh 60 ngay
+]
 
 # Ngưỡng trigger: top 30% của phân phối = "đột biến"
 TRIGGER_PERCENTILE = 70
@@ -115,19 +122,33 @@ def compute_indicators(df):
 
         body = abs(px - opn[i]) / (atr_v + 1e-9)
 
+        # Volume co huong: duong = mua manh, am = ban manh
+        candle_dir = 1.0 if px > opn[i] else (-1.0 if px < opn[i] else 0.0)
+        vol_directional = float((vol[i]/(vs20v+1e-9)-1.0) * candle_dir)
+
+        # Price break: gia co gan dinh N ngay khong
+        hi20 = float(np.nanmax(high[max(i-19,0):i+1]))
+        hi60 = float(np.nanmax(high[max(i-59,0):i+1]))
+        price_break_20 = 1.0 if px >= hi20 * 0.99 else 0.0
+        price_break_60 = 1.0 if px >= hi60 * 0.99 else 0.0
+
         rows.append({
-            "idx":          i,
-            "date":         df["date"].iloc[i],
-            "close":        px,
-            # Regime indicators (chậm)
-            "atr_ratio":    float(atr_v/(px+1e-9)*100),
-            "trend_slope":  float((s20-s50)/(px+1e-9)*100),
-            "momentum_20d": float((px/close[max(i-20,0)]-1)*100),
-            # Trigger indicators (nhanh)
-            "volume_spike": float((vol[i]/(vs20v+1e-9))-1),
-            "candle_body":  float(np.clip(body, 0, 3)),
-            "momentum_5d":  float((px/(c5+1e-9)-1)*100),
-            "stoch_k":      float(stoch[i]),
+            "idx":              i,
+            "date":             df["date"].iloc[i],
+            "close":            px,
+            # Regime indicators (cham)
+            "atr_ratio":        float(atr_v/(px+1e-9)*100),
+            "trend_slope":      float((s20-s50)/(px+1e-9)*100),
+            "momentum_20d":     float((px/close[max(i-20,0)]-1)*100),
+            # Trigger goc (nhanh)
+            "volume_spike":     float((vol[i]/(vs20v+1e-9))-1),
+            "candle_body":      float(np.clip(body, 0, 3)),
+            "momentum_5d":      float((px/(c5+1e-9)-1)*100),
+            "stoch_k":          float(stoch[i]),
+            # Trigger moi
+            "vol_directional":  vol_directional,
+            "price_break_20":   price_break_20,
+            "price_break_60":   price_break_60,
         })
 
     return pd.DataFrame(rows)
@@ -288,6 +309,27 @@ def analyze_two_layer(symbol: str):
             f"Mean={mean_A2:+.2f}% WR={wr_A2:.1f}% "
             f"Lift={lift2:+.2f}%  {ket_luan2}"
         )
+
+    # ── So sanh trigger goc vs trigger moi ──────────────────────────────────
+    print(f"\n  So sanh nhom trigger:")
+    old_triggers = ["volume_spike", "candle_body", "momentum_5d", "stoch_k"]
+    new_triggers = ["vol_directional", "price_break_20", "price_break_60"]
+
+    old_res = [r for r in results if r["trigger"] in old_triggers]
+    new_res = [r for r in results if r["trigger"] in new_triggers]
+
+    if old_res:
+        best_old = max(old_res, key=lambda x: x["lift"])
+        print(f"  Trigger goc tot nhat : {best_old['trigger']:<16} "
+              f"Mean_A={best_old['mean_A']:+.2f}% Lift={best_old['lift']:+.2f}%")
+    if new_res:
+        best_new = max(new_res, key=lambda x: x["lift"])
+        print(f"  Trigger moi tot nhat : {best_new['trigger']:<16} "
+              f"Mean_A={best_new['mean_A']:+.2f}% Lift={best_new['lift']:+.2f}%")
+        if old_res and new_res:
+            diff = best_new["lift"] - best_old["lift"]
+            nhan = "Tot hon" if diff > 0.3 else ("Tuong duong" if diff > -0.3 else "Kem hon")
+            print(f"  Ket luan: Trigger moi {nhan} ({diff:+.2f}%)")
 
     # ── Kết luận tổng ─────────────────────────────────────────────────────────
     print(f"\n{'─'*60}")
