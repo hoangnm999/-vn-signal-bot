@@ -210,7 +210,30 @@ def analyze_two_layer(symbol: str):
     print(f"  So ngay trong regime: {n_regime}/{len(ind)} ({n_regime/len(ind)*100:.0f}%)")
 
     # ── Tầng 2: Xác định trigger ──────────────────────────────────────────────
-    print(f"\nTang 2 — Trigger (top {100-TRIGGER_PERCENTILE}% dot bien):")
+    print(f"\nTang 2 — Trigger (nguong theo y nghia kinh te):")
+    print(f"  momentum_5d  : top 30% CAO  = da tang manh")
+    print(f"  volume_spike : top 30% CAO  = volume dot bien")
+    print(f"  stoch_k      : bottom 30% THAP = oversold < 30")
+    print(f"  candle_body  : top 30% CAO + nen xanh = mua manh")
+    print(f"  vol_directional: top 30% CAO = volume mua manh")
+    print()
+
+    # Nguong va huong cho tung trigger
+    # momentum_5d  : top 30% cao  = da tang manh -> tiep tuc tang
+    # volume_spike : top 30% cao  = volume dot bien
+    # stoch_k      : bottom 30% thap = oversold (< 30) -> co the bounce
+    # candle_body  : top 30% cao VA nen xanh (px > open) -> mua manh
+    # vol_directional: top 30% cao = volume mua manh
+    # price_break  : = 1.0 (gia gan dinh)
+    TRIGGER_DIRECTION = {
+        "momentum_5d":     "high",   # cao = tot
+        "volume_spike":    "high",   # cao = tot
+        "stoch_k":         "low",    # thap = oversold = tot de mua
+        "candle_body":     "high_green",  # cao + nen xanh = tot
+        "vol_directional": "high",   # cao = mua manh
+        "price_break_20":  "high",   # = 1.0
+        "price_break_60":  "high",   # = 1.0
+    }
 
     best_combo = None
     best_lift  = -999
@@ -219,8 +242,23 @@ def analyze_two_layer(symbol: str):
 
     # Test từng trigger indicator
     for trig_col in TRIGGER_INDICATORS:
-        thresh = np.percentile(ind[trig_col].values, TRIGGER_PERCENTILE)
-        has_trigger = ind[trig_col] >= thresh
+        direction = TRIGGER_DIRECTION.get(trig_col, "high")
+
+        if direction == "low":
+            # Oversold: bottom 30% (duoi nguong thap)
+            thresh = np.percentile(ind[trig_col].values, 100 - TRIGGER_PERCENTILE)
+            has_trigger = ind[trig_col] <= thresh
+        elif direction == "high_green":
+            # Nen xanh + than lon
+            thresh = np.percentile(ind[trig_col].values, TRIGGER_PERCENTILE)
+            # Can biet open de xac dinh nen xanh — dung vol_directional > 0 lam proxy
+            if "vol_directional" in ind.columns:
+                has_trigger = (ind[trig_col] >= thresh) & (ind["vol_directional"] >= 0)
+            else:
+                has_trigger = ind[trig_col] >= thresh
+        else:
+            thresh = np.percentile(ind[trig_col].values, TRIGGER_PERCENTILE)
+            has_trigger = ind[trig_col] >= thresh
 
         # 4 nhóm
         grp_A = ind[in_regime  & has_trigger]["fwd_return"]   # regime + trigger
@@ -278,12 +316,23 @@ def analyze_two_layer(symbol: str):
     print(f"\n  Test ket hop nhieu trigger cung luc:")
 
     for n_trig in [2, 3]:
-        # Yêu cầu ít nhất n_trig triggers cùng lúc
-        trigger_cols = TRIGGER_INDICATORS
-        trigger_flags = pd.DataFrame({
-            col: ind[col] >= np.percentile(ind[col].values, TRIGGER_PERCENTILE)
-            for col in trigger_cols
-        })
+        # Yêu cầu ít nhất n_trig triggers cùng lúc — dùng đúng hướng
+        trigger_flags_dict = {}
+        for col in TRIGGER_INDICATORS:
+            direction = TRIGGER_DIRECTION.get(col, "high")
+            if direction == "low":
+                thresh = np.percentile(ind[col].values, 100 - TRIGGER_PERCENTILE)
+                trigger_flags_dict[col] = ind[col] <= thresh
+            elif direction == "high_green":
+                thresh = np.percentile(ind[col].values, TRIGGER_PERCENTILE)
+                if "vol_directional" in ind.columns:
+                    trigger_flags_dict[col] = (ind[col] >= thresh) & (ind["vol_directional"] >= 0)
+                else:
+                    trigger_flags_dict[col] = ind[col] >= thresh
+            else:
+                thresh = np.percentile(ind[col].values, TRIGGER_PERCENTILE)
+                trigger_flags_dict[col] = ind[col] >= thresh
+        trigger_flags = pd.DataFrame(trigger_flags_dict)
         n_triggers_active = trigger_flags.sum(axis=1)
         has_multi = n_triggers_active >= n_trig
 
