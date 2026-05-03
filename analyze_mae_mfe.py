@@ -454,6 +454,14 @@ def analyze_cluster(cluster: str, all_signals: list[dict]):
     # Nếu MAE <= SL → hit SL, nếu MFE >= TP → hit TP
     # Nếu cả hai → SL (conservative, vì không biết thứ tự)
 
+    # Tính thêm p25 MAE làm Catastrophic SL
+    mae_all_vals = [s["mae"] for s in all_signals]
+    sl_catastrophic = round(float(np.percentile(mae_all_vals, 25)), 2)
+    tp_median       = sl_tp.get("ALL", {}).get("tp", +7.0)
+
+    print(f"\n  Catastrophic SL (p25 MAE) = {sl_catastrophic:+.2f}%")
+    print(f"  TP median MFE             = {tp_median:+.2f}%")
+
     sim_results = {}
     for scenario_label, sigs in [
         ("ALL signals", all_signals),
@@ -463,82 +471,87 @@ def analyze_cluster(cluster: str, all_signals: list[dict]):
         if not sigs:
             continue
 
-        # 4a. Baseline (forward return)
+        # 4a. Baseline (forward return — Time Stop only)
         base_rets = [s["fwd_return"] for s in sigs]
-        base_m    = calc_metrics(base_rets, f"{scenario_label} — Baseline")
+        base_m    = calc_metrics(base_rets, f"Baseline (Time Stop)")
 
-        # 4b. Với SL/TP từ median (dùng ALL thresholds)
-        sl = sl_tp.get("ALL", {}).get("sl", -5.0)
-        tp = sl_tp.get("ALL", {}).get("tp", +7.0)
+        # 4b. Catastrophic SL p50 + TP median (cũ — để so sánh)
+        sl_p50 = sl_tp.get("ALL", {}).get("sl", -5.0)
+        tp_p50 = sl_tp.get("ALL", {}).get("tp", +7.0)
 
-        sim_rets = []
-        outcome_counts = {"SL": 0, "TP": 0, "HOLD": 0}
+        sim_rets_p50 = []
+        oc_p50 = {"SL": 0, "TP": 0, "HOLD": 0}
         for s in sigs:
-            mae = s["mae"]
-            mfe = s["mfe"]
-            # Conservative: nếu cả 2 hit → SL
-            if mae <= sl and mfe >= tp:
-                ret = sl
-                outcome_counts["SL"] += 1
-            elif mae <= sl:
-                ret = sl
-                outcome_counts["SL"] += 1
-            elif mfe >= tp:
-                ret = tp
-                outcome_counts["TP"] += 1
+            if s["mae"] <= sl_p50 and s["mfe"] >= tp_p50:
+                ret = sl_p50; oc_p50["SL"] += 1
+            elif s["mae"] <= sl_p50:
+                ret = sl_p50; oc_p50["SL"] += 1
+            elif s["mfe"] >= tp_p50:
+                ret = tp_p50; oc_p50["TP"] += 1
             else:
-                ret = s["fwd_return"]
-                outcome_counts["HOLD"] += 1
-            sim_rets.append(ret)
+                ret = s["fwd_return"]; oc_p50["HOLD"] += 1
+            sim_rets_p50.append(ret)
+        sim_p50 = calc_metrics(sim_rets_p50, f"SL=p50({sl_p50:+.1f}%) TP=p50")
 
-        sim_m = calc_metrics(sim_rets, f"{scenario_label} — SL/TP")
-
-        # 4c. H1/H2 specific SL/TP
-        half_key = "H1" if "H1" in scenario_label else "H2" if "H2" in scenario_label else "ALL"
-        sl_h = sl_tp.get(half_key, sl_tp.get("ALL", {})).get("sl", sl)
-        tp_h = sl_tp.get(half_key, sl_tp.get("ALL", {})).get("tp", tp)
-
-        sim_rets_h = []
+        # 4c. Catastrophic SL p25 + Time Stop (không có TP cứng)
+        sim_rets_cat = []
+        oc_cat = {"SL": 0, "HOLD": 0}
         for s in sigs:
-            mae = s["mae"]
-            mfe = s["mfe"]
-            if mae <= sl_h and mfe >= tp_h:
-                ret = sl_h
-            elif mae <= sl_h:
-                ret = sl_h
-            elif mfe >= tp_h:
-                ret = tp_h
+            if s["mae"] <= sl_catastrophic:
+                ret = sl_catastrophic; oc_cat["SL"] += 1
             else:
-                ret = s["fwd_return"]
-            sim_rets_h.append(ret)
+                ret = s["fwd_return"]; oc_cat["HOLD"] += 1
+            sim_rets_cat.append(ret)
+        sim_cat = calc_metrics(sim_rets_cat,
+                               f"Catastrophic SL=p25({sl_catastrophic:+.1f}%)")
 
-        sim_h = calc_metrics(sim_rets_h, f"{scenario_label} — H-specific SL/TP")
+        # 4d. Catastrophic SL p25 + TP median
+        sim_rets_cat_tp = []
+        oc_cat_tp = {"SL": 0, "TP": 0, "HOLD": 0}
+        for s in sigs:
+            if s["mae"] <= sl_catastrophic and s["mfe"] >= tp_median:
+                ret = sl_catastrophic; oc_cat_tp["SL"] += 1
+            elif s["mae"] <= sl_catastrophic:
+                ret = sl_catastrophic; oc_cat_tp["SL"] += 1
+            elif s["mfe"] >= tp_median:
+                ret = tp_median; oc_cat_tp["TP"] += 1
+            else:
+                ret = s["fwd_return"]; oc_cat_tp["HOLD"] += 1
+            sim_rets_cat_tp.append(ret)
+        sim_cat_tp = calc_metrics(sim_rets_cat_tp,
+                                  f"p25 SL + p50 TP")
 
         # Print
-        for m in [base_m, sim_m, sim_h]:
+        print(f"\n  [{scenario_label}]")
+        print(f"  {'Scenario':<35} {'n':>5} {'WR':>7} {'MeanExp':>9} "
+              f"{'PF':>6} {'Sharpe':>7} {'MaxDD':>8}")
+        print(f"  {'─'*75}")
+
+        for m, oc in [
+            (base_m,       None),
+            (sim_p50,      oc_p50),
+            (sim_cat,      oc_cat),
+            (sim_cat_tp,   oc_cat_tp),
+        ]:
             marker = "→" if m == base_m else "  "
             print(
-                f"  {marker} {m['label']:<23} {m['n']:>5} "
+                f"  {marker} {m['label']:<33} {m['n']:>5} "
                 f"{m['wr']:>6.1f}% {m['mean_exp']:>+8.2f}% "
                 f"{m['pf']:>6.2f} {m['sharpe']:>+6.3f} "
                 f"{m['max_dd']:>+7.1f}%"
             )
-
-        # Outcome breakdown
-        total = sum(outcome_counts.values())
-        if total > 0:
-            sl_pct  = outcome_counts["SL"] / total * 100
-            tp_pct  = outcome_counts["TP"] / total * 100
-            hd_pct  = outcome_counts["HOLD"] / total * 100
-            print(f"    Outcomes: SL={sl_pct:.0f}% TP={tp_pct:.0f}% "
-                  f"HOLD={hd_pct:.0f}%")
+            if oc:
+                total = sum(oc.values())
+                parts = " ".join(f"{k}={v/total*100:.0f}%"
+                                 for k, v in oc.items() if total > 0)
+                print(f"       Outcomes: {parts}")
 
         sim_results[scenario_label] = {
-            "baseline": base_m,
-            "sl_tp":    sim_m,
-            "h_specific": sim_h,
+            "baseline":       base_m,
+            "sl_p50_tp_p50":  sim_p50,
+            "catastrophic_sl":sim_cat,
+            "cat_sl_tp":      sim_cat_tp,
         }
-        print()
 
     # ── 5. Key insight summary ────────────────────────────────────────────────
     print(f"{'─'*65}")
@@ -649,8 +662,12 @@ def main():
         for cl, out in all_output.items():
             for scenario in ["ALL signals"]:
                 sr = out["sim_results"].get(scenario, {})
-                for phase, label in [("baseline","Baseline"),
-                                     ("sl_tp",   "SL/TP")]:
+                for phase, label in [
+                    ("baseline",        "Baseline"),
+                    ("sl_p50_tp_p50",   "SL=p50/TP=p50"),
+                    ("catastrophic_sl", "Catastrophic SL p25"),
+                    ("cat_sl_tp",       "p25 SL + p50 TP"),
+                ]:
                     m = sr.get(phase, {})
                     if not m:
                         continue
