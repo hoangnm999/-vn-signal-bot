@@ -38,11 +38,10 @@ from datetime import datetime
 
 # ── Cluster assignments (fallback từ test_cluster_signal.py) ──────────────────
 CLUSTER_ASSIGNMENTS = {
-    "Mean Reversion": ["SSI", "VND", "HCM", "DGC", "DCM", "DPM",
-                       "NKG", "HSG", "VHM", "NVL", "GAS", "HAH"],
-    "Momentum":       ["VCB", "BID", "CTG", "MBB", "TCB", "STB",
-                       "HPG", "KDH", "MWG", "FRT", "PNJ",
-                       "REE", "PC1", "FPT", "GMD"],
+    # Clean watchlist — chỉ mã đã pass WF (WF_Exp > 0 và WFE > 0)
+    # Loại: VND, NVL (MR WF_Exp âm) | PC1, HPG, KDH (MOM WFE âm)
+    "Mean Reversion": ['DCM', 'NKG', 'DPM', 'HAH', 'HCM', 'HSG', 'DGC', 'GAS', 'SSI', 'VHM'],
+    "Momentum":       ['VCB', 'BID', 'MBB', 'MWG', 'CTG', 'FRT', 'REE', 'FPT', 'GMD', 'STB', 'PNJ', 'TCB'],
 }
 
 # ── Walk Forward config ───────────────────────────────────────────────────────
