@@ -49,10 +49,14 @@ ALL_SYMBOLS = [s for group in UNIVERSE.values() for s in group]
 
 # ── Config ────────────────────────────────────────────────────────────────────
 FWD_DAYS    = 10
-GOOD_THRESH = 5.0    # % tăng để gán nhãn GOOD
-BAD_THRESH  = -3.0   # % giảm để gán nhãn BAD
 TRAIN_START = "2019-01-01"
 TRAIN_END   = "2024-12-31"
+
+# Relative threshold — tính riêng cho từng mã
+# GOOD = return > mean + GOOD_STD_MULT * std của mã đó
+# BAD  = return < mean - BAD_STD_MULT  * std của mã đó
+GOOD_STD_MULT = 0.75   # top ~22% của distribution
+BAD_STD_MULT  = 0.75   # bottom ~22% của distribution
 
 # Ngưỡng để xác định "cross-symbol pattern thật"
 CROSS_MIN_D    = 0.3   # Cohen's d tối thiểu để tính là "có signal"
@@ -164,7 +168,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # ── Label + Cohen's d ─────────────────────────────────────────────────────────
 
 def label_and_analyze(ind_df: pd.DataFrame, close_arr: np.ndarray, n_full: int) -> list[dict]:
-    """Gán nhãn GOOD/BAD và tính Cohen's d cho từng indicator."""
+    """
+    Gán nhãn GOOD/BAD theo relative threshold của từng mã.
+    GOOD = return > mean + 0.75*std  (top ~22%)
+    BAD  = return < mean - 0.75*std  (bottom ~22%)
+    → Mỗi mã tự so sánh với chính nó, không dùng ngưỡng tuyệt đối.
+    """
     fwd_rets = []
     for i in ind_df["idx"].values:
         fi = i + FWD_DAYS
@@ -175,9 +184,22 @@ def label_and_analyze(ind_df: pd.DataFrame, close_arr: np.ndarray, n_full: int) 
     ind_df = ind_df.copy()
     ind_df["fwd_return"] = fwd_rets
     ind_df = ind_df.dropna(subset=["fwd_return"])
+
+    # Tính ngưỡng relative từ distribution của mã này
+    ret_mean = float(ind_df["fwd_return"].mean())
+    ret_std  = float(ind_df["fwd_return"].std())
+    good_thresh = ret_mean + GOOD_STD_MULT * ret_std
+    bad_thresh  = ret_mean - BAD_STD_MULT  * ret_std
+
     ind_df["label"] = ind_df["fwd_return"].apply(
-        lambda r: "GOOD" if r >= GOOD_THRESH else ("BAD" if r <= BAD_THRESH else "NEUTRAL")
+        lambda r: "GOOD" if r >= good_thresh else ("BAD" if r <= bad_thresh else "NEUTRAL")
     )
+
+    # Ghi lại ngưỡng để debug
+    ind_df.attrs["good_thresh"] = round(good_thresh, 2)
+    ind_df.attrs["bad_thresh"]  = round(bad_thresh, 2)
+    ind_df.attrs["ret_mean"]    = round(ret_mean, 2)
+    ind_df.attrs["ret_std"]     = round(ret_std, 2)
 
     good = ind_df[ind_df["label"] == "GOOD"]
     bad  = ind_df[ind_df["label"] == "BAD"]
@@ -237,33 +259,38 @@ def analyze_symbol(symbol: str) -> dict | None:
 
     results = label_and_analyze(ind_df, close_arr, n_full)
 
-    n_good = sum(1 for r in ind_df.get("label", pd.Series()).values
-                 if r == "GOOD") if "label" in ind_df.columns else 0
-
-    # Tính lại n_good/n_bad sau label
-    ind_labeled = ind_df.copy()
+    # Tính n_good/n_bad với relative threshold nhất quán
     fwd_rets = []
-    for i in ind_labeled["idx"].values:
+    for i in ind_df["idx"].values:
         fi = i + FWD_DAYS
         fwd_rets.append(
             float((close_arr[fi] - close_arr[i]) / close_arr[i] * 100)
             if fi < n_full else np.nan
         )
-    ind_labeled["fwd_return"] = fwd_rets
-    ind_labeled = ind_labeled.dropna(subset=["fwd_return"])
-    n_good = int((ind_labeled["fwd_return"] >= GOOD_THRESH).sum())
-    n_bad  = int((ind_labeled["fwd_return"] <= BAD_THRESH).sum())
-    n_total= len(ind_labeled)
+    ind_df2 = ind_df.copy()
+    ind_df2["fwd_return"] = fwd_rets
+    ind_df2 = ind_df2.dropna(subset=["fwd_return"])
+    n_total     = len(ind_df2)
+    ret_mean    = float(ind_df2["fwd_return"].mean())
+    ret_std     = float(ind_df2["fwd_return"].std())
+    good_thresh = ret_mean + GOOD_STD_MULT * ret_std
+    bad_thresh  = ret_mean - BAD_STD_MULT  * ret_std
+    n_good      = int((ind_df2["fwd_return"] >= good_thresh).sum())
+    n_bad       = int((ind_df2["fwd_return"] <= bad_thresh).sum())
 
     return {
-        "symbol":   symbol,
-        "n_bars":   len(train),
-        "n_total":  n_total,
-        "n_good":   n_good,
-        "n_bad":    n_bad,
-        "pct_good": round(n_good / n_total * 100, 1) if n_total else 0,
-        "pct_bad":  round(n_bad  / n_total * 100, 1) if n_total else 0,
-        "results":  results,
+        "symbol":      symbol,
+        "n_bars":      len(train),
+        "n_total":     n_total,
+        "n_good":      n_good,
+        "n_bad":       n_bad,
+        "pct_good":    round(n_good / n_total * 100, 1) if n_total else 0,
+        "pct_bad":     round(n_bad  / n_total * 100, 1) if n_total else 0,
+        "good_thresh": round(good_thresh, 2),
+        "bad_thresh":  round(bad_thresh, 2),
+        "ret_mean":    round(ret_mean, 2),
+        "ret_std":     round(ret_std, 2),
+        "results":     results,
     }
 
 
@@ -414,9 +441,9 @@ def main():
     symbols = sys.argv[1:] if len(sys.argv) > 1 else ALL_SYMBOLS
 
     print(f"{'='*65}")
-    print(f"CROSS-SYMBOL FEATURE ANALYSIS")
+    print(f"CROSS-SYMBOL FEATURE ANALYSIS (Relative Threshold)")
     print(f"Universe: {len(symbols)} ma | FWD={FWD_DAYS}d | Training {TRAIN_START}→{TRAIN_END}")
-    print(f"GOOD>={GOOD_THRESH}% | BAD<={BAD_THRESH}%")
+    print(f"GOOD = mean + {GOOD_STD_MULT}*std | BAD = mean - {BAD_STD_MULT}*std (per-symbol)")
     print(f"{'='*65}")
 
     # ── Per-symbol analysis ───────────────────────────────────────────────────
@@ -484,18 +511,24 @@ def main():
     print(f"Features su dung: {cluster_features}")
     print(f"{'─'*65}")
 
-    # In profile từng mã theo nhóm ngành
+    # In profile từng mã theo nhóm ngành — kèm threshold để verify
     for sector, syms in UNIVERSE.items():
         print(f"\n  [{sector}]")
         for sym in syms:
             if sym not in profiles:
                 continue
-            p = profiles[sym]
+            p        = profiles[sym]
+            sym_data = per_symbol.get(sym, {})
+            thresh_str = (f"good>{sym_data.get('good_thresh','?')}% "
+                          f"bad<{sym_data.get('bad_thresh','?')}% "
+                          f"mean={sym_data.get('ret_mean','?')} "
+                          f"std={sym_data.get('ret_std','?')}")
             vals = " | ".join(
                 f"{feat.split('_')[0][:4]}={p['profile'].get(feat, 0):+.2f}"
                 for feat in cluster_features[:5]
-            )
-            print(f"    {sym}: {vals} (good={p['n_good']}, bad={p['n_bad']})")
+            ) if cluster_features else "(no universal features yet)"
+            print(f"    {sym}: {vals}")
+            print(f"         [{thresh_str}] n_good={p['n_good']} n_bad={p['n_bad']}")
 
     # ── Kết luận ──────────────────────────────────────────────────────────────
     print(f"\n{'='*65}")
