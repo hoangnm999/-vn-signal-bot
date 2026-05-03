@@ -22,7 +22,7 @@ import pandas as pd
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
-FWD_DAYS     = 15     # hold 15 ngày
+FWD_DAYS     = 10     # hold 10 ngày
 GOOD_THRESH  = 5.0    # % tăng để gán nhãn GOOD
 BAD_THRESH   = -3.0   # % giảm để gán nhãn BAD
 TRAIN_END    = "2024-12-31"
