@@ -553,10 +553,10 @@ async def healthcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok  = "✅"
     err = "❌"
     warn = "⚠️"
-    lines = ["🩺 *HEALTHCHECK*\n"]
+    lines = ["🩺 HEALTHCHECK\n"]
 
     # ── 1. ENV VARS ──────────────────────────────────────────────────────────
-    lines.append("*ENV VARS*")
+    lines.append("ENV VARS")
     env_checks = [
         ("TELEGRAM_TOKEN",   "Telegram"),
         ("DATABASE_URL",     "PostgreSQL"),
@@ -570,7 +570,7 @@ async def healthcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("")
 
     # ── 2. DATABASE ──────────────────────────────────────────────────────────
-    lines.append("*DATABASE*")
+    lines.append("DATABASE")
     try:
         from db import get_conn
         conn = get_conn(); conn.close()
@@ -592,7 +592,7 @@ async def healthcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("")
 
     # ── 3. CORE MODULES ──────────────────────────────────────────────────────
-    lines.append("*CORE MODULES*")
+    lines.append("CORE MODULES")
     module_checks = [
         ("analyzer",         "analyzer"),
         ("vn_loader",        "vn_loader"),
@@ -608,7 +608,7 @@ async def healthcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("")
 
     # ── 4. OPTIONAL MODULES ──────────────────────────────────────────────────
-    lines.append("*OPTIONAL MODULES*")
+    lines.append("OPTIONAL MODULES")
     optional_checks = [
         ("backtest_rule_cmd", "backtest_rule_cmd"),
         ("analog_signal",     "analog_signal"),
@@ -630,7 +630,7 @@ async def healthcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("")
 
     # ── 5. DATA SOURCE ───────────────────────────────────────────────────────
-    lines.append("*DATA SOURCE*")
+    lines.append("DATA SOURCE")
     try:
         from vn_loader import load_vn_ohlcv
         df = load_vn_ohlcv("VCB", n_bars=5)
@@ -644,19 +644,20 @@ async def healthcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("")
 
     # ── 6. COMMANDS REGISTERED ───────────────────────────────────────────────
-    lines.append("*COMMANDS ACTIVE*")
-    handlers = context.application.handlers.get(0, [])
-    cmds = sorted([
-        h.commands for h in handlers
-        if hasattr(h, "commands")
-    ])
-    cmd_list = ", ".join(f"/{list(c)[0]}" for c in cmds if c)
-    lines.append(f"  {ok} {len(cmds)} lệnh: {cmd_list}")
+    lines.append("COMMANDS ACTIVE")
+    try:
+        handlers = context.application.handlers.get(0, [])
+        cmd_names = []
+        for h in handlers:
+            if hasattr(h, "commands"):
+                for c in h.commands:
+                    cmd_names.append(f"/{c}")
+        cmd_names.sort()
+        lines.append(f"  {ok} {len(cmd_names)} lenh: {', '.join(cmd_names)}")
+    except Exception as e:
+        lines.append(f"  {err} Commands: {str(e)[:60]}")
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text("\n".join(lines))
 
 
 # ── /debug <MA> ───────────────────────────────────────────────────────────────
