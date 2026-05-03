@@ -582,11 +582,11 @@ async def healthcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from db import load_scan_result
         r = load_scan_result(scan_type="watchlist")
         if r:
-            ts = r.get("scanned_at", "?")
-            ranked = len(r.get("ranked", []))
-            lines.append(f"  {ok} Scan cache: {ranked} mã, lúc {ts}")
+            ts = r.get("scanned_at") or r.get("saved_at") or r.get("ts") or "không rõ"
+            ranked = len(r.get("ranked", r.get("signals", [])))
+            lines.append(f"  {ok} Scan cache (batch cũ): {ranked} mã, lúc {ts}")
         else:
-            lines.append(f"  {warn} Scan cache: chưa có (chạy /cluster_scan trước)")
+            lines.append(f"  {warn} Scan cache: chưa có")
     except Exception as e:
         lines.append(f"  {err} Scan cache: {str(e)[:60]}")
     lines.append("")
@@ -617,7 +617,7 @@ async def healthcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ("local_swarm_cmd",   "local_swarm_cmd"),
         ("vibe_client",       "vibe_client"),
         ("portfolio",         "portfolio"),
-        ("alert_cmd",         "alert_cmd"),
+        ("alert_system",      "alert_system"),
     ]
     for mod, label in optional_checks:
         try:
@@ -632,8 +632,8 @@ async def healthcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── 5. DATA SOURCE ───────────────────────────────────────────────────────
     lines.append("*DATA SOURCE*")
     try:
-        from vn_loader import load_ohlcv
-        df = load_ohlcv("VCB", n_bars=5)
+        from vn_loader import load_vn_ohlcv
+        df = load_vn_ohlcv("VCB", n_bars=5)
         if df is not None and len(df) > 0:
             last_date = str(df.index[-1])[:10]
             lines.append(f"  {ok} vn_loader: VCB OK (last={last_date})")
