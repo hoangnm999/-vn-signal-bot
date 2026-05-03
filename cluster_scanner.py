@@ -148,8 +148,68 @@ TRAIL_CONFIG = {
     "GMD": {"mult": 2.0, "activation_pct": 6.15},   # MOM | WFE=3.63 consistency=100%
 }
 
+# Account size để tính position sizing (VND)
+# Chỉnh theo vốn thực tế của bạn
+ACCOUNT_SIZE = 300_000_000  # 300 triệu
+
+# Risk per trade theo Score tier (% account)
+RISK_PCT = {
+    "HIGH":   1.5,   # Score >= 20  → 1.5% = 4.5 triệu
+    "NORMAL": 1.0,   # Score 5-20   → 1.0% = 3 triệu
+    "LOW":    0.5,   # Score < 5    → 0.5% = 1.5 triệu
+}
+
+# Max concurrent positions & max exposure
+MAX_POSITIONS  = 6
+MAX_EXPOSURE   = 0.40   # tối đa 40% vốn deployed
+
 # In-memory signal cache (tồn tại trong session)
 _morning_signals: dict = {}   # symbol → signal_info (từ 8:30 scan)
+
+
+# ── Position sizing helper ───────────────────────────────────────────────────
+
+def _calc_position_size(entry_price: float, sl_pct: float,
+                        sizing_score: float) -> dict:
+    """
+    Tính số cổ phù hợp dựa trên risk-based position sizing.
+    Returns dict với qty, value, risk_amount, risk_tier.
+    """
+    # Xác định risk tier từ sizing score
+    if sizing_score >= 20:
+        risk_tier = "HIGH"
+    elif sizing_score >= 5:
+        risk_tier = "NORMAL"
+    else:
+        risk_tier = "LOW"
+
+    risk_pct    = RISK_PCT[risk_tier]
+    risk_amount = ACCOUNT_SIZE * risk_pct / 100          # VND rủi ro tối đa
+    sl_value    = entry_price * abs(sl_pct) / 100         # VND mất mỗi cổ nếu chạm SL
+    if sl_value <= 0:
+        return {}
+
+    raw_qty  = risk_amount / sl_value                    # số cổ lý thuyết
+    qty      = max(100, int(raw_qty / 100) * 100)        # làm tròn xuống bội số 100
+    value    = qty * entry_price                          # giá trị lệnh
+    exposure = value / ACCOUNT_SIZE * 100                # % vốn
+
+    # Cảnh báo nếu value lệnh quá lớn (> MAX_EXPOSURE / MAX_POSITIONS)
+    max_per_trade = ACCOUNT_SIZE * MAX_EXPOSURE / MAX_POSITIONS
+    if value > max_per_trade:
+        # Cap lại để không vượt quá giới hạn
+        qty   = max(100, int(max_per_trade / entry_price / 100) * 100)
+        value = qty * entry_price
+        exposure = value / ACCOUNT_SIZE * 100
+
+    return {
+        "qty":         qty,
+        "value":       value,
+        "risk_amount": round(risk_amount),
+        "risk_pct":    risk_pct,
+        "risk_tier":   risk_tier,
+        "exposure":    round(exposure, 1),
+    }
 
 
 # ── Indicator helpers ─────────────────────────────────────────────────────────
@@ -511,7 +571,22 @@ def _format_signal(sig: dict, vni_info: dict) -> str:
     else:
         lines.append(f"  Exit: Time Stop T+{fwd}d (~{sig['tp_date']})")
 
-    lines.append(f"  Size: Risk 1-2% account")
+    # Position sizing cụ thể
+    ps = _calc_position_size(sig["entry_price"], sig["sl_pct"], sizing_score)
+    if ps:
+        risk_tier_label = {"HIGH": "⬆️ CAO", "NORMAL": "➡️ BÌNH THƯỜNG", "LOW": "⬇️ THẤP"}
+        lines += [
+            f"",
+            f"*💰 Position Sizing ({ACCOUNT_SIZE/1e6:.0f}M account):*",
+            f"  Tier: {risk_tier_label.get(ps['risk_tier'], '')} "
+            f"(risk {ps['risk_pct']}% = {ps['risk_amount']/1e6:.1f}M)",
+            f"  → Mua: *{ps['qty']:,} cổ* (~{ps['value']/1e6:.1f}M, "
+            f"chiếm {ps['exposure']}% vốn)",
+            f"  → Max loss nếu chạm SL: "
+            f"~{ps['risk_amount']/1e6:.1f}M ({ps['risk_pct']}% account)",
+        ]
+    else:
+        lines.append(f"  Size: Risk 1% account")
 
     return "\n".join(lines)
 
