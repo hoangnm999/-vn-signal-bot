@@ -40,7 +40,8 @@ from datetime import datetime
 CLUSTER_ASSIGNMENTS = {
     # Clean watchlist — chỉ mã đã pass WF (WF_Exp > 0 và WFE > 0)
     # Loại: VND, NVL (MR WF_Exp âm) | PC1, HPG, KDH (MOM WFE âm)
-    "Mean Reversion": ['DCM', 'NKG', 'DPM', 'HAH', 'HCM', 'HSG', 'DGC', 'GAS', 'SSI', 'VHM'],
+    # Clean v2: loại SSI (WF âm sau VNI filter) và VHM (WF âm sau VNI filter)
+    "Mean Reversion": ['DCM', 'NKG', 'DPM', 'HAH', 'HCM', 'HSG', 'DGC', 'GAS'],
     "Momentum":       ['VCB', 'BID', 'MBB', 'MWG', 'CTG', 'FRT', 'REE', 'FPT', 'GMD', 'STB', 'PNJ', 'TCB'],
 }
 
