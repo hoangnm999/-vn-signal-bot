@@ -352,8 +352,10 @@ def walk_forward_symbol(symbol: str, cluster: str) -> dict | None:
             "test_start":  fold["test_start"],
             "test_end":    fold["test_end"],
             "metrics":     fold_metrics,
+            "signals":     fold_signals,   # raw signals cho PF + H1/H2
             "reg_thresh":  round(fold_thresh["reg_thresh"], 3),
             "is_oos_2025": fold["test_start"] >= "2025-01-01",
+            "half":        "H1" if int(fold["test_start"][5:7]) <= 6 else "H2",
         })
 
     # Aggregate WF metrics (tất cả folds)
@@ -389,31 +391,28 @@ def aggregate_wf(sym_results: list[dict]) -> dict:
 
     fold_agg = {}
     for label in fold_labels:
-        all_n   = 0
-        sum_exp = 0.0
-        wins    = 0
-        losses  = 0.0
-        sum_wins= 0.0
+        all_rets = []
 
         for r in sym_results:
             for f in r.get("fold_results", []):
                 if f["label"] == label:
-                    m = f["metrics"]
-                    n = m.get("n", 0)
-                    if n == 0:
-                        continue
-                    all_n    += n
-                    sum_exp  += m["mean_exp"] * n
-                    wins     += round(m["wr"] / 100 * n)
+                    for s in f.get("signals", []):
+                        all_rets.append(s["actual"])
 
-        if all_n == 0:
+        if not all_rets:
             continue
+
+        wins_r = [r for r in all_rets if r >= WIN_THRESH]
+        loss_r = [r for r in all_rets if r < WIN_THRESH]
+        pf     = round(sum(wins_r) / abs(sum(loss_r)), 2)                  if loss_r and sum(loss_r) != 0 else 99.0
 
         fold_agg[label] = {
             "label":    label,
-            "n":        all_n,
-            "mean_exp": round(sum_exp / all_n, 2) if all_n else 0.0,
-            "wr":       round(wins / all_n * 100, 1) if all_n else 0.0,
+            "n":        len(all_rets),
+            "mean_exp": round(float(np.mean(all_rets)), 2),
+            "wr":       round(len(wins_r) / len(all_rets) * 100, 1),
+            "pf":       pf,
+            "max_dd":   round(float(np.min(all_rets)), 1),
         }
 
     # Overall WF aggregate
@@ -459,7 +458,7 @@ def print_wf_results(cluster: str, sym_results: list[dict], agg: dict):
 
     # Per-fold aggregate table
     print(f"\nPER-FOLD AGGREGATE (cross-symbol):")
-    print(f"  {'Fold':<20} {'n':>5} {'WR':>7} {'MeanExp':>9}  Bar")
+    print(f"  {'Fold':<20} {'n':>5} {'WR':>7} {'MeanExp':>9} {'PF':>8}  Bar")
     print(f"  {'─'*50}")
 
     for label, m in sorted(agg["fold_agg"].items()):
@@ -467,9 +466,10 @@ def print_wf_results(cluster: str, sym_results: list[dict], agg: dict):
         bar_len = max(0, min(20, int((m["mean_exp"] + 3) * 3)))
         bar     = "█" * bar_len if m["mean_exp"] > 0 else "░" * abs(bar_len)
         marker  = " ◄ OOS 2025" if is_2025 else ""
+        pf_str  = f"PF={m.get('pf', 0):.2f}"
         print(
             f"  {label:<20} {m['n']:>5} {m['wr']:>6.1f}% "
-            f"{m['mean_exp']:>+8.2f}%  {bar}{marker}"
+            f"{m['mean_exp']:>+8.2f}% {pf_str:>8}  {bar}{marker}"
         )
 
     # Per-symbol summary
@@ -514,15 +514,97 @@ def print_wf_results(cluster: str, sym_results: list[dict], agg: dict):
             f"{pct_pos:>5}%  {verdict}"
         )
 
+    # ── H1 vs H2 seasonality analysis ───────────────────────────────────────
+    print(f"\nH1 vs H2 SEASONALITY (per-symbol):")
+    print(f"  {'Symbol':<7} " + "  ".join(
+        f"{'H1':>6}/{'H2':>6}" for y in ["2022","2023","2024","2025"]
+    ) + "  H1_avg  H2_avg  Pattern")
+    print(f"  {'─'*75}")
+
+    h1h2_h1_all, h1h2_h2_all = [], []
+
+    for r in sorted(sym_results,
+                    key=lambda x: -(x.get("train_metrics",{}).get("mean_exp",-99))):
+        if r.get("error"):
+            continue
+        sym    = r["symbol"]
+        folds  = r.get("fold_results", [])
+
+        # Group by year+half
+        yh = {}
+        for f in folds:
+            yr   = f["test_start"][:4]
+            half = f["half"]
+            key  = f"{yr}{half}"
+            sigs = f.get("signals", [])
+            if sigs:
+                yh[key] = float(np.mean([s["actual"] for s in sigs]))
+
+        row = f"  {sym:<7}"
+        h1_vals, h2_vals = [], []
+        for yr in ["2022","2023","2024","2025"]:
+            h1 = yh.get(f"{yr}H1")
+            h2 = yh.get(f"{yr}H2")
+            h1_str = f"{h1:>+5.1f}" if h1 is not None else "  n/a"
+            h2_str = f"{h2:>+5.1f}" if h2 is not None else "  n/a"
+            row += f"  {h1_str}/{h2_str}"
+            if h1 is not None: h1_vals.append(h1)
+            if h2 is not None: h2_vals.append(h2)
+
+        h1_avg = float(np.mean(h1_vals)) if h1_vals else 0.0
+        h2_avg = float(np.mean(h2_vals)) if h2_vals else 0.0
+        h1h2_h1_all.extend(h1_vals)
+        h1h2_h2_all.extend(h2_vals)
+
+        n_h1_better = sum(1 for h1, h2 in zip(h1_vals, h2_vals) if h1 > h2)
+        n_pairs     = min(len(h1_vals), len(h2_vals))
+        pct_h1      = n_h1_better / n_pairs * 100 if n_pairs else 0
+
+        pattern = (f"H1>{pct_h1:.0f}%" if pct_h1 >= 60
+                   else f"H2>{100-pct_h1:.0f}%" if pct_h1 <= 40
+                   else "Mixed")
+        row += f"  {h1_avg:>+6.2f}  {h2_avg:>+6.2f}  {pattern}"
+        print(row)
+
+    # Cross-symbol H1 vs H2 summary
+    if h1h2_h1_all and h1h2_h2_all:
+        avg_h1 = float(np.mean(h1h2_h1_all))
+        avg_h2 = float(np.mean(h1h2_h2_all))
+        n_pairs_total = min(len(h1h2_h1_all), len(h1h2_h2_all))
+        # Count per-year cross-symbol
+        n_h1_better_total = sum(1 for h1, h2 in zip(h1h2_h1_all, h1h2_h2_all)
+                                if h1 > h2)
+        pct_total = n_h1_better_total / n_pairs_total * 100 if n_pairs_total else 0
+        print(f"  {'─'*75}")
+        print(f"  {'AGGREGATE':<7}  {'':>33}  {avg_h1:>+6.2f}  {avg_h2:>+6.2f}  "
+              f"H1 wins {pct_total:.0f}% of time")
+        if pct_total >= 65:
+            print(f"  → PATTERN NHAT QUAN: H1 tot hon H2 trong {pct_total:.0f}% truong hop")
+            print(f"  → Goi y: tang position size H1, giam H2")
+        elif pct_total <= 35:
+            print(f"  → PATTERN NHAT QUAN: H2 tot hon H1 trong {100-pct_total:.0f}% truong hop")
+        else:
+            print(f"  → KHONG CO PATTERN RO RANG (H1 wins {pct_total:.0f}%) — co the la nhieu")
+
     # Overall verdict
     print(f"\n{'─'*70}")
     wfe     = agg["wfe"]
     wf_exp  = agg["wf_exp"]
     consist = agg["consistency"]
 
+    # Tính WF PF từ fold_agg
+    all_wf_rets  = []
+    for r in sym_results:
+        for f in r.get("fold_results", []):
+            for s in f.get("signals", []):
+                all_wf_rets.append(s["actual"])
+    wf_wins = [r for r in all_wf_rets if r >= WIN_THRESH]
+    wf_loss = [r for r in all_wf_rets if r < WIN_THRESH]
+    wf_pf   = round(sum(wf_wins) / abs(sum(wf_loss)), 2)               if wf_loss and sum(wf_loss) != 0 else 99.0
+
     print(f"  CLUSTER AGGREGATE:")
     print(f"    Training Exp : {agg['train_exp']:+.2f}%")
-    print(f"    WF Exp       : {wf_exp:+.2f}%")
+    print(f"    WF Exp       : {wf_exp:+.2f}%  |  WF PF: {wf_pf:.2f}")
     print(f"    WFE          : {wfe:.2f}  "
           + ("✅ >0.7 Tốt" if wfe >= 0.7 else
              "· 0.5-0.7 Chấp nhận" if wfe >= 0.5 else
@@ -587,12 +669,22 @@ def main():
         agg   = aggregate_wf(valid)
 
         print_wf_results(cluster, valid, agg)
+        # Lưu fold_results nhưng strip raw signals để giảm file size
+        def strip_fold_signals(results):
+            out = []
+            for r in results:
+                if not r: continue
+                rc = dict(r)
+                rc["fold_results"] = [
+                    {k: v for k, v in f.items() if k != "signals"}
+                    for f in r.get("fold_results", [])
+                ]
+                out.append(rc)
+            return out
+
         all_output[cluster] = {
             "agg": agg,
-            "symbols": [
-                {k: v for k, v in r.items() if k != "fold_results"}
-                for r in valid
-            ],
+            "symbols": strip_fold_signals(valid),
         }
 
     # Cross-cluster WFE comparison
