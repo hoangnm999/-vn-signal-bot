@@ -1072,47 +1072,94 @@ _PIPELINE_MIN_PF  = 1.3
 # regime_condition: "low" = dưới median, "high" = trên median
 # trigger_indicators: chỉ số nhanh dùng để detect tín hiệu đột biến
 _REGIME_CONFIG_DEFAULT: dict = {
+    # MWG: mean reversion — stoch_k oversold WR=76.2% Lift=+3.19%
     "MWG": {
-        "regime_indicator": "atr_ratio",
-        "regime_condition": "low",
-        "regime_label":     "Tich luy (ATR thap)",
-        "trigger_indicators": ["momentum_5d", "volume_spike", "stoch_k", "candle_body"],
+        "regime_indicator":  "atr_ratio",
+        "regime_condition":  "low",
+        "regime_label":      "Tich luy (ATR thap)",
+        "trigger_indicators": ["stoch_k", "momentum_5d", "volume_spike", "candle_body"],
+        "trigger_direction": {
+            "stoch_k":      "low",
+            "momentum_5d":  "high",
+            "volume_spike": "high",
+            "candle_body":  "high",
+        },
     },
+    # STB: momentum/breakout — bo stoch_k vi oversold = nguy hiem voi STB
     "STB": {
-        "regime_indicator": "atr_ratio",
-        "regime_condition": "high",
-        "regime_label":     "Bien dong cao (ATR cao)",
-        "trigger_indicators": ["momentum_5d", "stoch_k", "volume_spike", "candle_body"],
+        "regime_indicator":  "atr_ratio",
+        "regime_condition":  "high",
+        "regime_label":      "Bien dong cao (ATR cao)",
+        "trigger_indicators": ["momentum_5d", "volume_spike", "candle_body"],
+        "trigger_direction": {
+            "momentum_5d":  "high",
+            "volume_spike": "high",
+            "candle_body":  "high",
+        },
     },
+    # DPM: mean reversion co cau truc — stoch_k oversold Lift=+1.03%
     "DPM": {
-        "regime_indicator": "trend_slope",
-        "regime_condition": "low",
-        "regime_label":     "Downtrend / Sideways",
-        "trigger_indicators": ["momentum_5d", "stoch_k", "volume_spike", "candle_body"],
+        "regime_indicator":  "trend_slope",
+        "regime_condition":  "low",
+        "regime_label":      "Downtrend / Sideways",
+        "trigger_indicators": ["momentum_5d", "volume_spike", "stoch_k", "candle_body"],
+        "trigger_direction": {
+            "momentum_5d":  "high",
+            "volume_spike": "high",
+            "stoch_k":      "low",
+            "candle_body":  "high",
+        },
     },
+    # HPG: tuong tu MWG — mean reversion
     "HPG": {
-        "regime_indicator": "atr_ratio",
-        "regime_condition": "low",
-        "regime_label":     "Tich luy (ATR thap)",
-        "trigger_indicators": ["momentum_5d", "volume_spike", "stoch_k", "candle_body"],
+        "regime_indicator":  "atr_ratio",
+        "regime_condition":  "low",
+        "regime_label":      "Tich luy (ATR thap)",
+        "trigger_indicators": ["stoch_k", "momentum_5d", "volume_spike", "candle_body"],
+        "trigger_direction": {
+            "stoch_k":      "low",
+            "momentum_5d":  "high",
+            "volume_spike": "high",
+            "candle_body":  "high",
+        },
     },
+    # GAS: tuong tu MWG — tich luy
     "GAS": {
-        "regime_indicator": "atr_ratio",
-        "regime_condition": "low",
-        "regime_label":     "Tich luy (ATR thap)",
-        "trigger_indicators": ["momentum_5d", "volume_spike", "stoch_k", "candle_body"],
+        "regime_indicator":  "atr_ratio",
+        "regime_condition":  "low",
+        "regime_label":      "Tich luy (ATR thap)",
+        "trigger_indicators": ["stoch_k", "momentum_5d", "volume_spike", "candle_body"],
+        "trigger_direction": {
+            "stoch_k":      "low",
+            "momentum_5d":  "high",
+            "volume_spike": "high",
+            "candle_body":  "high",
+        },
     },
+    # DCM: tuong tu DPM — downtrend/sideways
     "DCM": {
-        "regime_indicator": "trend_slope",
-        "regime_condition": "low",
-        "regime_label":     "Downtrend / Sideways",
-        "trigger_indicators": ["momentum_5d", "stoch_k", "volume_spike", "candle_body"],
+        "regime_indicator":  "trend_slope",
+        "regime_condition":  "low",
+        "regime_label":      "Downtrend / Sideways",
+        "trigger_indicators": ["momentum_5d", "volume_spike", "stoch_k", "candle_body"],
+        "trigger_direction": {
+            "momentum_5d":  "high",
+            "volume_spike": "high",
+            "stoch_k":      "low",
+            "candle_body":  "high",
+        },
     },
+    # FPT: tuong tu STB — momentum/breakout
     "FPT": {
-        "regime_indicator": "atr_ratio",
-        "regime_condition": "high",
-        "regime_label":     "Bien dong cao (ATR cao)",
-        "trigger_indicators": ["momentum_5d", "stoch_k", "volume_spike", "candle_body"],
+        "regime_indicator":  "atr_ratio",
+        "regime_condition":  "high",
+        "regime_label":      "Bien dong cao (ATR cao)",
+        "trigger_indicators": ["momentum_5d", "volume_spike", "candle_body"],
+        "trigger_direction": {
+            "momentum_5d":  "high",
+            "volume_spike": "high",
+            "candle_body":  "high",
+        },
     },
 }
 _REGIME_CONFIG: dict = dict(_REGIME_CONFIG_DEFAULT)
@@ -1213,13 +1260,25 @@ def _compute_regime_threshold(ind_rows: list[dict], regime_indicator: str) -> fl
 def _compute_trigger_thresholds(
     ind_rows: list[dict],
     trigger_indicators: list[str],
+    trigger_direction: dict[str, str] | None = None,
 ) -> dict[str, float]:
-    """Tính ngưỡng top TRIGGER_PCT% cho từng trigger indicator."""
+    """
+    Tinh nguong cho tung trigger indicator.
+    direction=high: percentile cao (top 30%)
+    direction=low:  percentile thap (bottom 30% = oversold)
+    """
     thresholds = {}
     for trig in trigger_indicators:
         vals = [r[trig] for r in ind_rows
                 if trig in r and np.isfinite(r[trig])]
-        if vals:
+        if not vals:
+            continue
+        direction = (trigger_direction or {}).get(trig, "high")
+        if direction == "low":
+            # Bottom 30% = nguong oversold
+            thresholds[trig] = float(np.percentile(vals, 100 - _TRIGGER_PCT))
+        else:
+            # Top 30%
             thresholds[trig] = float(np.percentile(vals, _TRIGGER_PCT))
     return thresholds
 
@@ -1237,14 +1296,26 @@ def _check_regime(row: dict, regime_indicator: str,
 
 
 def _count_triggers(row: dict, trigger_indicators: list[str],
-                    thresholds: dict[str, float]) -> int:
-    """Đếm số triggers đang active tại ngày T."""
+                    thresholds: dict[str, float],
+                    trigger_direction: dict[str, str] | None = None) -> int:
+    """
+    Dem so triggers dang active tai ngay T.
+    trigger_direction: "high" = val >= thresh, "low" = val <= thresh
+    Mac dinh la "high" neu khong co config.
+    """
     count = 0
     for trig in trigger_indicators:
-        val   = row.get(trig, np.nan)
+        val    = row.get(trig, np.nan)
         thresh = thresholds.get(trig, np.nan)
-        if np.isfinite(val) and np.isfinite(thresh) and val >= thresh:
-            count += 1
+        if not (np.isfinite(val) and np.isfinite(thresh)):
+            continue
+        direction = (trigger_direction or {}).get(trig, "high")
+        if direction == "low":
+            if val <= thresh:
+                count += 1
+        else:
+            if val >= thresh:
+                count += 1
     return count
 
 
@@ -1300,18 +1371,19 @@ def _run_analog_backtest_sync(symbol: str, days: int = 1800) -> dict:
     cfg = _REGIME_CONFIG.get(symbol, _REGIME_CONFIG_FALLBACK)
     reg_ind   = cfg["regime_indicator"]
     reg_cond  = cfg["regime_condition"]
-    trig_inds = cfg["trigger_indicators"]
+    trig_inds  = cfg["trigger_indicators"]
+    trig_dir   = cfg.get("trigger_direction", {})
 
     # Tính ngưỡng từ training data
     reg_thresh  = _compute_regime_threshold(ind_rows, reg_ind)
-    trig_thresh = _compute_trigger_thresholds(ind_rows, trig_inds)
+    trig_thresh = _compute_trigger_thresholds(ind_rows, trig_inds, trig_dir)
 
     # Backtest loop
     n_skip_regime  = 0
     n_skip_trigger = 0
     signals        = []
 
-    for t_idx in range(120, n_bars - _FWD_DAYS - 1, 7):
+    for t_idx in range(120, n_bars - _FWD_DAYS - 1, 3):
         row = ind_map.get(t_idx)
         if row is None:
             continue
@@ -1322,7 +1394,7 @@ def _run_analog_backtest_sync(symbol: str, days: int = 1800) -> dict:
             continue
 
         # Tầng 2: trigger
-        n_trig = _count_triggers(row, trig_inds, trig_thresh)
+        n_trig = _count_triggers(row, trig_inds, trig_thresh, trig_dir)
         if n_trig < _MIN_TRIGGERS:
             n_skip_trigger += 1
             continue
@@ -1448,8 +1520,9 @@ def _run_walkforward_sync(symbol: str) -> dict:
     reg_ind    = cfg["regime_indicator"]
     reg_cond   = cfg["regime_condition"]
     trig_inds  = cfg["trigger_indicators"]
+    trig_dir   = cfg.get("trigger_direction", {})
     reg_thresh  = _compute_regime_threshold(train_rows, reg_ind)
-    trig_thresh = _compute_trigger_thresholds(train_rows, trig_inds)
+    trig_thresh = _compute_trigger_thresholds(train_rows, trig_inds, trig_dir)
 
     # Tính indicators toàn bộ df (cả OOS)
     n_bars    = len(df)
@@ -1460,11 +1533,11 @@ def _run_walkforward_sync(symbol: str) -> dict:
 
     # ── Training metrics (để compare) ────────────────────────────────────────
     train_signals = []
-    for t_idx in range(120, oos_start - _FWD_DAYS - 1, 7):
+    for t_idx in range(120, oos_start - _FWD_DAYS - 1, 3):
         row = ind_map.get(t_idx)
         if row is None: continue
         if not _check_regime(row, reg_ind, reg_cond, reg_thresh): continue
-        if _count_triggers(row, trig_inds, trig_thresh) < _MIN_TRIGGERS: continue
+        if _count_triggers(row, trig_inds, trig_thresh, trig_dir) < _MIN_TRIGGERS: continue
         fwd_idx = t_idx + _FWD_DAYS
         if fwd_idx >= n_bars: continue
         ret = (close_arr[fwd_idx] - close_arr[t_idx]) / close_arr[t_idx] * 100
@@ -1492,7 +1565,7 @@ def _run_walkforward_sync(symbol: str) -> dict:
             continue
 
         # Tầng 2: trigger
-        n_trig = _count_triggers(row, trig_inds, trig_thresh)
+        n_trig = _count_triggers(row, trig_inds, trig_thresh, trig_dir)
         if n_trig < _MIN_TRIGGERS:
             n_skip_trigger += 1
             continue
