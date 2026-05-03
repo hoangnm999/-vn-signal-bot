@@ -136,13 +136,8 @@ except ImportError:
     _PORTFOLIO = False
     logger.warning("portfolio.py chua co — /buy /sell /portfolio bi tat")
 
-try:
-    from morning_briefing import morning_cmd, _start_morning_cron
-    _MORNING = True
-    logger.info("morning_briefing.py loaded OK")
-except ImportError:
-    _MORNING = False
-    logger.warning("morning_briefing.py chua co — /morning bi tat")
+# morning_briefing disabled S31 — logic Analog Engine, thay bằng cluster_scan cron 08:30+12:30
+_MORNING = False
 
 try:
     from vibe_client import (
@@ -320,7 +315,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/alerts              — Xem canh bao dang hoat dong\n"
         "/alert cancel <id>   — Huy canh bao\n\n"
         "━━━ PORTFOLIO ━━━\n"
-        "/morning             — Morning briefing: regime + top ma + wave filter\n"
         "/buy <MA> <gia> <SL> <KL> [TP] — Ghi nhan vi the mua\n"
         "/sell <MA> [gia]     — Dong vi the\n"
         "/portfolio           — Tong quan P&L + goi y hanh dong\n"
@@ -454,8 +448,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 LICH SU & BAO CAO\n"
         "──────────────────────\n"
         "/history <MA>   — Signal cu + tag het han / dao chieu\n"
-        "/report [ngay]  — Accuracy tung agent (mac dinh 30 ngay)\n"
-        "/morning        — Bao cao sang: regime + portfolio + scan\n\n"
+        "/report [ngay]  — Accuracy tung agent (mac dinh 30 ngay)\n\n"
 
         "⚙️ HE THONG\n"
         "──────────────────────\n"
@@ -546,6 +539,124 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  PostgreSQL   : LOI — {str(e)[:60]}")
 
     await update.message.reply_text("\n".join(lines))
+
+
+# ── /healthcheck ──────────────────────────────────────────────────────────────
+async def healthcheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Kiểm tra toàn bộ modules và dependencies, trả về trạng thái từng thành phần.
+    """
+    if not is_allowed(update): await _deny(update); return
+
+    await update.message.reply_text("🔍 Đang kiểm tra hệ thống...")
+
+    ok  = "✅"
+    err = "❌"
+    warn = "⚠️"
+    lines = ["🩺 *HEALTHCHECK*\n"]
+
+    # ── 1. ENV VARS ──────────────────────────────────────────────────────────
+    lines.append("*ENV VARS*")
+    env_checks = [
+        ("TELEGRAM_TOKEN",   "Telegram"),
+        ("DATABASE_URL",     "PostgreSQL"),
+        ("DEEPSEEK_API_KEY", "DeepSeek"),
+        ("GEMINI_API_KEY",   "Gemini"),
+        ("CHAT_ID",          "Chat ID"),
+    ]
+    for key, label in env_checks:
+        val = os.environ.get(key, "")
+        lines.append(f"  {ok if val else err} {label}")
+    lines.append("")
+
+    # ── 2. DATABASE ──────────────────────────────────────────────────────────
+    lines.append("*DATABASE*")
+    try:
+        from db import get_conn
+        conn = get_conn(); conn.close()
+        lines.append(f"  {ok} Kết nối PostgreSQL")
+    except Exception as e:
+        lines.append(f"  {err} PostgreSQL: {str(e)[:60]}")
+
+    try:
+        from db import load_scan_result
+        r = load_scan_result(scan_type="watchlist")
+        if r:
+            ts = r.get("scanned_at", "?")
+            ranked = len(r.get("ranked", []))
+            lines.append(f"  {ok} Scan cache: {ranked} mã, lúc {ts}")
+        else:
+            lines.append(f"  {warn} Scan cache: chưa có (chạy /cluster_scan trước)")
+    except Exception as e:
+        lines.append(f"  {err} Scan cache: {str(e)[:60]}")
+    lines.append("")
+
+    # ── 3. CORE MODULES ──────────────────────────────────────────────────────
+    lines.append("*CORE MODULES*")
+    module_checks = [
+        ("analyzer",         "analyzer"),
+        ("vn_loader",        "vn_loader"),
+        ("db",               "db"),
+        ("cluster_scanner",  "cluster_scanner"),
+    ]
+    for mod, label in module_checks:
+        try:
+            __import__(mod)
+            lines.append(f"  {ok} {label}")
+        except Exception as e:
+            lines.append(f"  {err} {label}: {str(e)[:60]}")
+    lines.append("")
+
+    # ── 4. OPTIONAL MODULES ──────────────────────────────────────────────────
+    lines.append("*OPTIONAL MODULES*")
+    optional_checks = [
+        ("backtest_rule_cmd", "backtest_rule_cmd"),
+        ("analog_signal",     "analog_signal"),
+        ("analog_cmd",        "analog_cmd"),
+        ("wave_pattern",      "wave_pattern"),
+        ("local_swarm_cmd",   "local_swarm_cmd"),
+        ("vibe_client",       "vibe_client"),
+        ("portfolio",         "portfolio"),
+        ("alert_cmd",         "alert_cmd"),
+    ]
+    for mod, label in optional_checks:
+        try:
+            __import__(mod)
+            lines.append(f"  {ok} {label}")
+        except ImportError:
+            lines.append(f"  {warn} {label}: không có (optional)")
+        except Exception as e:
+            lines.append(f"  {err} {label}: {str(e)[:60]}")
+    lines.append("")
+
+    # ── 5. DATA SOURCE ───────────────────────────────────────────────────────
+    lines.append("*DATA SOURCE*")
+    try:
+        from vn_loader import load_ohlcv
+        df = load_ohlcv("VCB", n_bars=5)
+        if df is not None and len(df) > 0:
+            last_date = str(df.index[-1])[:10]
+            lines.append(f"  {ok} vn_loader: VCB OK (last={last_date})")
+        else:
+            lines.append(f"  {warn} vn_loader: VCB trả về rỗng")
+    except Exception as e:
+        lines.append(f"  {err} vn_loader: {str(e)[:60]}")
+    lines.append("")
+
+    # ── 6. COMMANDS REGISTERED ───────────────────────────────────────────────
+    lines.append("*COMMANDS ACTIVE*")
+    handlers = context.application.handlers.get(0, [])
+    cmds = sorted([
+        h.commands for h in handlers
+        if hasattr(h, "commands")
+    ])
+    cmd_list = ", ".join(f"/{list(c)[0]}" for c in cmds if c)
+    lines.append(f"  {ok} {len(cmds)} lệnh: {cmd_list}")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown"
+    )
 
 
 # ── /debug <MA> ───────────────────────────────────────────────────────────────
@@ -1593,6 +1704,7 @@ def main():
     app.add_handler(CommandHandler("add",          add_cmd))
     app.add_handler(CommandHandler("remove",       remove_cmd))
     app.add_handler(CommandHandler("status",       status_cmd))
+    app.add_handler(CommandHandler("healthcheck",  healthcheck_cmd))
     app.add_handler(CommandHandler("debug",        debug_cmd))
     app.add_handler(CommandHandler("check",        check_cmd))
     app.add_handler(CommandHandler("scan",         scan_cmd))
@@ -1642,8 +1754,7 @@ def main():
         app.add_handler(CommandHandler("buy",       buy_cmd))
         app.add_handler(CommandHandler("sell",      sell_cmd))
         app.add_handler(CommandHandler("portfolio", portfolio_cmd))
-    if _MORNING:
-        app.add_handler(CommandHandler("morning", morning_cmd))
+    # /morning disabled S31
     app.add_error_handler(_error_handler)
 
     async def post_init(application):
@@ -1667,8 +1778,7 @@ def main():
             asyncio.create_task(_start_alert_cron(application))
         if _PORTFOLIO:
             asyncio.create_task(_start_portfolio_cron(application.bot, _scan_ids))
-        if _MORNING:
-            asyncio.create_task(_start_morning_cron(application.bot, _scan_ids))
+        # morning cron disabled S31
         if _ANALOG_SIGNAL:
             _signal_ids = _scan_ids
             if _signal_ids:
