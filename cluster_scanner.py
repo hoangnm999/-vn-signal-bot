@@ -16,7 +16,10 @@ Logic mỗi lần scan:
 
 Clusters:
   Mean Reversion (FWD=20d): DCM, NKG, DPM, HAH, HCM, HSG, DGC, GAS
+                             + NLG, HDB, BMP (S31 expand)
   Momentum      (FWD=10d):  VCB, BID, MBB, MWG, CTG, FRT, REE, FPT, GMD, STB, PNJ, TCB
+                             + SSI, VND, VIX, CTS, VCI, HAG, BCM, ORS, BSR, VSC,
+                               DIG, LPB, FTS, APG, VDS (S31 expand Tier 1)
 
 VNI Filter (MR only): vni_atr_ratio >= median training (soft info, shown in signal)
 """
@@ -37,9 +40,20 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # ── Watchlist & Config ────────────────────────────────────────────────────────
-MR_SYMBOLS  = ["DCM", "NKG", "DPM", "HAH", "HCM", "HSG", "DGC", "GAS"]
-MOM_SYMBOLS = ["VCB", "BID", "MBB", "MWG", "CTG", "FRT", "REE", "FPT",
-               "GMD", "STB", "PNJ", "TCB"]
+MR_SYMBOLS  = [
+    # Original (S30)
+    "DCM", "NKG", "DPM", "HAH", "HCM", "HSG", "DGC", "GAS",
+    # Tier 1 expand (S31) — Score >= 5, WFE validated
+    "NLG", "HDB", "BMP",
+]
+MOM_SYMBOLS = [
+    # Original (S30)
+    "VCB", "BID", "MBB", "MWG", "CTG", "FRT", "REE", "FPT",
+    "GMD", "STB", "PNJ", "TCB",
+    # Tier 1 expand (S31) — Score >= 5, WFE validated
+    "SSI", "VND", "VIX", "CTS", "VCI", "HAG", "BCM",
+    "ORS", "BSR", "VSC", "DIG", "LPB", "FTS", "APG", "VDS",
+]
 
 FWD_DAYS = {"Mean Reversion": 20, "Momentum": 10}
 
@@ -95,6 +109,26 @@ SYMBOL_STATS = {
     "STB": {"wr": 43, "exp": 0.9,  "wfe": 0.00, "n": 73,  "pf": 1.05, "cluster": "Momentum"},
     "PNJ": {"wr": 47, "exp": 0.4,  "wfe": 3.27, "n": 57,  "pf": 1.23, "cluster": "Momentum"},
     "TCB": {"wr": 54, "exp": 0.3,  "wfe": 0.70, "n": 68,  "pf": 1.63, "cluster": "Momentum"},
+    # ── Tier 1 expand S31 — Mean Reversion ───────────────────────────────────
+    "NLG": {"wr": 61, "exp": 4.0,  "wfe": 1.11, "n": 136, "pf": 1.89, "cluster": "Mean Reversion"},
+    "HDB": {"wr": 62, "exp": 2.5,  "wfe": 1.25, "n": 135, "pf": 1.93, "cluster": "Mean Reversion"},
+    "BMP": {"wr": 55, "exp": 2.4,  "wfe": 1.34, "n": 171, "pf": 1.43, "cluster": "Mean Reversion"},
+    # ── Tier 1 expand S31 — Momentum ─────────────────────────────────────────
+    "SSI": {"wr": 63, "exp": 3.8,  "wfe": 35.73,"n": 236, "pf": 2.43, "cluster": "Momentum"},
+    "VND": {"wr": 62, "exp": 4.7,  "wfe": 4.75, "n": 257, "pf": 2.30, "cluster": "Momentum"},
+    "VIX": {"wr": 57, "exp": 4.3,  "wfe": 3.97, "n": 231, "pf": 1.85, "cluster": "Momentum"},
+    "CTS": {"wr": 63, "exp": 6.3,  "wfe": 1.59, "n": 222, "pf": 2.38, "cluster": "Momentum"},
+    "VCI": {"wr": 71, "exp": 5.6,  "wfe": 1.05, "n": 194, "pf": 3.42, "cluster": "Momentum"},
+    "HAG": {"wr": 60, "exp": 4.1,  "wfe": 7.21, "n": 246, "pf": 2.10, "cluster": "Momentum"},
+    "BCM": {"wr": 51, "exp": 2.8,  "wfe": 12.08,"n": 162, "pf": 1.50, "cluster": "Momentum"},
+    "ORS": {"wr": 54, "exp": 3.7,  "wfe": 2.49, "n": 214, "pf": 1.64, "cluster": "Momentum"},
+    "BSR": {"wr": 57, "exp": 2.4,  "wfe": 3.92, "n": 250, "pf": 1.86, "cluster": "Momentum"},
+    "VSC": {"wr": 60, "exp": 1.6,  "wfe": 4.82, "n": 223, "pf": 2.09, "cluster": "Momentum"},
+    "DIG": {"wr": 59, "exp": 3.6,  "wfe": 1.35, "n": 244, "pf": 2.00, "cluster": "Momentum"},
+    "LPB": {"wr": 56, "exp": 2.0,  "wfe": 2.67, "n": 229, "pf": 1.79, "cluster": "Momentum"},
+    "FTS": {"wr": 62, "exp": 4.7,  "wfe": 1.11, "n": 268, "pf": 2.34, "cluster": "Momentum"},
+    "APG": {"wr": 55, "exp": 4.3,  "wfe": 1.75, "n": 219, "pf": 1.72, "cluster": "Momentum"},
+    "VDS": {"wr": 59, "exp": 4.2,  "wfe": 1.40, "n": 222, "pf": 2.08, "cluster": "Momentum"},
 }
 
 # SL từ MAE p25 analysis
@@ -439,14 +473,24 @@ def _format_signal(sig: dict, vni_info: dict) -> str:
         lines.append(f"*VNI ATR:* {vni_info['status']}")
 
     # Profit Factor
-    pf = stats.get("pf", 0)
+    pf  = stats.get("pf", 0)
     pf_str = f"{pf:.2f}" if pf else "?"
+
+    # Sizing Score = Exp × PF × WFE → normalized thành 3 tier
+    sizing_score = (stats.get("exp", 0) * pf * wfe) if (pf and wfe) else 0
+    if sizing_score >= 10:
+        size_rec = "⬆️ TĂNG SIZE (2-3% account)"
+    elif sizing_score >= 5:
+        size_rec = "➡️ NORMAL SIZE (1-2% account)"
+    else:
+        size_rec = "⬇️ MIN SIZE (0.5-1% account)"
 
     lines += [
         f"",
         f"*📊 Walk Forward OOS (2022→nay):*",
         f"  WR={stats.get('wr', '?')}% | Exp={stats.get('exp', '?'):+.1f}% | "
         f"PF={pf_str} | WFE={wfe:.2f} | n={stats.get('n', '?')}",
+        f"  Score={sizing_score:.1f} → {size_rec}",
         f"",
         f"*🎯 Trade Plan:*",
         f"  Entry: Close hôm nay ~{sig['entry_price']:,.0f}",
