@@ -359,6 +359,11 @@ def run_analysis(symbol: str) -> dict:
 if __name__ == "__main__":
     symbols = sys.argv[1:] if len(sys.argv) > 1 else ["MWG"]
 
+    # Bước 0: phân tích tốc độ thay đổi trước
+    for sym in symbols:
+        analyze_variability(sym.upper())
+
+
     # Chạy tất cả window để so sánh
     windows = [2, 5, 10, 15]
 
@@ -431,3 +436,94 @@ if __name__ == "__main__":
             row = f"{ind:<16} " + " ".join(f"{s:>+7.3f}" for s in scores) + f"  {avg_abs:.3f}"
             print(row)
         print("="*55)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHÂN TÍCH TỐC ĐỘ THAY ĐỔI — chỉ số nào thay đổi đủ nhanh để phân biệt ngày
+# ══════════════════════════════════════════════════════════════════════════════
+
+def analyze_variability(symbol: str):
+    """
+    Với mỗi chỉ số, đo:
+      1. std_daily   : độ lệch chuẩn ngày qua ngày → thay đổi nhanh hay chậm
+      2. autocorr_1  : tự tương quan lag-1 → nếu gần 1.0 = thay đổi rất chậm
+      3. pct_days_diff: % ngày mà chỉ số thay đổi > 5% so với ngày trước
+
+    Chỉ số tốt để phân biệt ngày: autocorr thấp + std_daily cao
+    """
+    import pandas as pd
+
+    print(f"\n{'='*60}")
+    print(f"TOC DO THAY DOI CHI SO — {symbol}")
+    print(f"(autocorr gần 1.0 = thay đổi chậm = khó phân biệt ngày)")
+    print(f"{'='*60}")
+
+    try:
+        from vn_loader import load_vn_ohlcv
+        df = load_vn_ohlcv(symbol, days=2000, min_bars=200)
+        df["date"] = pd.to_datetime(df["date"])
+        train_df = df[
+            (df["date"] >= TRAIN_START) &
+            (df["date"] <= TRAIN_END)
+        ].reset_index(drop=True)
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return
+
+    ind_df = compute_all_indicators(train_df)
+
+    print(f"\n{'Indicator':<16} {'AutoCorr':>9} {'Std_daily':>10} {'%Ngay_diff5%':>13}  Nhan_xet")
+    print("-" * 70)
+
+    results = []
+    for ind in ALL_INDICATORS:
+        if ind not in ind_df.columns:
+            continue
+        vals = ind_df[ind].dropna().values
+
+        # Tự tương quan lag-1
+        if len(vals) > 10:
+            autocorr = float(pd.Series(vals).autocorr(lag=1))
+        else:
+            autocorr = 0.0
+
+        # Std của thay đổi ngày qua ngày
+        daily_changes = np.diff(vals)
+        std_daily = float(np.std(daily_changes))
+
+        # % ngày thay đổi > 5% range của chỉ số
+        val_range = float(np.nanmax(vals) - np.nanmin(vals))
+        if val_range > 0:
+            pct_diff = float(np.mean(np.abs(daily_changes) > 0.05 * val_range) * 100)
+        else:
+            pct_diff = 0.0
+
+        # Nhận xét
+        if autocorr > 0.95:
+            nhan_xet = "⛔ Qua cham"
+        elif autocorr > 0.85:
+            nhan_xet = "⚠️  Cham"
+        elif autocorr > 0.70:
+            nhan_xet = "🟡 Trung binh"
+        else:
+            nhan_xet = "✅ Nhanh"
+
+        results.append({
+            "indicator": ind,
+            "autocorr":  autocorr,
+            "std_daily": std_daily,
+            "pct_diff":  pct_diff,
+            "nhan_xet":  nhan_xet,
+        })
+
+    # Sort theo autocorr tăng dần (nhanh nhất lên đầu)
+    results.sort(key=lambda x: x["autocorr"])
+
+    for r in results:
+        print(
+            f"{r['indicator']:<16} {r['autocorr']:>+9.3f} {r['std_daily']:>10.4f} "
+            f"{r['pct_diff']:>12.1f}%  {r['nhan_xet']}"
+        )
+
+    print(f"\n→ Chỉ dùng chỉ số có autocorr < 0.85 để phân biệt ngày hiệu quả")
+    return results
