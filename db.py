@@ -943,3 +943,49 @@ def delete_analog_config(symbol: str) -> bool:
         if conn:
             try: conn.close()
             except Exception: pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WATCHLIST HELPERS — tách từ batch_scanner.py (S31 cleanup)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_watchlist() -> list[str]:
+    """
+    Load danh sách mã từ WATCHLIST env var.
+    Fallback về danh sách mặc định nếu không có.
+    """
+    raw = os.environ.get("WATCHLIST", "VCB,HPG,FPT,HAH,STB,DVP")
+    symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    # Deduplicate giữ thứ tự
+    seen, unique = set(), []
+    for s in symbols:
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+    logger.info(f"[Watchlist] {len(unique)} mã: {', '.join(unique)}")
+    return unique
+
+
+# In-memory cache cho scan result (reset mỗi lần bot restart)
+_last_scan_result_cache: dict | None = None
+
+
+def get_last_scan_result(scan_type: str = "watchlist") -> dict | None:
+    """
+    Trả về kết quả scan mới nhất.
+    Ưu tiên: in-memory cache → PostgreSQL (tồn tại qua restart & Render deploy).
+    Dùng bởi morning_briefing.py.
+    """
+    global _last_scan_result_cache
+    # 1. In-memory (scan đã chạy trong session hiện tại)
+    if _last_scan_result_cache is not None:
+        return _last_scan_result_cache
+    # 2. PostgreSQL
+    try:
+        result = load_scan_result(scan_type=scan_type)
+        if result:
+            _last_scan_result_cache = result
+            return result
+    except Exception as e:
+        logger.warning(f"[ScanCache] DB load fail (non-critical): {e}")
+    return None

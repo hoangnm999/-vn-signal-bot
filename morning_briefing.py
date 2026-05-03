@@ -91,7 +91,7 @@ def _get_top_symbols_fast(n: int = TOP_N_SCAN) -> tuple[list[dict], bool]:
 
     # Đọc qua get_last_scan_result() — PostgreSQL backend, tồn tại qua Render deploy
     try:
-        from batch_scanner import get_last_scan_result
+        from db import get_last_scan_result
         # Thử watchlist trước, fallback hose nếu watchlist chưa có
         scan_result = get_last_scan_result(scan_type="watchlist")
         if not scan_result or not scan_result.get("ranked"):
@@ -137,7 +137,7 @@ def _get_top_symbols_fast(n: int = TOP_N_SCAN) -> tuple[list[dict], bool]:
 
     # Fallback: watchlist thô (không có score — cần /scan_watchlist trước)
     try:
-        from batch_scanner import load_watchlist
+        from db import load_watchlist
         symbols = load_watchlist()[:n]
         logger.info(f"morning: no scan cache, using raw watchlist ({len(symbols)} symbols)")
         return [{"symbol": s, "score": 0.0, "wr": 0.0, "rr": 0.0,
