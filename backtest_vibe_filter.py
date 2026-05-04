@@ -301,10 +301,44 @@ def load_symbol(symbol: str) -> Optional[pd.DataFrame]:
 # VIBE AGENT RUNNER (wrapper gọi vibe_skills.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Timeout (giây) cho mỗi engine call — tránh treo vô hạn khi engine fetch HTTP
+ENGINE_TIMEOUT_SEC = 8
+
+def _run_engine_safe(name: str, engine, data_map: dict,
+                     symbol: str, timeout: int = ENGINE_TIMEOUT_SEC) -> int:
+    """
+    Chay 1 engine với hard timeout dùng signal.alarm (Linux only).
+    Trả về signal int (+1/0/-1), hoặc 0 nếu timeout/exception.
+    """
+    import signal as _signal
+
+    class _Timeout(Exception):
+        pass
+
+    def _handler(signum, frame):
+        raise _Timeout()
+
+    old_handler = _signal.signal(_signal.SIGALRM, _handler)
+    _signal.alarm(timeout)
+    try:
+        sigs, _ = engine.generate(data_map)
+        return int(sigs.get(symbol, 0))
+    except _Timeout:
+        logger.warning(f"[Vibe] {symbol}/{name}: TIMEOUT >{timeout}s — skip")
+        return 0
+    except Exception as e:
+        logger.debug(f"[Vibe] {symbol}/{name}: {e}")
+        return 0
+    finally:
+        _signal.alarm(0)
+        _signal.signal(_signal.SIGALRM, old_handler)
+
+
 def run_vibe_on_slice(symbol: str, df_slice: pd.DataFrame) -> dict:
     """
     Chay cac vibe engines tren df_slice (data den ngay i, khong lookahead).
-    Skip engines trong SKIP_ENGINES (MLStrategy, FundamentalFilter, Seasonal).
+    - Skip engines trong SKIP_ENGINES
+    - Hard timeout ENGINE_TIMEOUT_SEC giay moi engine
     Tra ve {engine_name: int} -- +1 bull / -1 bear / 0 neutral
     """
     try:
@@ -319,12 +353,7 @@ def run_vibe_on_slice(symbol: str, df_slice: pd.DataFrame) -> dict:
         for name, engine in _ENGINES.items():
             if name in SKIP_ENGINES:
                 continue
-            try:
-                sigs, _ = engine.generate(data_map)
-                signals[name] = sigs.get(symbol, 0)
-            except Exception as e:
-                signals[name] = 0
-                logger.debug(f"[Vibe] {symbol}/{name}: {e}")
+            signals[name] = _run_engine_safe(name, engine, data_map, symbol)
 
         return signals
     except ImportError:
