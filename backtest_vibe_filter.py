@@ -353,7 +353,9 @@ def run_vibe_on_slice(symbol: str, df_slice: pd.DataFrame) -> dict:
         for name, engine in _ENGINES.items():
             if name in SKIP_ENGINES:
                 continue
+            logger.debug(f"[Vibe] {symbol} running engine: {name}")
             signals[name] = _run_engine_safe(name, engine, data_map, symbol)
+            logger.debug(f"[Vibe] {symbol} engine done: {name} -> {signals[name]}")
 
         return signals
     except ImportError:
@@ -560,7 +562,7 @@ def step1_cohen_d(cluster: str, symbols: list[str]) -> pd.DataFrame:
 
         for idx, (i, d, fwd_ret) in enumerate(signal_rows):
             if idx % 20 == 0 and idx > 0:
-                logger.info(f"  [{sym}] vibe progress: {idx}/{len(signal_rows)}")
+                logger.info(f"  [{sym}] vibe progress: {idx}/{len(signal_rows)} (date={d})")
 
             # Vibe signals (khong lookahead)
             df_slice = df.iloc[: i + 1].copy()
