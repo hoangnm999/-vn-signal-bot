@@ -184,12 +184,11 @@ TRAIL_CONFIG = {
 # Chỉnh theo vốn thực tế của bạn
 ACCOUNT_SIZE = 300_000_000  # 300 triệu
 
-# Risk per trade theo Score tier (% account)
-RISK_PCT = {
-    "HIGH":   1.5,   # Score >= 20  → 1.5% = 4.5 triệu
-    "NORMAL": 1.0,   # Score 5-20   → 1.0% = 3 triệu
-    "LOW":    0.5,   # Score < 5    → 0.5% = 1.5 triệu
-}
+# Continuous position sizing config
+BASE_RISK_PCT  = 1.0    # % account cho mã có Score = MEDIAN_SCORE
+MIN_RISK_PCT   = 0.4    # % tối thiểu (mã yếu nhất)
+MAX_RISK_PCT   = 2.0    # % tối đa (mã mạnh nhất, 2x base)
+MEDIAN_SCORE   = 8.4    # median score của toàn watchlist (tính từ data)
 
 # Max concurrent positions & max exposure
 MAX_POSITIONS  = 6
@@ -204,42 +203,57 @@ _morning_signals: dict = {}   # symbol → signal_info (từ 8:30 scan)
 def _calc_position_size(entry_price: float, sl_pct: float,
                         sizing_score: float) -> dict:
     """
-    Tính số cổ phù hợp dựa trên risk-based position sizing.
-    Returns dict với qty, value, risk_amount, risk_tier.
-    """
-    # Xác định risk tier từ sizing score
-    if sizing_score >= 20:
-        risk_tier = "HIGH"
-    elif sizing_score >= 5:
-        risk_tier = "NORMAL"
-    else:
-        risk_tier = "LOW"
+    Continuous position sizing — tỷ lệ trực tiếp với Score (log scale).
 
-    risk_pct    = RISK_PCT[risk_tier]
-    risk_amount = ACCOUNT_SIZE * risk_pct / 100          # VND rủi ro tối đa
-    sl_value    = entry_price * abs(sl_pct) / 100         # VND mất mỗi cổ nếu chạm SL
+    Formula:
+        risk_pct = BASE_RISK_PCT × log(1 + score) / log(1 + MEDIAN_SCORE)
+        Clamped: [MIN_RISK_PCT, MAX_RISK_PCT]
+
+    Dùng log scale để tránh outlier score (SSI=329) chiếm quá nhiều size.
+    Mã có Score = MEDIAN (8.4) → risk = BASE_RISK_PCT (1%)
+    Mã có Score > median       → risk tăng dần, max 2x
+    Mã có Score < median       → risk giảm dần, min 0.4x
+    """
+    import math
+
+    # Log-scaled risk
+    score       = max(sizing_score, 0.1)   # tránh log(0)
+    log_score   = math.log(1 + score)
+    log_median  = math.log(1 + MEDIAN_SCORE)
+    raw_risk    = BASE_RISK_PCT * (log_score / log_median)
+    risk_pct    = round(max(MIN_RISK_PCT, min(MAX_RISK_PCT, raw_risk)), 2)
+
+    risk_amount = ACCOUNT_SIZE * risk_pct / 100
+    sl_value    = entry_price * abs(sl_pct) / 100
     if sl_value <= 0:
         return {}
 
-    raw_qty  = risk_amount / sl_value                    # số cổ lý thuyết
-    qty      = max(100, int(raw_qty / 100) * 100)        # làm tròn xuống bội số 100
-    value    = qty * entry_price                          # giá trị lệnh
-    exposure = value / ACCOUNT_SIZE * 100                # % vốn
+    raw_qty  = risk_amount / sl_value
+    qty      = max(100, int(raw_qty / 100) * 100)
+    value    = qty * entry_price
+    exposure = value / ACCOUNT_SIZE * 100
 
-    # Cảnh báo nếu value lệnh quá lớn (> MAX_EXPOSURE / MAX_POSITIONS)
+    # Cap tại max per trade
     max_per_trade = ACCOUNT_SIZE * MAX_EXPOSURE / MAX_POSITIONS
     if value > max_per_trade:
-        # Cap lại để không vượt quá giới hạn
-        qty   = max(100, int(max_per_trade / entry_price / 100) * 100)
-        value = qty * entry_price
+        qty      = max(100, int(max_per_trade / entry_price / 100) * 100)
+        value    = qty * entry_price
         exposure = value / ACCOUNT_SIZE * 100
+
+    # Label để hiển thị
+    if risk_pct >= BASE_RISK_PCT * 1.5:
+        size_label = "⬆️ TĂNG SIZE"
+    elif risk_pct >= BASE_RISK_PCT * 0.8:
+        size_label = "➡️ BÌNH THƯỜNG"
+    else:
+        size_label = "⬇️ GIẢM SIZE"
 
     return {
         "qty":         qty,
         "value":       value,
         "risk_amount": round(risk_amount),
         "risk_pct":    risk_pct,
-        "risk_tier":   risk_tier,
+        "size_label":  size_label,
         "exposure":    round(exposure, 1),
     }
 
@@ -600,21 +614,15 @@ def _format_signal(sig: dict, vni_info: dict,
     pf  = stats.get("pf", 0)
     pf_str = f"{pf:.2f}" if pf else "?"
 
-    # Sizing Score = Exp × PF × WFE → normalized thành 3 tier
+    # Continuous sizing score = Exp × PF × WFE
     sizing_score = (stats.get("exp", 0) * pf * wfe) if (pf and wfe) else 0
-    if sizing_score >= 10:
-        size_rec = "⬆️ TĂNG SIZE (2-3% account)"
-    elif sizing_score >= 5:
-        size_rec = "➡️ NORMAL SIZE (1-2% account)"
-    else:
-        size_rec = "⬇️ MIN SIZE (0.5-1% account)"
 
     lines += [
         f"",
         f"*📊 Walk Forward OOS (2022→nay):*",
         f"  WR={stats.get('wr', '?')}% | Exp={stats.get('exp', '?'):+.1f}% | "
         f"PF={pf_str} | WFE={wfe:.2f} | n={stats.get('n', '?')}",
-        f"  Score={sizing_score:.1f} → {size_rec}",
+        f"  Score={sizing_score:.1f} (median={MEDIAN_SCORE})",
         f"",
         f"*🎯 Trade Plan:*",
         f"  Entry: Close hôm nay ~{sig['entry_price']:,.0f}",
@@ -638,19 +646,18 @@ def _format_signal(sig: dict, vni_info: dict,
     # Position sizing cụ thể
     ps = _calc_position_size(sig["entry_price"], sig["sl_pct"], sizing_score)
     if ps:
-        risk_tier_label = {"HIGH": "⬆️ CAO", "NORMAL": "➡️ BÌNH THƯỜNG", "LOW": "⬇️ THẤP"}
         lines += [
             f"",
             f"*💰 Position Sizing ({ACCOUNT_SIZE/1e6:.0f}M account):*",
-            f"  Tier: {risk_tier_label.get(ps['risk_tier'], '')} "
-            f"(risk {ps['risk_pct']}% = {ps['risk_amount']/1e6:.1f}M)",
+            f"  {ps['size_label']} — risk {ps['risk_pct']}% "
+            f"= {ps['risk_amount']/1e6:.1f}M",
             f"  → Mua: *{ps['qty']:,} cổ* (~{ps['value']/1e6:.1f}M, "
             f"chiếm {ps['exposure']}% vốn)",
             f"  → Max loss nếu chạm SL: "
             f"~{ps['risk_amount']/1e6:.1f}M ({ps['risk_pct']}% account)",
         ]
     else:
-        lines.append(f"  Size: Risk 1% account")
+        lines.append(f"  Size: Risk {BASE_RISK_PCT}% account")
 
     return "\n".join(lines)
 
