@@ -120,6 +120,20 @@ VIBE_DISAGREE_BONUS = -0.20  # -20% score khi ngược chiều
 
 MIN_TRADES_REPORT = 5  # tối thiểu số trades để báo kết quả
 
+# --- Engines bị skip trong backtest ---
+# MLStrategy      : RandomForest fit lại trên mỗi df_slice -> rat cham (~10 phut/symbol).
+#                   Refit tren same data cung la leakage risk trong backtest context.
+# FundamentalFilter: HTTP call (Fireant/KBS) moi lan goi, khong co cache per-date
+#                   -> treo pipeline. Fundamental la static, khong thay doi theo
+#                   signal date trong lich su -> khong phu hop lam time-series filter.
+# Seasonal        : Chi lookup month/weekday co dinh, khong dung df -> predictive
+#                   power rat thap, bo de pipeline gon.
+SKIP_ENGINES: set = {
+    "MLStrategy",
+    "FundamentalFilter",
+    "Seasonal",
+}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INDICATOR HELPERS (replicate cluster_scanner.py)
@@ -289,15 +303,32 @@ def load_symbol(symbol: str) -> Optional[pd.DataFrame]:
 
 def run_vibe_on_slice(symbol: str, df_slice: pd.DataFrame) -> dict:
     """
-    Chạy tất cả vibe engines trên df_slice (data đến ngày i, không lookahead).
-    Trả về {engine_name: int} — +1 bull / -1 bear / 0 neutral
+    Chay cac vibe engines tren df_slice (data den ngay i, khong lookahead).
+    Skip engines trong SKIP_ENGINES (MLStrategy, FundamentalFilter, Seasonal).
+    Tra ve {engine_name: int} -- +1 bull / -1 bear / 0 neutral
     """
     try:
-        from vibe_skills import run_vibe_agents
-        result = run_vibe_agents(symbol, df_slice)
-        return result.get("signals", {})
+        from vibe_skills import _ENGINES, _prep
+        df_prep = _prep(df_slice)
+        if len(df_prep) < 20:
+            return {}
+
+        data_map = {symbol: df_prep}
+        signals: dict = {}
+
+        for name, engine in _ENGINES.items():
+            if name in SKIP_ENGINES:
+                continue
+            try:
+                sigs, _ = engine.generate(data_map)
+                signals[name] = sigs.get(symbol, 0)
+            except Exception as e:
+                signals[name] = 0
+                logger.debug(f"[Vibe] {symbol}/{name}: {e}")
+
+        return signals
     except ImportError:
-        logger.error("Không tìm thấy vibe_skills.py — đặt vào cùng thư mục")
+        logger.error("Khong tim thay vibe_skills.py -- dat vao cung thu muc")
         return {}
     except Exception as e:
         logger.debug(f"[Vibe] {symbol}: {e}")
@@ -477,26 +508,32 @@ def step1_cohen_d(cluster: str, symbols: list[str]) -> pd.DataFrame:
         if thresh is None:
             continue
 
+        # Pre-scan: dem so cluster signals truoc (khong goi vibe)
+        signal_rows = []
         for i in range(200, train_end_idx - fwd):
             d = dates_arr[i]
             if d < DATA_START:
                 continue
-
             ind = _indicators_at(df, i, atr_ser)
             if ind is None:
                 continue
-            # Chỉ lấy rows ĐÃ có cluster signal (tránh vibe chạy trên toàn bộ data)
             if not _has_cluster_signal(ind, thresh, cluster):
                 continue
-
-            # Forward return
             if i + 1 + fwd >= len(closes):
                 continue
             entry  = closes[i + 1]
             exit_  = closes[i + 1 + fwd]
             fwd_ret = (exit_ / entry - 1) * 100 - FEE_PCT
+            signal_rows.append((i, d, fwd_ret))
 
-            # Vibe signals (không lookahead)
+        logger.info(f"  [{sym}] {len(signal_rows)} cluster signals -> chay vibe engines "
+                    f"(skip: {SKIP_ENGINES})")
+
+        for idx, (i, d, fwd_ret) in enumerate(signal_rows):
+            if idx % 20 == 0 and idx > 0:
+                logger.info(f"  [{sym}] vibe progress: {idx}/{len(signal_rows)}")
+
+            # Vibe signals (khong lookahead)
             df_slice = df.iloc[: i + 1].copy()
             vibe_sigs = run_vibe_on_slice(sym, df_slice)
             if not vibe_sigs:

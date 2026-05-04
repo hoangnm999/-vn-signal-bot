@@ -161,6 +161,7 @@ SYMBOL_STATS = {
 SL_CONFIG = {
     "Mean Reversion": -13.5,  # p25 MAE
     "Momentum":       -6.4,   # p25 MAE
+    "Breakout":       -6.4,   # dùng MOM SL (quyết định S31, MAE riêng TBD)
 }
 
 # Trailing Stop config — validated từ backtest + walk forward (S31)
@@ -541,6 +542,11 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
     if cluster == "Mean Reversion":
         regime_detail = (f"Giá dưới SMA50 ({val:+.1f}%) | "
                          f"SMA50={ind['sma50']:.1f}")
+    elif cluster == "Breakout":
+        consol_pct = ind.get("consolidation", 0) * 100
+        regime_detail = (f"BB rộng (width={val:.1f}%) | "
+                         f"Sideways {consol_pct:.0f}% ngày | "
+                         f"Vol dry-up={ind.get('vol_dry_up', 0):+.2f}x")
     else:
         regime_detail = (f"EMA12 > EMA26 ({val:+.2f}%) | "
                          f"EMA12={ind['ema12']:.1f} EMA26={ind['ema26']:.1f}")
@@ -737,11 +743,6 @@ def _format_morning_scan(
             elif sig["symbol"] in MOM_SYMBOLS:
                 dual_tag = " _(+MOM)_"
             sig_text = "\n" + _format_signal(sig, vni_info, extra_tag=dual_tag) + "\n"
-            if len(current) + len(sig_text) > 3800:
-                messages.append(current)
-                current = sig_text
-            else:
-                current += sig_text
             if len(current) + len(sig_text) > 3800:
                 messages.append(current)
                 current = sig_text
