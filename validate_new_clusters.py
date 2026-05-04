@@ -419,7 +419,7 @@ def run():
             print(f"{status_icon} {wf['status']} "
                   f"WFE={wf.get('avg_wfe','?')} "
                   f"consistency={wf.get('consistency','?')}% "
-                  f"OOS_exp={wf.get('avg_oos_exp','?'):+}%")
+                  f"OOS_exp={wf.get('avg_oos_exp',0):+.3f}%")
 
             # Print fold details
             for fold in wf.get("folds", []):
