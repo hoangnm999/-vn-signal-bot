@@ -55,7 +55,18 @@ MOM_SYMBOLS = [
     "ORS", "BSR", "VSC", "DIG", "LPB", "FTS", "APG", "VDS",
 ]
 
-FWD_DAYS = {"Mean Reversion": 20, "Momentum": 10}
+# Breakout cluster (S31 — validated từ discover_clusters_v2 + walk forward)
+# Score >= 5, chưa có trong MR/MOM watchlist
+BREAKOUT_SYMBOLS = [
+    # Mã chỉ thuộc Breakout
+    "VIB", "KBC", "KSB", "HT1", "SHB", "GVR", "SIP",
+    # Mã thuộc cả MR + Breakout (nhận signal từ 2 cluster)
+    "DGC", "DCM", "NKG", "HSG",
+    # Mã thuộc cả MOM + Breakout (nhận signal từ 2 cluster)
+    "VIX", "FPT", "TCB", "BSR", "VND", "GMD", "LPB",
+]
+
+FWD_DAYS = {"Mean Reversion": 20, "Momentum": 10, "Breakout": 15}
 
 # Cron times (UTC)
 MORNING_HOUR,   MORNING_MINUTE   = 1, 30   # 08:30 VN
@@ -78,6 +89,13 @@ SIGNAL_CONFIG = {
         "trigger_direction": {"momentum_5d": "high", "volume_spike": "high",
                               "candle_body": "high"},
         "description": "Mua khi EMA12>EMA26 + momentum mạnh + volume xác nhận",
+    },
+    "Breakout": {
+        "regime_indicator":  "bb_squeeze",
+        "regime_condition":  "high",
+        "trigger_indicators":["consolidation", "vol_dry_up"],
+        "trigger_direction": {"consolidation": "low", "vol_dry_up": "high"},
+        "description": "Mua khi BB rộng + giá sideways + volume khô → bứt phá",
     },
 }
 
@@ -129,6 +147,14 @@ SYMBOL_STATS = {
     "FTS": {"wr": 62, "exp": 4.7,  "wfe": 1.11, "n": 268, "pf": 2.34, "cluster": "Momentum"},
     "APG": {"wr": 55, "exp": 4.3,  "wfe": 1.75, "n": 219, "pf": 1.72, "cluster": "Momentum"},
     "VDS": {"wr": 59, "exp": 4.2,  "wfe": 1.40, "n": 222, "pf": 2.08, "cluster": "Momentum"},
+    # Breakout cluster S31 (validated)
+    "VIB": {"wr": 67, "exp": 4.75, "wfe": 1.11, "n": 247, "pf": 3.79, "cluster": "Breakout"},
+    "KBC": {"wr": 56, "exp": 5.04, "wfe": 4.66, "n": 238, "pf": 2.06, "cluster": "Breakout"},
+    "KSB": {"wr": 64, "exp": 4.89, "wfe": 7.01, "n": 251, "pf": 1.96, "cluster": "Breakout"},
+    "HT1": {"wr": 71, "exp": 5.05, "wfe": 1.72, "n": 236, "pf": 3.07, "cluster": "Breakout"},
+    "SHB": {"wr": 60, "exp": 7.99, "wfe": 2.54, "n": 193, "pf": 3.08, "cluster": "Breakout"},
+    "GVR": {"wr": 67, "exp": 6.07, "wfe": 1.99, "n": 220, "pf": 2.53, "cluster": "Breakout"},
+    "SIP": {"wr": 60, "exp": 3.00, "wfe": 1.38, "n": 219, "pf": 1.83, "cluster": "Breakout"},
 }
 
 # SL từ MAE p25 analysis
@@ -263,6 +289,18 @@ def _compute_indicators(df: pd.DataFrame) -> dict | None:
     vs20v = vsma20[i] if np.isfinite(vsma20[i]) else vol[i]
     c5    = close[max(i - 5, 0)]
 
+    # Breakout indicators
+    vsma60   = _sma(vol, 60)
+    vsma60_v = vsma60[i] if np.isfinite(vsma60[i]) else vs20v
+    bb_std_v = float(pd.Series(close[:i+1]).rolling(20).std().iloc[-1]) if i >= 20 else atr_v
+    bb_width = float(4 * bb_std_v / (s20 + 1e-9) * 100)
+
+    def _consol_val(c_arr, idx):
+        if idx < 15: return 0.5
+        window = c_arr[idx-14:idx+1]
+        mid    = c_arr[idx]
+        return float(np.sum(np.abs(window - mid) / (mid + 1e-9) < 0.03)) / len(window)
+
     return {
         "close":          px,
         "price_vs_sma50": float((px - s50) / (px + 1e-9) * 100),
@@ -280,6 +318,10 @@ def _compute_indicators(df: pd.DataFrame) -> dict | None:
         "last_date":      str(df["date"].iloc[i])[:10],
         "volume":         float(vol[i]),
         "vol_sma20":      float(vs20v),
+        # Breakout cluster indicators
+        "bb_squeeze":    bb_width,
+        "consolidation": _consol_val(close, i),
+        "vol_dry_up":    float((vs20v / (vsma60_v + 1e-9)) - 1.0),
     }
 
 
@@ -325,6 +367,14 @@ def _compute_thresholds_from_training(df: pd.DataFrame,
         s50   = sma50[i]  if np.isfinite(sma50[i])  else px
         vs20v = vsma20[i] if np.isfinite(vsma20[i]) else vol[i]
         c5    = close[max(i - 5, 0)]
+        # Breakout indicators
+        vsma60_   = _sma(vol, 60)
+        vsma60_v_ = vsma60_[i] if np.isfinite(vsma60_[i]) else vs20v
+        bb_std_   = pd.Series(close[:i+1]).rolling(20).std().iloc[-1] if i >= 20 else atr_v
+        bb_width_ = float(4 * float(bb_std_) / (px + 1e-9) * 100)
+        window_   = close[max(0,i-14):i+1]
+        consol_   = float(np.sum(np.abs(window_ - px) / (px + 1e-9) < 0.03)) / max(len(window_), 1)
+
         rows.append({
             "price_vs_sma50": float((px - s50) / (px + 1e-9) * 100),
             "ema_cross":      float((ema12[i] - ema26[i]) / (px + 1e-9) * 100),
@@ -332,6 +382,9 @@ def _compute_thresholds_from_training(df: pd.DataFrame,
             "volume_spike":   float((vol[i] / (vs20v + 1e-9)) - 1.0),
             "stoch_k":        float(stoch[i]),
             "candle_body":    float(np.clip(abs(px - opn[i]) / (atr_v + 1e-9), 0, 3)),
+            "bb_squeeze":     bb_width_,
+            "consolidation":  consol_,
+            "vol_dry_up":     float((vs20v / (vsma60_v_ + 1e-9)) - 1.0),
         })
 
     reg_ind  = cfg["regime_indicator"]
@@ -508,16 +561,21 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
 
 # ── Format Telegram messages ──────────────────────────────────────────────────
 
-def _format_signal(sig: dict, vni_info: dict) -> str:
+def _format_signal(sig: dict, vni_info: dict,
+                   extra_tag: str = "") -> str:
     """Format 1 signal thành Telegram message."""
     sym     = sig["symbol"]
     cluster = sig["cluster"]
     stats   = sig["stats"]
     fwd     = sig["fwd_days"]
 
-    # Cluster emoji
-    emoji = "🔄" if cluster == "Mean Reversion" else "🚀"
-    cluster_short = "MR" if cluster == "Mean Reversion" else "MOM"
+    # Cluster emoji + short
+    if cluster == "Mean Reversion":
+        emoji, cluster_short = "🔄", "MR"
+    elif cluster == "Momentum":
+        emoji, cluster_short = "🚀", "MOM"
+    else:
+        emoji, cluster_short = "💥", "BO"
 
     # WFE badge
     wfe = stats.get("wfe", 0)
@@ -526,7 +584,7 @@ def _format_signal(sig: dict, vni_info: dict) -> str:
                  "⭐"   if wfe >= 0.5 else "")
 
     lines = [
-        f"{emoji} *{sym}* [{cluster_short}] {wfe_badge}",
+        f"{emoji} *{sym}* [{cluster_short}]{extra_tag} {wfe_badge}",
         f"",
         f"📅 Data: {sig['last_date']} | {sig['n_triggers']}/{len(SIGNAL_CONFIG[cluster]['trigger_indicators'])} triggers",
         f"",
@@ -604,6 +662,8 @@ def _format_morning_scan(
     mom_no_signal: list[str],
     vni_info: dict,
     scan_label: str = "08:30",
+    bo_signals: list[dict] | None = None,
+    bo_no_signal: list[str] | None = None,
 ) -> list[str]:
     """Format full morning scan report."""
     vn_now = datetime.utcnow() + timedelta(hours=7)
@@ -618,11 +678,16 @@ def _format_morning_scan(
 
     total_signals = len(mr_signals) + len(mom_signals)
 
+    bo_signals    = bo_signals    or []
+    bo_no_signal  = bo_no_signal  or []
+    total_signals = len(mr_signals) + len(mom_signals) + len(bo_signals)
+
     if total_signals == 0:
         current += (
             f"\n✅ Không có signal hôm nay\n\n"
-            f"*Mean Reversion (8 mã):* Không đủ điều kiện\n"
-            f"*Momentum (12 mã):* Không đủ điều kiện\n\n"
+            f"*Mean Reversion ({len(MR_SYMBOLS)} mã):* Không đủ điều kiện\n"
+            f"*Momentum ({len(MOM_SYMBOLS)} mã):* Không đủ điều kiện\n"
+            f"*Breakout ({len(BREAKOUT_SYMBOLS)} mã):* Không đủ điều kiện\n\n"
             f"*VNI:* {vni_info['status']}\n"
             f"_(ATR={vni_info['atr_ratio']:.3f} vs threshold={vni_info['threshold']:.3f})_"
         )
@@ -654,9 +719,35 @@ def _format_morning_scan(
     else:
         current += f"\n\n🚀 *MOM:* Không có signal"
 
+    # Breakout signals
+    if bo_signals:
+        current += f"\n━━ 💥 BREAKOUT (FWD=15d) ━━\n"
+        for sig in bo_signals:
+            # Ghi chú nếu mã này cũng thuộc cluster khác
+            dual_tag = ""
+            if sig["symbol"] in MR_SYMBOLS:
+                dual_tag = " _(+MR)_"
+            elif sig["symbol"] in MOM_SYMBOLS:
+                dual_tag = " _(+MOM)_"
+            sig_text = "\n" + _format_signal(sig, vni_info, extra_tag=dual_tag) + "\n"
+            if len(current) + len(sig_text) > 3800:
+                messages.append(current)
+                current = sig_text
+            else:
+                current += sig_text
+            if len(current) + len(sig_text) > 3800:
+                messages.append(current)
+                current = sig_text
+            else:
+                current += sig_text
+    else:
+        current += f"\n\n💥 *BO:* Không có signal"
+
     # Footer
+    total_symbols = len(MR_SYMBOLS) + len(MOM_SYMBOLS) + len(BREAKOUT_SYMBOLS)
     footer = (
         f"\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"_Scan: {total_symbols} mã (MR={len(MR_SYMBOLS)}, MOM={len(MOM_SYMBOLS)}, BO={len(BREAKOUT_SYMBOLS)})_\n"
         f"*VNI ATR:* {vni_info['atr_ratio']:.3f} "
         f"({'cao ✅' if vni_info['is_high'] else 'thấp ⚠️'} "
         f"vs threshold {vni_info['threshold']:.3f})\n"
@@ -792,6 +883,7 @@ def run_morning_scan() -> tuple[list[str], dict]:
 
     mr_signals, mr_no_signal   = [], []
     mom_signals, mom_no_signal = [], []
+    bo_signals,  bo_no_signal  = [], []
 
     for sym in MR_SYMBOLS:
         sig = _scan_symbol(sym, "Mean Reversion")
@@ -809,29 +901,40 @@ def run_morning_scan() -> tuple[list[str], dict]:
         else:
             mom_no_signal.append(sym)
 
+    for sym in BREAKOUT_SYMBOLS:
+        sig = _scan_symbol(sym, "Breakout")
+        if sig:
+            bo_signals.append(sig)
+            logger.info(f"[Scanner] {sym} BO SIGNAL: {sig['trigger_str']}")
+        else:
+            bo_no_signal.append(sym)
+
     # Lưu vào memory để 12:30 update
     global _morning_signals
     _morning_signals = {}
-    for sig in mr_signals + mom_signals:
+    for sig in mr_signals + mom_signals + bo_signals:
+        cluster_short = ("MR"  if sig["cluster"] == "Mean Reversion" else
+                         "MOM" if sig["cluster"] == "Momentum" else "BO")
         _morning_signals[sig["symbol"]] = {
             "entry":         sig["entry_price"],
             "cluster":       sig["cluster"],
-            "cluster_short": "MR" if sig["cluster"] == "Mean Reversion" else "MOM",
+            "cluster_short": cluster_short,
             "scan_time":     sig["scan_time"],
             "last_date":     sig["last_date"],
         }
 
     # Ghi vao cluster_journal (S31)
-    _journal_log_signals(mr_signals + mom_signals, vni_info)
+    _journal_log_signals(mr_signals + mom_signals + bo_signals, vni_info)
 
-    total = len(mr_signals) + len(mom_signals)
+    total = len(mr_signals) + len(mom_signals) + len(bo_signals)
     logger.info(f"[Scanner] Morning scan done: {total} signals "
-                f"(MR={len(mr_signals)}, MOM={len(mom_signals)})")
+                f"(MR={len(mr_signals)}, MOM={len(mom_signals)}, BO={len(bo_signals)})")
 
     messages = _format_morning_scan(
         mr_signals, mom_signals,
         mr_no_signal, mom_no_signal,
         vni_info, "08:30",
+        bo_signals=bo_signals, bo_no_signal=bo_no_signal,
     )
     return messages, _morning_signals
 
