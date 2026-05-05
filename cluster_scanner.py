@@ -375,19 +375,23 @@ def _compute_thresholds_from_training(df: pd.DataFrame,
     denom  = np.where(hi14 - lo14 == 0, 1e-9, hi14 - lo14)
     stoch  = 100 * (close - lo14) / denom
 
+    # FIX S33 Bug 3: tính vsma60 1 lần ngoài loop, không tính lại mỗi vòng
+    vsma60 = _sma(vol, 60)
+    # FIX S33: tính bb_std toàn series 1 lần bằng rolling (nhanh hơn nhiều)
+    bb_std_series = pd.Series(close).rolling(20).std().values
+
     rows = []
     for i in range(60, n):
         px    = close[i]
-        atr_v = atr[i]   if np.isfinite(atr[i])   else px * 0.02
+        atr_v = atr[i]    if np.isfinite(atr[i])    else px * 0.02
         s50   = sma50[i]  if np.isfinite(sma50[i])  else px
         vs20v = vsma20[i] if np.isfinite(vsma20[i]) else vol[i]
         c5    = close[max(i - 5, 0)]
-        # Breakout indicators
-        vsma60_   = _sma(vol, 60)
-        vsma60_v_ = vsma60_[i] if np.isfinite(vsma60_[i]) else vs20v
-        bb_std_   = pd.Series(close[:i+1]).rolling(20).std().iloc[-1] if i >= 20 else atr_v
+        # Breakout indicators — dùng series đã tính sẵn
+        vsma60_v_ = vsma60[i] if np.isfinite(vsma60[i]) else vs20v
+        bb_std_   = bb_std_series[i] if np.isfinite(bb_std_series[i]) else atr_v
         bb_width_ = float(4 * float(bb_std_) / (px + 1e-9) * 100)
-        window_   = close[max(0,i-14):i+1]
+        window_   = close[max(0, i - 14):i + 1]
         consol_   = float(np.sum(np.abs(window_ - px) / (px + 1e-9) < 0.03)) / max(len(window_), 1)
 
         rows.append({
@@ -405,15 +409,23 @@ def _compute_thresholds_from_training(df: pd.DataFrame,
     reg_ind  = cfg["regime_indicator"]
     trig_ind = cfg["trigger_indicators"]
     trig_dir = cfg["trigger_direction"]
+    reg_cond = cfg["regime_condition"]
 
-    reg_vals   = [r[reg_ind] for r in rows if np.isfinite(r.get(reg_ind, float("nan")))]
-    reg_thresh = float(np.median(reg_vals)) if reg_vals else 0.0
+    reg_vals = [r[reg_ind] for r in rows if np.isfinite(r.get(reg_ind, float("nan")))]
+
+    # FIX S33 Bug 1: dùng percentile nhất quán với backtest (TRIGGER_PCT=70)
+    # regime "low"  → threshold = p70 (chỉ 30% ngày thấp nhất mới pass)
+    # regime "high" → threshold = p30 (chỉ 30% ngày cao nhất mới pass)
+    reg_pct    = TRIGGER_PCT if reg_cond == "low" else (100 - TRIGGER_PCT)
+    reg_thresh = float(np.percentile(reg_vals, reg_pct)) if reg_vals else 0.0
 
     trig_thresh = {}
     for t in trig_ind:
         vals = [r[t] for r in rows if np.isfinite(r.get(t, float("nan")))]
         if not vals:
             continue
+        # trigger "low"  → signal khi giá trị thấp → threshold = p30
+        # trigger "high" → signal khi giá trị cao  → threshold = p70
         if trig_dir.get(t, "high") == "low":
             trig_thresh[t] = float(np.percentile(vals, 100 - TRIGGER_PCT))
         else:
