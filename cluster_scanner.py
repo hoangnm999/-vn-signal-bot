@@ -493,7 +493,7 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
     """
     try:
         from vn_loader import load_vn_ohlcv
-        df = load_vn_ohlcv(symbol, days=400, min_bars=200)
+        df = load_vn_ohlcv(symbol, days=2000, min_bars=200)
         df["date"] = pd.to_datetime(df["date"])
     except Exception as e:
         logger.debug(f"[Scanner] {symbol} load fail: {e}")
