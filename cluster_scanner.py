@@ -324,40 +324,43 @@ TRAIL_CONFIG = {
 
 VIBE_FILTER_CONFIG = {
     "Mean Reversion": {
-        # S35 watchlist — tất cả mã mới chưa có vibe filter
-        # NAB, BMP_MR: pass cả 2 options (full pass) — ưu tiên chạy vibe backtest trước
-        # Còn lại: partial pass (chỉ Option B) — chạy vibe sau khi confirm live
-        "NAB":    {"hard": [], "bonus": []},
-        "BMP":    {"hard": [], "bonus": []},
-        "LPB":    {"hard": [], "bonus": []},
-        "HDB":    {"hard": [], "bonus": []},   # ✅ giữ từ S33 (reset vibe — watchlist đã thay đổi)
-        "SSI":    {"hard": [], "bonus": []},
-        "FRT":    {"hard": [], "bonus": []},
-        "AGR":    {"hard": [], "bonus": []},
-        "BSR":    {"hard": [], "bonus": []},
-        "VCB":    {"hard": [], "bonus": []},
-        "NLG":    {"hard": [], "bonus": []},
-        "IJC":    {"hard": [], "bonus": []},
-        "PC1":    {"hard": [], "bonus": []},
-        "CTI":    {"hard": [], "bonus": []},
-        "REE":    {"hard": [], "bonus": []},
-        "TLG":    {"hard": [], "bonus": []},
-        "KDH":    {"hard": [], "bonus": []},
-        "PVP":    {"hard": [], "bonus": []},
-        "BWE":    {"hard": [], "bonus": []},
-        "HPG":    {"hard": [], "bonus": []},
+        # S35 vibe backtest validated (Session 36)
+        # Logic: HARD = decay<=25% AND tot_filt>=tot_base | BONUS = decay<=25% AND exp_filt>exp_base
+        # HARD: SMC/NAB, SMC/BMP (cov 100%) | MultiFactor/SSI (tot_filt>tot_base)
+        # BONUS: exp_filt > exp_base, decay <= 25% — per engine/symbol pair
+        "NAB":    {"hard": ["SMC"],         "bonus": ["Volatility", "CrossMarket", "MultiFactor"]},
+        "BMP":    {"hard": ["SMC"],         "bonus": []},
+        "LPB":    {"hard": [],              "bonus": []},
+        "HDB":    {"hard": [],              "bonus": []},
+        "SSI":    {"hard": ["MultiFactor"], "bonus": []},
+        "FRT":    {"hard": [],              "bonus": ["Candlestick"]},
+        "AGR":    {"hard": [],              "bonus": ["SMC", "CrossMarket"]},
+        "BSR":    {"hard": [],              "bonus": []},
+        "VCB":    {"hard": [],              "bonus": ["Volatility"]},
+        "NLG":    {"hard": [],              "bonus": []},
+        "IJC":    {"hard": [],              "bonus": ["CrossMarket"]},
+        "PC1":    {"hard": [],              "bonus": []},
+        "CTI":    {"hard": [],              "bonus": ["MultiFactor"]},
+        "REE":    {"hard": [],              "bonus": ["SMC", "Chanlun"]},
+        "TLG":    {"hard": [],              "bonus": ["Volatility", "MultiFactor"]},
+        "KDH":    {"hard": [],              "bonus": ["CrossMarket"]},
+        "PVP":    {"hard": [],              "bonus": []},
+        "BWE":    {"hard": [],              "bonus": ["Chanlun"]},
+        "HPG":    {"hard": [],              "bonus": []},
     },
     "Momentum": {
-        # S33 validated — giữ nguyên
-        "SSI": {"hard": ["SMC"],                              "bonus": ["TechnicalBasic", "CrossMarket"]},
-        "VND": {"hard": ["CrossMarket"],                      "bonus": []},
-        "VIX": {"hard": ["CrossMarket"],                      "bonus": ["TechnicalBasic", "SMC"]},
-        "LPB": {"hard": ["CrossMarket"],                      "bonus": ["TechnicalBasic"]},
-        "FTS": {"hard": ["MultiFactor"],                      "bonus": ["TechnicalBasic"]},
-        "CTS": {"hard": [],                                   "bonus": ["Candlestick", "CrossMarket", "MultiFactor", "Volatility"]},
-        "HAG": {"hard": [],                                   "bonus": []},
-        "VDS": {"hard": [],                                   "bonus": ["Candlestick", "TechnicalBasic", "Volatility", "SMC"]},
-        # S34 mới — chưa có vibe filter (cần chạy vibe backtest trước khi deploy hard filter)
+        # S35 vibe backtest validated (Session 36)
+        # Logic: HARD = decay<=25% AND tot_filt>=tot_base | BONUS = decay<=25% AND exp_filt>exp_base
+        # NULL filter (cov=100%): SMC/HAH, SMC/FTS → LOAI
+        # HARD: SMC/SSI | CrossMarket/LPB,BSR,DXS | MultiFactor/ANV,GEX
+        # BONUS: TechnicalBasic/LPB | Volatility/MBB
+        "SSI": {"hard": ["SMC"],         "bonus": []},
+        "LPB": {"hard": ["CrossMarket"], "bonus": ["TechnicalBasic"]},
+        "BSR": {"hard": ["CrossMarket"], "bonus": []},
+        "DXS": {"hard": ["CrossMarket"], "bonus": []},
+        "ANV": {"hard": ["MultiFactor"], "bonus": []},
+        "GEX": {"hard": ["MultiFactor"], "bonus": []},
+        "MBB": {"hard": [],              "bonus": ["Volatility"]},
         "VTP": {"hard": [],  "bonus": []},
         "BSI": {"hard": [],  "bonus": []},
         "SHB": {"hard": [],  "bonus": []},
@@ -365,15 +368,16 @@ VIBE_FILTER_CONFIG = {
         "QCG": {"hard": [],  "bonus": []},
         "SIP": {"hard": [],  "bonus": []},
         "DCM": {"hard": [],  "bonus": []},
-        "BSR": {"hard": [],  "bonus": []},
         "MCH": {"hard": [],  "bonus": []},
         "DPM": {"hard": [],  "bonus": []},
         "HAH": {"hard": [],  "bonus": []},
-        "ANV": {"hard": [],  "bonus": []},
-        "GEX": {"hard": [],  "bonus": []},
-        "DXS": {"hard": [],  "bonus": []},
-        "MBB": {"hard": [],  "bonus": []},
+        "FTS": {"hard": [],  "bonus": []},
         "CTG": {"hard": [],  "bonus": []},
+        "VND": {"hard": [],  "bonus": []},
+        "VIX": {"hard": [],  "bonus": []},
+        "CTS": {"hard": [],  "bonus": []},
+        "HAG": {"hard": [],  "bonus": []},
+        "VDS": {"hard": [],  "bonus": []},
     },
     "Breakout": {
         # S33 validated
