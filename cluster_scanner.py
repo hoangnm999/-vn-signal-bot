@@ -39,28 +39,66 @@ logger = logging.getLogger(__name__)
 
 # ── Watchlist & Config ────────────────────────────────────────────────────────
 MR_SYMBOLS  = [
-    # S33 validated — baseline KEEP, decay <= 25%
+    # S34 scan v4 — KẾT QUẢ MỚI (chờ re-scan sau fix bug p70)
+    # Hiện tại chỉ 2 mã pass do bug regime threshold (đã fix notebook v4.1)
+    # Cần chạy lại HOSE scan MR với CLUSTER_TO_RUN='Mean Reversion' để có kết quả đầy đủ
+    # Tạm giữ watchlist S33 cho đến khi có kết quả scan mới
     "DCM", "NKG", "DPM", "HAH", "HCM", "HSG", "DGC", "HDB",
-    # Removed S33: GAS (IS exp âm), NLG (decay 48%), BMP (vibe filter không hiệu quả)
+    # S34 new (pass cả 2 options nhưng cần xác nhận lại sau re-scan):
+    # "VPI", "KOS",  # ← uncomment sau khi có kết quả re-scan MR
 ]
 MOM_SYMBOLS = [
-    # S33 validated — baseline KEEP, decay <= 25%
-    "SSI", "VND", "VIX", "CTS", "HAG", "LPB", "FTS", "VDS",
-    # Removed S33: VCB (OOS âm), BID (decay 70%), MBB (user loại), MWG (user loại),
-    #   CTG (decay 44%), FRT (decay 53%), REE (decay 89%), FPT (decay 47%),
-    #   GMD (OOS âm), STB (user loại), PNJ (IS âm), TCB (user loại),
-    #   VCI (decay 30%), BCM (OOS âm), ORS (decay 62%), BSR (user loại),
-    #   VSC (IS âm), DIG (IS âm), APG (OOS âm)
+    # ── S34 scan v4 — Pass CẢ 2 options (Option A + B) ───────────────────────
+    # Tier A (score >= 4, consist 100%):
+    "VIX",   # [A] OOS=+6.26% WFE=2.06 consist=100% ← current ✅
+    "SSI",   # [A] OOS=+4.84% WFE=7.58* consist=100% ← current ✅ (*WFE inflate)
+    "VDS",   # [A] OOS=+4.74% WFE=2.92 consist=100% ← current ✅
+    "LPB",   # [A] OOS=+4.45% WFE=1.85 consist=100% ← current ✅
+    "VTP",   # [A] OOS=+4.17% WFE=2.43 consist=100% ⭐ NEW
+    # Tier B (score 1-4, consist >= 60%):
+    "BSI",   # [B] OOS=+3.80% WFE=2.17 consist=100% ⭐ NEW
+    "SHB",   # [B] OOS=+3.55% WFE=6.12* consist=100% ⭐ NEW (*WFE inflate)
+    "NVL",   # [B] OOS=+3.28% WFE=3.77 consist=100% ⭐ NEW
+    "QCG",   # [B] OOS=+4.59% WFE=0.94 consist=67%  ⭐ NEW
+    "FTS",   # [B] OOS=+2.94% WFE=1.27 consist=100% ← current ✅
+    "SIP",   # [B] OOS=+2.94% WFE=1.24 consist=100% ⭐ NEW
+    "CTS",   # [B] OOS=+2.55% WFE=2.66 consist=100% ← current ✅
+    "DCM",   # [B] OOS=+2.46% WFE=2.51 consist=100% (từ MR S33)
+    "BSR",   # [B] OOS=+3.24% WFE=2.00 consist=75%  ⭐ NEW
+    "MCH",   # [B] OOS=+3.59% WFE=3.57 consist=60%  ⭐ NEW (cũng pass BO)
+    "DPM",   # [B] OOS=+2.72% WFE=2.92 consist=67%  (từ MR S33)
+    "HAH",   # [B] OOS=+1.43% WFE=1.80 consist=100% (từ MR S33)
+    # ── Partial pass — chỉ 1 option (note khi phát tín hiệu) ─────────────────
+    "ANV",   # [B] OOS=+2.75% — CHỈ Option A | ⭐ NEW
+    "GEX",   # [B] OOS=+3.11% — CHỈ Option A | ⭐ NEW
+    "DXS",   # [B] OOS=+3.14% — CHỈ Option B | ⭐ NEW
+    "MBB",   # [B] OOS=+2.62% — CHỈ Option B | WFE inflate | ⭐ NEW
+    "CTG",   # [B] OOS=+1.23% — CHỈ Option B | score biên
+    # ── Loại so với S33 ───────────────────────────────────────────────────────
+    # VND: fail cả 2 options → loại
+    # HAG: fail cả 2 options → loại
 ]
 
-# Breakout cluster (S33 validated — baseline KEEP, decay <= 25%)
+# Breakout cluster (S34 scan v4 results)
 BREAKOUT_SYMBOLS = [
-    # S33 validated
-    "HT1", "DGC", "DCM", "TCB", "GMD", "LPB",
-
-    # Removed S33: VIB (OOS âm), KBC (IS âm), KSB (decay 71%), SHB (user loại),
-    #   GVR (user loại), SIP (user loại), NKG (IS âm), HSG (decay 58%),
-    #   VIX (IS âm), FPT (OOS âm), BSR (INSUFFICIENT), VND (INSUFFICIENT)
+    # ── Pass cả 2 options ─────────────────────────────────────────────────────
+    "BFC",   # [A] OOS=+4.62% WFE=2.61 consist=100% ⭐ NEW
+    "VSC",   # [A] OOS=+6.01% WFE=3.87 consist=67%  ⭐ NEW
+    "BMP",   # [B] OOS=+2.84% WFE=1.53 consist=100% ⭐ NEW
+    "FRT",   # [B] OOS=+3.01% WFE=2.23 consist=67%  ⭐ NEW
+    # ── Partial pass — chỉ Option A (note khi phát tín hiệu) ─────────────────
+    "TCH",   # [A] OOS=+6.23% WFE=2.01 consist=100% — CHỈ Option A | ⭐ NEW
+    "LPB",   # [A] OOS=+8.04% WFE=3.54 consist=75%  — CHỈ Option A (cũng MOM [A])
+    "HDB",   # [B] OOS=+1.57% WFE=4.05* consist=75% — CHỈ Option A | score biên 1.18
+    # ── Partial pass — chỉ Option B ──────────────────────────────────────────
+    "MCH",   # [B] OOS=+4.63% WFE=1.61 consist=60%  — CHỈ Option B (cũng MOM [B])
+    "TCB",   # [B] OOS=+3.62% WFE=1.48 consist=75%  — CHỈ Option B ← current S33
+    "VTP",   # [B] OOS=+3.57% WFE=2.72 consist=75%  — CHỈ Option B (cũng MOM [A])
+    # ── Loại so với S33 ───────────────────────────────────────────────────────
+    # HT1: fail cả 2 options → loại
+    # GMD: fail cả 2 options → loại
+    # DGC: fail cả 2 options → loại
+    # DCM: fail BO → chuyển sang MOM
 ]
 
 FWD_DAYS = {"Mean Reversion": 20, "Momentum": 10, "Breakout": 15}
@@ -99,31 +137,94 @@ SIGNAL_CONFIG = {
 TRIGGER_PCT  = 70
 MIN_TRIGGERS = 2
 
-# Per-symbol WF stats (từ walk forward results Session 30)
-# Format: symbol → {wr, exp, wfe, n_wf}
+# ── Per-symbol WF stats (S34 scan v4) ────────────────────────────────────────
+# Format: {wr, exp, wfe, n, pf, cluster}
+# Score = OOS_exp × (consistency/100) — từ v4 pipeline
+# partial_pass: True = chỉ pass 1 option → note trong signal
+# wfe_inflate: True = WFE > 5 do IS_exp thấp → không tin WFE, dùng OOS_exp
 SYMBOL_STATS = {
-    # Mean Reversion                                              pf = estimated từ WR+Exp (S31)
-    "DCM": {"wr": 65, "exp": 7.0,  "wfe": 0.73, "n": 31,  "pf": 2.17, "cluster": "Mean Reversion"},
-    "NKG": {"wr": 60, "exp": 6.0,  "wfe": 0.80, "n": 39,  "pf": 1.75, "cluster": "Mean Reversion"},
-    "DPM": {"wr": 56, "exp": 4.1,  "wfe": 0.47, "n": 33,  "pf": 1.49, "cluster": "Mean Reversion"},
-    "HAH": {"wr": 62, "exp": 3.2,  "wfe": 0.97, "n": 40,  "pf": 1.91, "cluster": "Mean Reversion"},
-    "HCM": {"wr": 55, "exp": 3.2,  "wfe": 0.51, "n": 41,  "pf": 1.43, "cluster": "Mean Reversion"},
-    "HSG": {"wr": 52, "exp": 2.5,  "wfe": 0.30, "n": 46,  "pf": 1.27, "cluster": "Mean Reversion"},
-    "DGC": {"wr": 50, "exp": 1.6,  "wfe": 0.43, "n": 46,  "pf": 1.17, "cluster": "Mean Reversion"},
-    # Momentum
-    # ── Tier 1 expand S31 — Mean Reversion ───────────────────────────────────
-    "HDB": {"wr": 62, "exp": 2.5,  "wfe": 1.25, "n": 135, "pf": 1.93, "cluster": "Mean Reversion"},
-    # ── Tier 1 expand S31 — Momentum ─────────────────────────────────────────
-    "SSI": {"wr": 63, "exp": 3.8,  "wfe": 35.73,"n": 236, "pf": 2.43, "cluster": "Momentum"},
-    "VND": {"wr": 62, "exp": 4.7,  "wfe": 4.75, "n": 257, "pf": 2.30, "cluster": "Momentum"},
-    "VIX": {"wr": 57, "exp": 4.3,  "wfe": 3.97, "n": 231, "pf": 1.85, "cluster": "Momentum"},
-    "CTS": {"wr": 63, "exp": 6.3,  "wfe": 1.59, "n": 222, "pf": 2.38, "cluster": "Momentum"},
-    "HAG": {"wr": 60, "exp": 4.1,  "wfe": 7.21, "n": 246, "pf": 2.10, "cluster": "Momentum"},
-    "LPB": {"wr": 56, "exp": 2.0,  "wfe": 2.67, "n": 229, "pf": 1.79, "cluster": "Momentum"},
-    "FTS": {"wr": 62, "exp": 4.7,  "wfe": 1.11, "n": 268, "pf": 2.34, "cluster": "Momentum"},
-    "VDS": {"wr": 59, "exp": 4.2,  "wfe": 1.40, "n": 222, "pf": 2.08, "cluster": "Momentum"},
-    # Breakout cluster S31 (validated)
-    "HT1": {"wr": 71, "exp": 5.05, "wfe": 1.72, "n": 236, "pf": 3.07, "cluster": "Breakout"},
+    # ── Mean Reversion (tạm giữ S33, chờ re-scan sau fix bug p70) ────────────
+    "DCM_MR": {"wr": 65, "exp": 7.0,  "wfe": 0.73, "n": 31,  "pf": 2.17, "cluster": "Mean Reversion"},
+    "NKG":    {"wr": 60, "exp": 6.0,  "wfe": 0.80, "n": 39,  "pf": 1.75, "cluster": "Mean Reversion"},
+    "DPM_MR": {"wr": 56, "exp": 4.1,  "wfe": 0.47, "n": 33,  "pf": 1.49, "cluster": "Mean Reversion"},
+    "HAH_MR": {"wr": 62, "exp": 3.2,  "wfe": 0.97, "n": 40,  "pf": 1.91, "cluster": "Mean Reversion"},
+    "HCM":    {"wr": 55, "exp": 3.2,  "wfe": 0.51, "n": 41,  "pf": 1.43, "cluster": "Mean Reversion"},
+    "HSG":    {"wr": 52, "exp": 2.5,  "wfe": 0.30, "n": 46,  "pf": 1.27, "cluster": "Mean Reversion"},
+    "DGC":    {"wr": 50, "exp": 1.6,  "wfe": 0.43, "n": 46,  "pf": 1.17, "cluster": "Mean Reversion"},
+    "HDB_MR": {"wr": 62, "exp": 2.5,  "wfe": 1.25, "n": 135, "pf": 1.93, "cluster": "Mean Reversion"},
+    # ── Momentum — S34 scan v4 ────────────────────────────────────────────────
+    # Tier A — pass cả 2 options
+    "VIX":  {"wr": 61, "exp": 6.26, "wfe": 2.06, "n": 24, "pf": 2.50, "cluster": "Momentum",
+             "score": 6.26, "consist": 100, "partial_pass": False},
+    "SSI":  {"wr": 60, "exp": 4.84, "wfe": 7.58, "n": 20, "pf": 1.52, "cluster": "Momentum",
+             "score": 4.84, "consist": 100, "partial_pass": False, "wfe_inflate": True},
+    "VDS":  {"wr": 72, "exp": 4.74, "wfe": 2.92, "n": 26, "pf": 2.21, "cluster": "Momentum",
+             "score": 4.74, "consist": 100, "partial_pass": False},
+    "LPB":  {"wr": 74, "exp": 4.45, "wfe": 1.85, "n": 22, "pf": 2.02, "cluster": "Momentum",
+             "score": 4.45, "consist": 100, "partial_pass": False},
+    "VTP":  {"wr": 60, "exp": 4.17, "wfe": 2.43, "n": 29, "pf": 1.81, "cluster": "Momentum",
+             "score": 4.17, "consist": 100, "partial_pass": False},
+    # Tier B — pass cả 2 options
+    "BSI":  {"wr": 55, "exp": 3.80, "wfe": 2.17, "n": 20, "pf": 2.06, "cluster": "Momentum",
+             "score": 3.80, "consist": 100, "partial_pass": False},
+    "SHB":  {"wr": 55, "exp": 3.55, "wfe": 6.12, "n": 22, "pf": 2.21, "cluster": "Momentum",
+             "score": 3.55, "consist": 100, "partial_pass": False, "wfe_inflate": True},
+    "NVL":  {"wr": 53, "exp": 3.28, "wfe": 3.77, "n": 22, "pf": 2.61, "cluster": "Momentum",
+             "score": 3.28, "consist": 100, "partial_pass": False},
+    "QCG":  {"wr": 52, "exp": 4.59, "wfe": 0.94, "n": 29, "pf": 1.67, "cluster": "Momentum",
+             "score": 3.06, "consist": 67,  "partial_pass": False},
+    "FTS":  {"wr": 58, "exp": 2.94, "wfe": 1.27, "n": 15, "pf": 3.09, "cluster": "Momentum",
+             "score": 2.94, "consist": 100, "partial_pass": False},
+    "SIP":  {"wr": 57, "exp": 2.94, "wfe": 1.24, "n": 21, "pf": 2.17, "cluster": "Momentum",
+             "score": 2.94, "consist": 100, "partial_pass": False},
+    "CTS":  {"wr": 56, "exp": 2.55, "wfe": 2.66, "n": 23, "pf": 2.48, "cluster": "Momentum",
+             "score": 2.55, "consist": 100, "partial_pass": False},
+    "DCM":  {"wr": 57, "exp": 2.46, "wfe": 2.51, "n": 17, "pf": 1.65, "cluster": "Momentum",
+             "score": 2.46, "consist": 100, "partial_pass": False},
+    "BSR":  {"wr": 56, "exp": 3.24, "wfe": 2.00, "n": 18, "pf": 2.79, "cluster": "Momentum",
+             "score": 2.43, "consist": 75,  "partial_pass": False},
+    "MCH":  {"wr": 59, "exp": 3.59, "wfe": 3.57, "n": 32, "pf": 2.14, "cluster": "Momentum",
+             "score": 2.15, "consist": 60,  "partial_pass": False},
+    "DPM":  {"wr": 55, "exp": 2.72, "wfe": 2.92, "n": 12, "pf": 1.64, "cluster": "Momentum",
+             "score": 1.81, "consist": 67,  "partial_pass": False},
+    "HAH":  {"wr": 58, "exp": 1.43, "wfe": 1.80, "n": 13, "pf": 1.76, "cluster": "Momentum",
+             "score": 1.43, "consist": 100, "partial_pass": False},
+    # Partial pass — chỉ 1 option (note trong signal)
+    "ANV":  {"wr": 55, "exp": 2.75, "wfe": 2.33, "n": 41, "pf": 1.55, "cluster": "Momentum",
+             "score": 2.75, "consist": 100, "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option A"},
+    "GEX":  {"wr": 55, "exp": 3.11, "wfe": 1.93, "n": 33, "pf": 2.32, "cluster": "Momentum",
+             "score": 2.33, "consist": 75,  "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option A"},
+    "DXS":  {"wr": 50, "exp": 3.14, "wfe": 2.25, "n": 25, "pf": 1.32, "cluster": "Momentum",
+             "score": 3.14, "consist": 100, "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option B"},
+    "MBB":  {"wr": 47, "exp": 2.62, "wfe": 9.78, "n": 20, "pf": 1.74, "cluster": "Momentum",
+             "score": 1.97, "consist": 75,  "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option B",
+             "wfe_inflate": True},
+    "CTG":  {"wr": 50, "exp": 1.23, "wfe": 1.11, "n": 25, "pf": 1.96, "cluster": "Momentum",
+             "score": 1.02, "consist": 83,  "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option B · score biên"},
+    # ── Breakout — S34 scan v4 ────────────────────────────────────────────────
+    # Tier A — pass cả 2 options
+    "BFC":  {"wr": 55, "exp": 4.62, "wfe": 2.61, "n": 12, "pf": 1.25, "cluster": "Breakout",
+             "score": 4.62, "consist": 100, "partial_pass": False},
+    "VSC":  {"wr": 60, "exp": 6.01, "wfe": 3.87, "n": 11, "pf": 1.55, "cluster": "Breakout",
+             "score": 4.01, "consist": 67,  "partial_pass": False},
+    # Tier B — pass cả 2 options
+    "BMP":  {"wr": 58, "exp": 2.84, "wfe": 1.53, "n": 19, "pf": 1.81, "cluster": "Breakout",
+             "score": 2.84, "consist": 100, "partial_pass": False},
+    "FRT_BO": {"wr": 55, "exp": 3.01, "wfe": 2.23, "n": 12, "pf": 1.91, "cluster": "Breakout",
+               "score": 2.01, "consist": 67,  "partial_pass": False},
+    # Partial pass — chỉ Option A
+    "TCH":  {"wr": 60, "exp": 6.23, "wfe": 2.01, "n": 15, "pf": 2.35, "cluster": "Breakout",
+             "score": 6.23, "consist": 100, "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option A"},
+    "LPB_BO": {"wr": 60, "exp": 8.04, "wfe": 3.54, "n": 24, "pf": 3.61, "cluster": "Breakout",
+               "score": 6.03, "consist": 75,  "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option A (cũng MOM Tier A)"},
+    "HDB":  {"wr": 55, "exp": 1.57, "wfe": 4.05, "n": 23, "pf": 1.73, "cluster": "Breakout",
+             "score": 1.18, "consist": 75,  "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option A · score biên · WFE inflate",
+             "wfe_inflate": True},
+    # Partial pass — chỉ Option B
+    "TCB":  {"wr": 90, "exp": 3.62, "wfe": 1.48, "n": 17, "pf": 1.46, "cluster": "Breakout",
+             "score": 2.72, "consist": 75,  "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option B"},
+    "VTP_BO": {"wr": 60, "exp": 3.57, "wfe": 2.72, "n": 18, "pf": 2.02, "cluster": "Breakout",
+               "score": 2.67, "consist": 75,  "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option B (cũng MOM Tier A)"},
 }
 
 # SL từ MAE p25 analysis
@@ -162,37 +263,58 @@ TRAIL_CONFIG = {
 
 VIBE_FILTER_CONFIG = {
     "Mean Reversion": {
-        # HARD FILTER — chỉ vào lệnh khi engine đồng ý
+        # S33 validated — giữ nguyên (chờ re-scan sau fix bug p70)
         "DCM": {"hard": ["SMC"],                              "bonus": []},
         "NKG": {"hard": ["Chanlun"],                          "bonus": ["Candlestick"]},
         "HAH": {"hard": ["CrossMarket"],                      "bonus": ["TechnicalBasic"]},
         "HCM": {"hard": ["SMC", "CrossMarket", "Chanlun"],    "bonus": ["Candlestick"]},
         "HSG": {"hard": ["CrossMarket", "MultiFactor"],       "bonus": ["Candlestick"]},
-        # Không có HARD filter — vibe filter làm giảm exp (DGC, HDB) hoặc không hiệu quả
         "DGC": {"hard": [],                                   "bonus": ["Candlestick"]},
         "HDB": {"hard": [],                                   "bonus": []},
         "DPM": {"hard": [],                                   "bonus": []},
     },
     "Momentum": {
-        # HARD FILTER
+        # S33 validated — giữ nguyên
         "SSI": {"hard": ["SMC"],                              "bonus": ["TechnicalBasic", "CrossMarket"]},
         "VND": {"hard": ["CrossMarket"],                      "bonus": []},
         "VIX": {"hard": ["CrossMarket"],                      "bonus": ["TechnicalBasic", "SMC"]},
         "LPB": {"hard": ["CrossMarket"],                      "bonus": ["TechnicalBasic"]},
         "FTS": {"hard": ["MultiFactor"],                      "bonus": ["TechnicalBasic"]},
-        # Không có HARD filter
         "CTS": {"hard": [],                                   "bonus": ["Candlestick", "CrossMarket", "MultiFactor", "Volatility"]},
         "HAG": {"hard": [],                                   "bonus": []},
         "VDS": {"hard": [],                                   "bonus": ["Candlestick", "TechnicalBasic", "Volatility", "SMC"]},
+        # S34 mới — chưa có vibe filter (cần chạy vibe backtest trước khi deploy hard filter)
+        "VTP": {"hard": [],  "bonus": []},
+        "BSI": {"hard": [],  "bonus": []},
+        "SHB": {"hard": [],  "bonus": []},
+        "NVL": {"hard": [],  "bonus": []},
+        "QCG": {"hard": [],  "bonus": []},
+        "SIP": {"hard": [],  "bonus": []},
+        "DCM": {"hard": [],  "bonus": []},
+        "BSR": {"hard": [],  "bonus": []},
+        "MCH": {"hard": [],  "bonus": []},
+        "DPM": {"hard": [],  "bonus": []},
+        "HAH": {"hard": [],  "bonus": []},
+        "ANV": {"hard": [],  "bonus": []},
+        "GEX": {"hard": [],  "bonus": []},
+        "DXS": {"hard": [],  "bonus": []},
+        "MBB": {"hard": [],  "bonus": []},
+        "CTG": {"hard": [],  "bonus": []},
     },
     "Breakout": {
-        # BO không có HARD filter — toàn bộ chỉ là BONUS
-        "HT1": {"hard": [],                                   "bonus": ["TechnicalBasic", "CrossMarket"]},
-        "DGC": {"hard": [],                                   "bonus": ["SMC", "CrossMarket"]},
-        "DCM": {"hard": [],                                   "bonus": []},
-        "TCB": {"hard": [],                                   "bonus": ["Candlestick"]},
-        "GMD": {"hard": [],                                   "bonus": []},
-        "LPB": {"hard": [],                                   "bonus": []},
+        # S33 validated
+        "DGC": {"hard": [],  "bonus": ["SMC", "CrossMarket"]},
+        "TCB": {"hard": [],  "bonus": ["Candlestick"]},
+        "LPB": {"hard": [],  "bonus": []},
+        # S34 mới — chưa có vibe filter
+        "BFC":  {"hard": [], "bonus": []},
+        "VSC":  {"hard": [], "bonus": []},
+        "BMP":  {"hard": [], "bonus": []},
+        "FRT":  {"hard": [], "bonus": []},
+        "TCH":  {"hard": [], "bonus": []},
+        "HDB":  {"hard": [], "bonus": []},
+        "MCH":  {"hard": [], "bonus": []},
+        "VTP":  {"hard": [], "bonus": []},
     },
 }
 
@@ -208,7 +330,7 @@ ACCOUNT_SIZE = 300_000_000  # 300 triệu
 BASE_RISK_PCT  = 1.0    # % account cho mã có Score = MEDIAN_SCORE
 MIN_RISK_PCT   = 0.4    # % tối thiểu (mã yếu nhất)
 MAX_RISK_PCT   = 2.0    # % tối đa (mã mạnh nhất, 2x base)
-MEDIAN_SCORE   = 8.4    # median score của toàn watchlist (tính từ data)
+MEDIAN_SCORE   = 3.0    # median score S34 (OOS_exp × consist/100)
 
 # Max concurrent positions & max exposure
 MAX_POSITIONS  = 6
@@ -591,6 +713,10 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
     }
     trigger_str = " + ".join(trigger_labels.get(t, t) for t in triggered)
 
+    # Partial pass note
+    partial_note = stats.get("partial_note", "") if stats.get("partial_pass") else ""
+    wfe_inflate_note = "⚠️ WFE inflate (dùng OOS_exp)" if stats.get("wfe_inflate") else ""
+
     return {
         "symbol":        symbol,
         "cluster":       cluster,
@@ -607,6 +733,8 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
         "stats":         stats,
         "ind":           ind,
         "scan_time":     datetime.now().strftime("%H:%M"),
+        "partial_note":  partial_note,
+        "wfe_inflate_note": wfe_inflate_note,
     }
 
 
@@ -643,7 +771,11 @@ def _format_signal(sig: dict, vni_info: dict,
         f"*Triggers:* {sig['trigger_str']}",
     ]
 
-    # VNI info cho MR
+    # Partial pass warning
+    if sig.get("partial_note"):
+        lines.append(f"*Lưu ý:* {sig['partial_note']}")
+    if sig.get("wfe_inflate_note"):
+        lines.append(f"*Lưu ý:* {sig['wfe_inflate_note']}")
     if cluster == "Mean Reversion":
         lines.append(f"*VNI ATR:* {vni_info['status']}")
 
