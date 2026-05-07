@@ -705,13 +705,22 @@ def _get_vni_atr_info() -> dict:
 def _scan_symbol(symbol: str, cluster: str) -> dict | None:
     """
     Scan 1 mã. Trả về signal dict nếu có signal, None nếu không.
+    Timeout 30s trên bước load data để tránh hang vô hạn nếu vnstock API chậm.
     """
+    import concurrent.futures
     try:
         from vn_loader import load_vn_ohlcv
-        df = load_vn_ohlcv(symbol, days=2000, min_bars=200)
+        # FIX: timeout 30s trên network call — tránh freeze toàn bộ scan nếu 1 symbol chậm
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(load_vn_ohlcv, symbol, 2000, 200)
+            try:
+                df = fut.result(timeout=30)
+            except concurrent.futures.TimeoutError:
+                logger.warning(f"[Scanner] {symbol} load TIMEOUT (>30s) — SKIP")
+                return None
         df["date"] = pd.to_datetime(df["date"])
     except Exception as e:
-        logger.debug(f"[Scanner] {symbol} load fail: {e}")
+        logger.warning(f"[Scanner] {symbol} load fail: {e}")
         return None
 
     # Tính indicators ngày mới nhất
@@ -780,16 +789,18 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
 
     # Trigger detail
     trigger_labels = {
-        "stoch_k":     f"Stoch oversold ({ind['stoch_k']:.1f})",
-        "momentum_5d": f"Momentum 5d ({ind['momentum_5d']:+.1f}%)",
-        "volume_spike":f"Volume spike ({ind['volume_spike']:+.1f}x)",
-        "candle_body": f"Nến thân lớn ({ind['candle_body']:.2f})",
+        "stoch_k":      f"Stoch oversold ({ind['stoch_k']:.1f})",
+        "momentum_5d":  f"Momentum 5d ({ind['momentum_5d']:+.1f}%)",
+        "volume_spike": f"Volume spike ({ind['volume_spike']:+.1f}x)",
+        "candle_body":  f"Nến thân lớn ({ind['candle_body']:.2f})",
+        "consolidation":f"Sideways ({ind.get('consolidation', 0)*100:.0f}%)",
+        "vol_dry_up":   f"Vol kho ({ind.get('vol_dry_up', 0):+.2f}x)",
     }
     trigger_str = " + ".join(trigger_labels.get(t, t) for t in triggered)
 
     # Partial pass note
     partial_note = stats.get("partial_note", "") if stats.get("partial_pass") else ""
-    wfe_inflate_note = "⚠️ WFE inflate (dùng OOS_exp)" if stats.get("wfe_inflate") else ""
+    wfe_inflate_note = "⚠️ WFE inflate (dùng OOS exp)" if stats.get("wfe_inflate") else ""
 
     return {
         "symbol":        symbol,
@@ -1124,6 +1135,8 @@ def run_morning_scan() -> tuple[list[str], dict]:
     Chạy full scan cho cả 2 cluster.
     Trả về (messages, signals_dict).
     """
+    import time as _time
+    t_start = _time.time()
     logger.info("[Scanner] Starting morning scan...")
     vni_info = _get_vni_atr_info()
 
@@ -1138,6 +1151,7 @@ def run_morning_scan() -> tuple[list[str], dict]:
             logger.info(f"[Scanner] {sym} MR SIGNAL: {sig['trigger_str']}")
         else:
             mr_no_signal.append(sym)
+            logger.debug(f"[Scanner] {sym} MR: no signal")
 
     for sym in MOM_SYMBOLS:
         sig = _scan_symbol(sym, "Momentum")
@@ -1146,6 +1160,7 @@ def run_morning_scan() -> tuple[list[str], dict]:
             logger.info(f"[Scanner] {sym} MOM SIGNAL: {sig['trigger_str']}")
         else:
             mom_no_signal.append(sym)
+            logger.debug(f"[Scanner] {sym} MOM: no signal")
 
     for sym in BREAKOUT_SYMBOLS:
         sig = _scan_symbol(sym, "Breakout")
@@ -1154,6 +1169,7 @@ def run_morning_scan() -> tuple[list[str], dict]:
             logger.info(f"[Scanner] {sym} BO SIGNAL: {sig['trigger_str']}")
         else:
             bo_no_signal.append(sym)
+            logger.debug(f"[Scanner] {sym} BO: no signal")
 
     # Lưu vào memory để 12:30 update
     global _morning_signals
@@ -1173,8 +1189,10 @@ def run_morning_scan() -> tuple[list[str], dict]:
     _journal_log_signals(mr_signals + mom_signals + bo_signals, vni_info)
 
     total = len(mr_signals) + len(mom_signals) + len(bo_signals)
+    elapsed = round(_time.time() - t_start, 1)
     logger.info(f"[Scanner] Morning scan done: {total} signals "
-                f"(MR={len(mr_signals)}, MOM={len(mom_signals)}, BO={len(bo_signals)})")
+                f"(MR={len(mr_signals)}, MOM={len(mom_signals)}, BO={len(bo_signals)}) "
+                f"in {elapsed}s")
 
     messages = _format_morning_scan(
         mr_signals, mom_signals,
