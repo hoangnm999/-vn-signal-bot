@@ -857,8 +857,9 @@ def _format_signal(sig: dict, vni_info: dict,
     pf  = stats.get("pf", 0)
     pf_str = f"{pf:.2f}" if pf else "?"
 
-    # Continuous sizing score = Exp × PF × WFE
-    sizing_score = (stats.get("exp", 0) * pf * wfe) if (pf and wfe) else 0
+    # Sizing score = score S34 (OOS_exp × consist/100) — đã có trong SYMBOL_STATS
+    # Fallback về exp nếu mã chưa có score field (mã S33 cũ)
+    sizing_score = stats.get("score") or stats.get("exp", 0)
 
     lines += [
         f"",
@@ -894,7 +895,7 @@ def _format_signal(sig: dict, vni_info: dict,
             f"*💰 Position Sizing ({ACCOUNT_SIZE/1e6:.0f}M account):*",
             f"  {ps['size_label']} — risk {ps['risk_pct']}% "
             f"= {ps['risk_amount']/1e6:.1f}M",
-            f"  → Mua: *{ps['qty']:,} cổ* (~{ps['value']/1e6:.1f}M, "
+            f"  → Mua: {ps['qty']:,} cổ (~{ps['value']/1e6:.1f}M, "
             f"chiếm {ps['exposure']}% vốn)",
             f"  → Max loss nếu chạm SL: "
             f"~{ps['risk_amount']/1e6:.1f}M ({ps['risk_pct']}% account)",
@@ -976,9 +977,9 @@ def _format_morning_scan(
             # Ghi chú nếu mã này cũng thuộc cluster khác
             dual_tag = ""
             if sig["symbol"] in MR_SYMBOLS:
-                dual_tag = " _(+MR)_"
+                dual_tag = " (+MR)"
             elif sig["symbol"] in MOM_SYMBOLS:
-                dual_tag = " _(+MOM)_"
+                dual_tag = " (+MOM)"
             sig_text = "\n" + _format_signal(sig, vni_info, extra_tag=dual_tag) + "\n"
             if len(current) + len(sig_text) > 3800:
                 messages.append(current)
