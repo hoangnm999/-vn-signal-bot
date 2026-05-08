@@ -149,12 +149,10 @@ SIGNAL_CONFIG = {
     "Momentum": {
         "regime_indicator":  "ema_cross",
         "regime_condition":  "high",
-        # FIX S36: candle_bull (có hướng) thay candle_body — không fire khi nến đỏ to
-        # volume_spike_bull = -1 khi nến đỏ — không fire khi bán tháo
-        "trigger_indicators":["momentum_5d", "volume_spike_bull", "candle_bull"],
-        "trigger_direction": {"momentum_5d": "high", "volume_spike_bull": "high",
-                              "candle_bull": "high"},
-        "description": "Mua khi EMA12>EMA26 + momentum mạnh + volume xác nhận + nến xanh to",
+        "trigger_indicators":["momentum_5d", "volume_spike", "candle_body"],
+        "trigger_direction": {"momentum_5d": "high", "volume_spike": "high",
+                              "candle_body": "high"},
+        "description": "Mua khi EMA12>EMA26 + momentum mạnh + volume xác nhận + nến thân lớn",
     },
     "Breakout": {
         "regime_indicator":  "bb_squeeze",
@@ -545,8 +543,8 @@ def _compute_indicators(df: pd.DataFrame) -> dict | None:
         "price_vs_sma20": float((px - s20) / (px + 1e-9) * 100),
         "ema_cross":      float((ema12[i] - ema26[i]) / (px + 1e-9) * 100),
         "momentum_5d":    float((px / (c5 + 1e-9) - 1.0) * 100),
-        # FIX S36: momentum_2d cho MOM guard — đà ngắn hạn 2 ngày
-        "momentum_2d":    float((px / (close[max(0, i-2)] + 1e-9) - 1.0) * 100),
+        # FIX S36: momentum_3d cho MOM guard — đà ngắn hạn 3 ngày
+        "momentum_3d":    float((px / (close[max(0, i-3)] + 1e-9) - 1.0) * 100),
         "volume_spike":   float((vol[i] / (vs20v + 1e-9)) - 1.0),
         "stoch_k":        float(stoch[i]),
         "candle_body":    float(np.clip(abs(px - opn[i]) / (atr_v + 1e-9), 0, 3)),
@@ -809,9 +807,7 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
         "stoch_k":           f"Stoch oversold ({ind['stoch_k']:.1f})",
         "momentum_5d":       f"Momentum 5d ({ind['momentum_5d']:+.1f}%)",
         "volume_spike":      f"Volume spike ({ind['volume_spike']:+.1f}x)",
-        "volume_spike_bull": f"Volume xanh ({ind.get('volume_spike_bull', 0):+.1f}x)",
         "candle_body":       f"Nến thân lớn ({ind['candle_body']:.2f})",
-        "candle_bull":       f"Nến xanh to ({ind.get('candle_bull', 0):.2f})",
         "consolidation":     f"Sideways ({ind.get('consolidation', 0)*100:.0f}%)",
         "vol_dry_up":        f"Vol kho ({ind.get('vol_dry_up', 0):+.2f}x)",
     }
