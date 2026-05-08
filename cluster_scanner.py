@@ -382,19 +382,23 @@ VIBE_FILTER_CONFIG = {
         "VDS": {"hard": [],  "bonus": []},
     },
     "Breakout": {
-        # S33 validated
-        "DGC": {"hard": [],  "bonus": ["SMC", "CrossMarket"]},
-        "TCB": {"hard": [],  "bonus": ["Candlestick"]},
-        "LPB": {"hard": [],  "bonus": []},
-        # S34 mới — chưa có vibe filter
-        "BFC":  {"hard": [], "bonus": []},
-        "VSC":  {"hard": [], "bonus": []},
-        "BMP":  {"hard": [], "bonus": []},
-        "FRT":  {"hard": [], "bonus": []},
-        "TCH":  {"hard": [], "bonus": []},
-        "HDB":  {"hard": [], "bonus": []},
-        "MCH":  {"hard": [], "bonus": []},
-        "VTP":  {"hard": [], "bonus": []},
+        # S35 watchlist (Session 36) — 10 mã
+        # Vibe backtest S35: 0 HARD, 0 BONUS
+        #   SMC/BMP: null filter (cov=100%) + decay 40% → LOAI
+        #   SMC/TCH: null filter (cov=100%) → LOAI (theo precedent HAH/FTS MOM)
+        #   CrossMarket/FRT: exp_filt < exp_base → LOAI
+        #   CrossMarket/TCH: exp_filt < exp_base → LOAI
+        # → Tất cả mã reset về hard=[], bonus=[]
+        "BFC": {"hard": [], "bonus": []},
+        "VSC": {"hard": [], "bonus": []},
+        "BMP": {"hard": [], "bonus": []},
+        "FRT": {"hard": [], "bonus": []},
+        "TCH": {"hard": [], "bonus": []},
+        "LPB": {"hard": [], "bonus": []},
+        "HDB": {"hard": [], "bonus": []},
+        "MCH": {"hard": [], "bonus": []},
+        "TCB": {"hard": [], "bonus": []},
+        "VTP": {"hard": [], "bonus": []},
     },
 }
 
