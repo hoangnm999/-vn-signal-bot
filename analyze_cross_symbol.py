@@ -62,12 +62,16 @@ BAD_STD_MULT  = 0.75   # bottom ~22% của distribution
 CROSS_MIN_D    = 0.3   # Cohen's d tối thiểu để tính là "có signal"
 CROSS_MIN_PCT  = 0.50  # >= 50% số mã có signal → pattern cross-symbol
 
-# 15 indicators
+# 18 indicators — thêm candle_bull, volume_spike_bull, momentum_3d để validate S36 fix
 ALL_INDICATORS = [
     "rsi_14", "macd_hist", "bb_position", "volume_spike",
     "trend_slope", "price_vs_sma20", "price_vs_sma50", "atr_ratio",
     "stoch_k", "ema_cross", "momentum_5d", "momentum_20d",
     "high_low_pos", "vol_trend", "candle_body",
+    # FIX S36: thêm để so sánh với candle_body và volume_spike gốc
+    "candle_bull",        # nến xanh to (có hướng) — Cohen's d cao hơn candle_body không?
+    "volume_spike_bull",  # volume cao + nến xanh — discriminative hơn volume_spike không?
+    "momentum_3d",        # đà 3 ngày ngắn hạn — có ý nghĩa bổ sung không?
 ]
 
 
@@ -160,6 +164,10 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
             "high_low_pos":   float(hlp),
             "vol_trend":      float((vs5v / (vs20v + 1e-9)) - 1.0),
             "candle_body":    float(np.clip(body, 0, 3)),
+            # FIX S36: indicators mới để validate
+            "candle_bull":       float(np.clip((px - opn[i]) / (atr_v + 1e-9), -3, 3)),
+            "volume_spike_bull": float((vol[i] / (vs20v + 1e-9)) - 1.0) if px >= opn[i] else -1.0,
+            "momentum_3d":       float((px / (close[max(i-3, 0)] + 1e-9) - 1.0) * 100),
         })
 
     return pd.DataFrame(rows)
@@ -563,8 +571,8 @@ def main():
         "n_success":       len(per_symbol),
         "failed":          failed,
         "fwd_days":        FWD_DAYS,
-        "good_thresh":     GOOD_THRESH,
-        "bad_thresh":      BAD_THRESH,
+        "good_std_mult":   GOOD_STD_MULT,
+        "bad_std_mult":    BAD_STD_MULT,
         "cross_results":   cross_results,
         "cluster_features":cluster_features,
         "per_symbol":      {

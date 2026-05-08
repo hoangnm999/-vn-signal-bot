@@ -76,25 +76,41 @@ CLUSTER_D_THRESH = 0.15  # |d| >= 0.15 để assign, else fallback
 SIGNAL_CONFIG = {
     "Mean Reversion": {
         "regime_indicator":  "price_vs_sma50",
-        "regime_condition":  "low",           # giá dưới SMA50
+        "regime_condition":  "low",
         "trigger_indicators":["stoch_k", "volume_spike", "momentum_5d"],
         "trigger_direction": {
-            "stoch_k":      "low",   # oversold
-            "volume_spike": "high",  # volume đột biến
-            "momentum_5d":  "high",  # bắt đầu hồi
+            "stoch_k":      "low",
+            "volume_spike": "high",
+            "momentum_5d":  "high",
         },
         "description": "Mua khi gia duoi SMA50 + stoch oversold + volume + momentum hoi",
     },
     "Momentum": {
         "regime_indicator":  "ema_cross",
-        "regime_condition":  "high",          # EMA12 > EMA26
+        "regime_condition":  "high",
         "trigger_indicators":["momentum_5d", "volume_spike", "candle_body"],
         "trigger_direction": {
-            "momentum_5d":  "high",  # momentum mạnh
-            "volume_spike": "high",  # volume xác nhận
-            "candle_body":  "high",  # nến thân lớn
+            "momentum_5d":  "high",
+            "volume_spike": "high",
+            "candle_body":  "high",
         },
-        "description": "Mua khi EMA12>EMA26 + momentum cao + volume + nen lon",
+        "description": "ORIGINAL S34: momentum_5d + volume_spike + candle_body",
+    },
+}
+
+# S36 variant: dùng candle_bull + volume_spike_bull (có hướng nến)
+# Chạy song song để so sánh số lệnh và OOS exp
+SIGNAL_CONFIG_S36 = {
+    "Momentum": {
+        "regime_indicator":  "ema_cross",
+        "regime_condition":  "high",
+        "trigger_indicators":["momentum_5d", "volume_spike_bull", "candle_bull"],
+        "trigger_direction": {
+            "momentum_5d":     "high",
+            "volume_spike_bull":"high",
+            "candle_bull":     "high",
+        },
+        "description": "S36 FIX: momentum_5d + volume_spike_bull + candle_bull (co huong nen)",
     },
 }
 
@@ -153,6 +169,10 @@ def compute_indicators(df: pd.DataFrame) -> list[dict]:
             "candle_body":    float(np.clip(
                 abs(px - opn[i]) / (atr_v + 1e-9), 0, 3)),
             "atr_ratio":      float(atr_v / (px + 1e-9) * 100),
+            # S36: indicators có hướng để validate
+            "candle_bull":       float(np.clip((px - opn[i]) / (atr_v + 1e-9), -3, 3)),
+            "volume_spike_bull": float((vol[i] / (vs20v + 1e-9)) - 1.0) if px >= opn[i] else -1.0,
+            "momentum_3d":       float((px / (close[max(i-3, 0)] + 1e-9) - 1.0) * 100),
         })
     return rows
 
@@ -667,6 +687,48 @@ def main():
     out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False))
     print(f"\n  Da luu: {out_path}")
     print(f"  Buoc tiep: Review per-symbol OOS → chon ma vao watchlist")
+
+    # ── So sánh S36 vs Original cho MOM ──────────────────────────────────────
+    print(f"\n{'═'*65}")
+    print(f"SO SÁNH MOM: Original (candle_body) vs S36 (candle_bull)")
+    print(f"{'═'*65}")
+
+    mom_results_s36 = []
+    for sym in mom_syms:
+        print(f"  [S36] {sym}...", end=" ", flush=True)
+        # Temporarily swap config
+        orig_cfg = SIGNAL_CONFIG["Momentum"]
+        SIGNAL_CONFIG["Momentum"] = SIGNAL_CONFIG_S36["Momentum"]
+        r = analyze_symbol(sym, "Momentum")
+        SIGNAL_CONFIG["Momentum"] = orig_cfg
+        mom_results_s36.append(r)
+        if r:
+            tr  = r.get("train", {})
+            oos = r.get("oos",   {})
+            print(f"train n={tr.get('n',0)} exp={tr.get('mean_exp',0):+.2f}% | "
+                  f"oos n={oos.get('n',0)} exp={oos.get('mean_exp',0):+.2f}%")
+        else:
+            print("FAIL")
+
+    mom_valid_s36 = [r for r in mom_results_s36 if r]
+    agg_orig = aggregate_cluster(mom_valid,     FWD_TIER1, "train")
+    agg_s36  = aggregate_cluster(mom_valid_s36, FWD_TIER1, "train")
+    agg_orig_oos = aggregate_cluster(mom_valid,     FWD_TIER1, "oos")
+    agg_s36_oos  = aggregate_cluster(mom_valid_s36, FWD_TIER1, "oos")
+
+    print(f"\n  {'Version':<20} {'Train_n':>8} {'Train_exp':>10} {'OOS_n':>7} {'OOS_exp':>8}")
+    print(f"  {'─'*60}")
+    print(f"  {'Original (S34)':<20} {agg_orig['n']:>8} {agg_orig['mean_exp']:>+9.2f}% "
+          f"{agg_orig_oos['n']:>7} {agg_orig_oos['mean_exp']:>+7.2f}%")
+    print(f"  {'S36 (candle_bull)':<20} {agg_s36['n']:>8} {agg_s36['mean_exp']:>+9.2f}% "
+          f"{agg_s36_oos['n']:>7} {agg_s36_oos['mean_exp']:>+7.2f}%")
+    print(f"\n  Kết luận:")
+    if agg_s36_oos['mean_exp'] > agg_orig_oos['mean_exp']:
+        print(f"  → S36 OOS exp CAO hơn Original (+{agg_s36_oos['mean_exp']-agg_orig_oos['mean_exp']:.2f}%)")
+        print(f"  → candle_bull discriminative hơn candle_body ✅ — giữ S36 fix")
+    else:
+        print(f"  → Original OOS exp CAO hơn S36 (+{agg_orig_oos['mean_exp']-agg_s36_oos['mean_exp']:.2f}%)")
+        print(f"  → candle_body tốt hơn candle_bull ← quay về logic gốc")
 
 
 if __name__ == "__main__":
