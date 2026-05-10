@@ -81,26 +81,32 @@ MR_SYMBOLS  = [
 # Universe = W2_ONLY: pass WF với smooth stoch nhưng KHÔNG pass baseline raw stoch
 # Rule vớt n<15: phải có consist=100% VÀ WFE≥2.0
 MR2_SYMBOLS = [
-    # ── n≥15, OOS_n đủ lớn ────────────────────────────────────────────────────
-    "VPI",   # [B] OOS=+3.06% WFE=5.37 consist=83%  n=26 ✅
-    "CTR",   # [B] OOS=+3.13% WFE=2.65 consist=60%  n=19 ok
-    "DPR",   # [B] OOS=+3.50% WFE=1.64 consist=60%  n=18 ok
-    "PET",   # [B] OOS=+3.95% WFE=9.18 consist=60%  n=20 ✅
-    "DXG",   # [B] OOS=+4.14% WFE=1.02 consist=60%  n=19 ok
-    "TDP",   # [B] OOS=+2.57% WFE=1.40 consist=60%  n=21 ✅
-    "VSC",   # [B] OOS=+2.17% WFE=2.56 consist=60%  n=19 ok
-    "CTS",   # [B] OOS=+2.13% WFE=1.12 consist=60%  n=17 ok
-    "MIG",   # [B] OOS=+1.85% WFE=1.34 consist=75%  n=15 ok
-    # ── n<15 — vớt theo rule: consist=100% VÀ WFE≥2.0 ────────────────────────
-    "TRC",   # [A] OOS=+4.48% WFE=5.43 consist=100% n=12 ⚠️ (n_cap=True)
-    "HCM",   # [A] OOS=+4.40% WFE=2.23 consist=100% n=14 ⚠️ (n_cap=True)
-    "CTG",   # [B] OOS=+3.49% WFE=6.05 consist=100% n=14 ⚠️ (n_cap=True)
-    # ── Loại ──────────────────────────────────────────────────────────────────
-    # HAH: WFE=0.83 (<0.8 threshold) → loại
-    # NKG: WFE=0.88 (<0.8 threshold) → loại
-    # GMD: WFE=0.91 (<0.8 threshold) → loại
-    # MSB: WFE=0.88 (<0.8 threshold) → loại
-    # EVF: n=14 + consist=67% + WFE=1.02 → không đủ rule vớt (cần consist=100%)
+    # S37 vibe filter results:
+    # BONUS  : DPR (MultiFactor)
+    # NO_FILTER: VPI, CTR, TDP, VSC, HCM, CTG — không đủ engine data, chờ live
+    # LOAI   : MIG (exp thấp + Candlestick+CrossMarket loại)
+    #           PET (exp thấp + Volatility+MultiFactor loại)
+    #           TRC (exp thấp + CrossMarket loại)
+    # GIỮ với NO_FILTER: CTS và DXG — exp tốt, vibe engines không đủ conclusive
+    #   CTS: SMC+CrossMarket loại nhưng tot margin nhỏ, OOS_exp=+2.13% vẫn pass WF
+    #   DXG: CrossMarket loại do 1 fold outlier (-20%), OOS_exp=+4.14% rất tốt
+    # ── Active watchlist ──────────────────────────────────────────────────────
+    "VPI",   # [B] OOS=+3.06% WFE=5.37 consist=83%  n=26 ✅ NO_FILTER
+    "CTR",   # [B] OOS=+3.13% WFE=2.65 consist=60%  n=19    NO_FILTER
+    "DPR",   # [B] OOS=+3.50% WFE=1.64 consist=60%  n=18    BONUS:MultiFactor
+    "DXG",   # [B] OOS=+4.14% WFE=1.02 consist=60%  n=19    NO_FILTER (CrossMarket 1 fold outlier)
+    "TDP",   # [B] OOS=+2.57% WFE=1.40 consist=60%  n=21    NO_FILTER
+    "VSC",   # [B] OOS=+2.17% WFE=2.56 consist=60%  n=19    NO_FILTER
+    "CTS",   # [B] OOS=+2.13% WFE=1.12 consist=60%  n=17    NO_FILTER (engines inconclusive)
+    "HCM",   # [A] OOS=+4.40% WFE=2.23 consist=100% n=14 ⚠️ NO_FILTER (n_cap=True)
+    "CTG",   # [B] OOS=+3.49% WFE=6.05 consist=100% n=14 ⚠️ NO_FILTER (n_cap=True)
+    # ── Loại theo vibe filter S37 ─────────────────────────────────────────────
+    # MIG: exp thấp (+1.85%) + Candlestick=LOAI + CrossMarket=LOAI
+    # PET: exp thấp (+3.95% nhưng consist=60%) + Volatility=LOAI + MultiFactor=LOAI
+    # TRC: CrossMarket=LOAI (n=12, n_cap đã vớt nhưng engine loại)
+    # ── Loại từ trước (score/WFE/n filter) ───────────────────────────────────
+    # HAH, NKG, GMD, MSB: WFE < 0.8
+    # EVF: n=14 + consist=67%
 ]
 
 MOM_SYMBOLS = [
@@ -364,7 +370,8 @@ SYMBOL_STATS = {
                "score": 1.77, "consist": 83,
                "partial_note": "⚠️ WFE borderline 0.88"},
     # ── MR2 cluster — S37: Mean Reversion với Smooth Stoch ───────────────────
-    # Suffix _MR2 để phân biệt với plain key (mã không có trong cluster khác)
+    # Vibe filter S37: LOAI → MIG, PET, TRC (xóa khỏi watchlist)
+    # CTS, DXG: engines loại nhưng margin/outlier → giữ NO_FILTER per quyết định S37
     # n_cap=True: position sizing × 0.7 cho mã OOS_n < 15
     "VPI":  {"wr": 58, "exp": 3.06, "wfe": 5.37, "n": 26, "pf": 1.85, "cluster": "Mean Reversion 2",
              "score": 2.55, "consist": 83},
@@ -372,22 +379,16 @@ SYMBOL_STATS = {
              "score": 1.88, "consist": 60},
     "DPR":  {"wr": 61, "exp": 3.50, "wfe": 1.64, "n": 18, "pf": 1.82, "cluster": "Mean Reversion 2",
              "score": 2.10, "consist": 60},
-    "PET":  {"wr": 65, "exp": 3.95, "wfe": 9.18, "n": 20, "pf": 2.11, "cluster": "Mean Reversion 2",
-             "score": 2.37, "consist": 60},
     "DXG":  {"wr": 58, "exp": 4.14, "wfe": 1.02, "n": 19, "pf": 1.74, "cluster": "Mean Reversion 2",
-             "score": 2.48, "consist": 60},
+             "score": 2.48, "consist": 60,
+             "partial_note": "ℹ️ MR2 (CrossMarket 1 fold outlier, NO_FILTER)"},
     "TDP":  {"wr": 57, "exp": 2.57, "wfe": 1.40, "n": 21, "pf": 1.63, "cluster": "Mean Reversion 2",
              "score": 1.54, "consist": 60},
     "VSC":  {"wr": 58, "exp": 2.17, "wfe": 2.56, "n": 19, "pf": 1.65, "cluster": "Mean Reversion 2",
              "score": 1.30, "consist": 60},
     "CTS":  {"wr": 59, "exp": 2.13, "wfe": 1.12, "n": 17, "pf": 1.58, "cluster": "Mean Reversion 2",
-             "score": 1.28, "consist": 60},
-    "MIG":  {"wr": 67, "exp": 1.85, "wfe": 1.34, "n": 15, "pf": 1.54, "cluster": "Mean Reversion 2",
-             "score": 1.39, "consist": 75},
-    # n<15 — vớt: consist=100% + WFE≥2.0 → n_cap=True (sizing × 0.7)
-    "TRC":  {"wr": 75, "exp": 4.48, "wfe": 5.43, "n": 12, "pf": 2.87, "cluster": "Mean Reversion 2",
-             "score": 4.48, "consist": 100, "n_cap": True,
-             "partial_note": "⚠️ n=12 (<15) — sizing giảm 30%"},
+             "score": 1.28, "consist": 60,
+             "partial_note": "ℹ️ MR2 (SMC+CrossMarket margin nhỏ, NO_FILTER)"},
     "HCM":  {"wr": 71, "exp": 4.40, "wfe": 2.23, "n": 14, "pf": 2.34, "cluster": "Mean Reversion 2",
              "score": 4.40, "consist": 100, "n_cap": True,
              "partial_note": "⚠️ n=14 (<15) — sizing giảm 30%"},
@@ -511,19 +512,17 @@ VIBE_FILTER_CONFIG = {
         "FPT": {"hard": [], "bonus": []},
         "VHC": {"hard": [], "bonus": []},
     },
-    # S37: MR2 cluster — chưa có vibe backtest, tất cả để trống
-    # TODO: chạy vibe backtest cho 12 mã MR2 trước khi thêm hard/bonus engines
+    # S37: MR2 cluster — vibe filter kết quả S37
+    # LOAI: MIG, PET, TRC (đã xóa khỏi MR2_SYMBOLS)
+    # LOAI: CTS (SMC+CrossMarket) và DXG (CrossMarket) → giữ với NO_FILTER per quyết định S37
     "Mean Reversion 2": {
         "VPI": {"hard": [], "bonus": []},
         "CTR": {"hard": [], "bonus": []},
-        "DPR": {"hard": [], "bonus": []},
-        "PET": {"hard": [], "bonus": []},
-        "DXG": {"hard": [], "bonus": []},
+        "DPR": {"hard": [], "bonus": ["MultiFactor"]},
+        "DXG": {"hard": [], "bonus": []},   # CrossMarket=LOAI (1 fold outlier), giữ NO_FILTER
         "TDP": {"hard": [], "bonus": []},
         "VSC": {"hard": [], "bonus": []},
-        "CTS": {"hard": [], "bonus": []},
-        "MIG": {"hard": [], "bonus": []},
-        "TRC": {"hard": [], "bonus": []},
+        "CTS": {"hard": [], "bonus": []},   # SMC+CrossMarket loại nhưng margin nhỏ, giữ NO_FILTER
         "HCM": {"hard": [], "bonus": []},
         "CTG": {"hard": [], "bonus": []},
     },
