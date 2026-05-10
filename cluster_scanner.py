@@ -76,6 +76,33 @@ MR_SYMBOLS  = [
     # DGC: fail MR S35 → loại
     # VGC: score=0.75 < 1.0 → loại
 ]
+# ── MR2 cluster — Mean Reversion với Smooth Stoch (SMA3) ─────────────────────
+# S37: cluster mới, independent universe (không overlap MR)
+# Universe = W2_ONLY: pass WF với smooth stoch nhưng KHÔNG pass baseline raw stoch
+# Rule vớt n<15: phải có consist=100% VÀ WFE≥2.0
+MR2_SYMBOLS = [
+    # ── n≥15, OOS_n đủ lớn ────────────────────────────────────────────────────
+    "VPI",   # [B] OOS=+3.06% WFE=5.37 consist=83%  n=26 ✅
+    "CTR",   # [B] OOS=+3.13% WFE=2.65 consist=60%  n=19 ok
+    "DPR",   # [B] OOS=+3.50% WFE=1.64 consist=60%  n=18 ok
+    "PET",   # [B] OOS=+3.95% WFE=9.18 consist=60%  n=20 ✅
+    "DXG",   # [B] OOS=+4.14% WFE=1.02 consist=60%  n=19 ok
+    "TDP",   # [B] OOS=+2.57% WFE=1.40 consist=60%  n=21 ✅
+    "VSC",   # [B] OOS=+2.17% WFE=2.56 consist=60%  n=19 ok
+    "CTS",   # [B] OOS=+2.13% WFE=1.12 consist=60%  n=17 ok
+    "MIG",   # [B] OOS=+1.85% WFE=1.34 consist=75%  n=15 ok
+    # ── n<15 — vớt theo rule: consist=100% VÀ WFE≥2.0 ────────────────────────
+    "TRC",   # [A] OOS=+4.48% WFE=5.43 consist=100% n=12 ⚠️ (n_cap=True)
+    "HCM",   # [A] OOS=+4.40% WFE=2.23 consist=100% n=14 ⚠️ (n_cap=True)
+    "CTG",   # [B] OOS=+3.49% WFE=6.05 consist=100% n=14 ⚠️ (n_cap=True)
+    # ── Loại ──────────────────────────────────────────────────────────────────
+    # HAH: WFE=0.83 (<0.8 threshold) → loại
+    # NKG: WFE=0.88 (<0.8 threshold) → loại
+    # GMD: WFE=0.91 (<0.8 threshold) → loại
+    # MSB: WFE=0.88 (<0.8 threshold) → loại
+    # EVF: n=14 + consist=67% + WFE=1.02 → không đủ rule vớt (cần consist=100%)
+]
+
 MOM_SYMBOLS = [
     # ── S34 scan v4 — Pass CẢ 2 options (Option A + B) ───────────────────────
     # Tier A (score >= 4, consist 100%):
@@ -108,29 +135,40 @@ MOM_SYMBOLS = [
     # HAG: fail cả 2 options → loại
 ]
 
-# Breakout cluster (S34 scan v4 results)
+# Breakout cluster — S37: redesign với BB Squeeze (W3) + Consol V2 (S6)
+# Filter: score ≥ 1.5, WFE ≥ 0.8, consist ≥ 80%, Option B
+# BB hẹp (squeeze) → vol dry-up → breakout (khác baseline BB rộng)
 BREAKOUT_SYMBOLS = [
-    # ── Pass cả 2 options ─────────────────────────────────────────────────────
-    "BFC",   # [A] OOS=+4.62% WFE=2.61 consist=100% ⭐ NEW
-    "VSC",   # [A] OOS=+6.01% WFE=3.87 consist=67%  ⭐ NEW
-    "BMP",   # [B] OOS=+2.84% WFE=1.53 consist=100% ⭐ NEW
-    "FRT",   # [B] OOS=+3.01% WFE=2.23 consist=67%  ⭐ NEW
-    # ── Partial pass — chỉ Option A (note khi phát tín hiệu) ─────────────────
-    "TCH",   # [A] OOS=+6.23% WFE=2.01 consist=100% — CHỈ Option A | ⭐ NEW
-    "LPB",   # [A] OOS=+8.04% WFE=3.54 consist=75%  — CHỈ Option A (cũng MOM [A])
-    "HDB",   # [B] OOS=+1.57% WFE=4.05* consist=75% — CHỈ Option A | score biên 1.18
-    # ── Partial pass — chỉ Option B ──────────────────────────────────────────
-    "MCH",   # [B] OOS=+4.63% WFE=1.61 consist=60%  — CHỈ Option B (cũng MOM [B])
-    "TCB",   # [B] OOS=+3.62% WFE=1.48 consist=75%  — CHỈ Option B ← current S33
-    "VTP",   # [B] OOS=+3.57% WFE=2.72 consist=75%  — CHỈ Option B (cũng MOM [A])
-    # ── Loại so với S33 ───────────────────────────────────────────────────────
-    # HT1: fail cả 2 options → loại
-    # GMD: fail cả 2 options → loại
-    # DGC: fail cả 2 options → loại
-    # DCM: fail BO → chuyển sang MOM
+    # ── Tier A (score ≥ 4.0) ──────────────────────────────────────────────────
+    "CTG",   # [A] score=4.75 OOS=+4.75% WFE=2.256 consist=100% n=33 ✅
+    "LPB",   # [A] score=4.36 OOS=+4.36% WFE=0.901 consist=100% n=28 ⚠️WFE (cũng MOM A)
+    # ── Tier B (score 1.5–3.99) ───────────────────────────────────────────────
+    "TRC",   # [B] score=3.68 OOS=+3.68% WFE=2.453 consist=100% n=32 ✅
+    "CTS",   # [B] score=3.66 OOS=+4.41% WFE=1.726 consist=83%  n=31 ✅
+    "BSI",   # [B] score=3.57 OOS=+4.30% WFE=2.750 consist=83%  n=28 ✅
+    "DXG",   # [B] score=3.49 OOS=+3.49% WFE=2.573 consist=100% n=30 ✅
+    "VTP",   # [B] score=3.46 OOS=+4.17% WFE=2.408 consist=83%  n=31 ✅ (cũng MOM A)
+    "BMP",   # [B] score=3.35 OOS=+4.19% WFE=2.346 consist=80%  n=21 ✅ (cũng MR A)
+    "TCB",   # [B] score=3.28 OOS=+3.28% WFE=2.694 consist=100% n=33 ✅
+    "NAB",   # [B] score=2.99 OOS=+3.60% WFE=0.824 consist=83%  n=35 ⚠️WFE (cũng MR A)
+    "CTD",   # [B] score=2.76 OOS=+3.32% WFE=0.844 consist=83%  n=32 ⚠️WFE
+    "ACB",   # [B] score=2.58 OOS=+2.58% WFE=3.430 consist=100% n=32 ✅
+    "TV2",   # [B] score=2.49 OOS=+3.00% WFE=2.525 consist=83%  n=30 ✅
+    "MBB",   # [B] score=2.21 OOS=+2.21% WFE=1.903 consist=100% n=35 ✅
+    "BID",   # [B] score=2.20 OOS=+2.20% WFE=0.968 consist=100% n=38 ⚠️WFE
+    "ELC",   # [B] score=2.09 OOS=+2.52% WFE=1.376 consist=83%  n=37 ✅
+    "FPT",   # [B] score=1.77 OOS=+2.13% WFE=0.878 consist=83%  n=29 ⚠️WFE
+    "VHC",   # [B] score=1.58 OOS=+1.91% WFE=1.702 consist=83%  n=30 ✅
+    # ── Loại so với baseline S34 ──────────────────────────────────────────────
+    # BFC: không pass W3+S6 regime (BB squeeze) → loại
+    # VSC: không pass W3+S6 → loại
+    # FRT: không pass W3+S6 → loại
+    # MCH: không pass W3+S6 → loại
+    # TCH: không pass W3+S6 → loại
+    # Loại theo score < 1.5: TLG(1.20), HDB(1.18), EIB(1.09)
 ]
 
-FWD_DAYS = {"Mean Reversion": 20, "Momentum": 10, "Breakout": 15}
+FWD_DAYS = {"Mean Reversion": 20, "Mean Reversion 2": 20, "Momentum": 10, "Breakout": 15}
 
 # Cron times (UTC)
 MORNING_HOUR,   MORNING_MINUTE   = 1, 30   # 08:30 VN
@@ -146,6 +184,17 @@ SIGNAL_CONFIG = {
                               "momentum_5d": "high"},
         "description": "Mua khi giá dưới SMA50 + stoch oversold + volume spike",
     },
+    # S37: MR2 — Mean Reversion với Smooth Stoch (SMA3 của raw %K)
+    # Universe riêng (MR2_SYMBOLS), không overlap MR
+    # stoch_k_smooth = SMA3(raw %K) — bắt oversold muộn hơn, phù hợp mã bounce chậm
+    "Mean Reversion 2": {
+        "regime_indicator":  "price_vs_sma50",
+        "regime_condition":  "low",
+        "trigger_indicators":["stoch_k_smooth", "volume_spike", "momentum_5d"],
+        "trigger_direction": {"stoch_k_smooth": "low", "volume_spike": "high",
+                              "momentum_5d": "high"},
+        "description": "MR với smooth stoch (SMA3) — bounce chậm hơn MR baseline",
+    },
     "Momentum": {
         "regime_indicator":  "ema_cross",
         "regime_condition":  "high",
@@ -156,12 +205,15 @@ SIGNAL_CONFIG = {
     },
     "Breakout": {
         "regime_indicator":  "bb_squeeze",
-        "regime_condition":  "high",
-        # FIX S36: consolidation direction = "high" (nhiều ngày tích lũy = tốt)
-        # công thức % ngày sideways đã đúng, chỉ cần flip direction low→high
-        "trigger_indicators":["consolidation", "vol_dry_up"],
-        "trigger_direction": {"consolidation": "high", "vol_dry_up": "high"},
-        "description": "Mua khi BB rộng + giá sideways + volume khô → bứt phá",
+        # S37 W3: 'low' = BB hẹp (squeeze) thay vì 'high' (BB rộng baseline)
+        # Squeeze setup: BB hẹp → vol dry-up → consolidation → chờ bứt phá
+        "regime_condition":  "low",
+        "trigger_indicators":["consolidation", "vol_dry_up", "momentum_5d"],
+        "trigger_direction": {"consolidation": "high", "vol_dry_up": "high",
+                              "momentum_5d": "high"},
+        # S37 S6: consolidation dùng % ngày sideways vs mean(window) (consol_v2)
+        # nhất quán với _consol_val trong _compute_indicators
+        "description": "BB squeeze + vol dry-up + consolidation → bứt phá",
     },
 }
 
@@ -202,7 +254,9 @@ SYMBOL_STATS = {
     "PC1":    {"wr": 54, "exp": 2.44, "wfe": 2.91, "n": 25, "pf": 1.39, "cluster": "Mean Reversion",
                "score": 1.63, "consist": 67,  "partial_pass": True,  "partial_note": "⚠️ Chỉ pass Option B"},
     "CTI":    {"wr": 55, "exp": 2.15, "wfe": 4.01, "n": 14, "pf": 1.36, "cluster": "Mean Reversion",
-               "score": 1.61, "consist": 75,  "partial_pass": True,  "partial_note": "⚠️ Chỉ pass Option B", "wfe_inflate": True},
+               "score": 1.61, "consist": 75,  "partial_pass": True,  "partial_note": "⚠️ Chỉ pass Option B",
+               "wfe_inflate": True},
+               # NOTE S37 W8: n=14 dưới ngưỡng per-symbol n≥15 — monitor khi có thêm folds
     "REE":    {"wr": 54, "exp": 2.39, "wfe": 1.32, "n": 23, "pf": 2.21, "cluster": "Mean Reversion",
                "score": 1.60, "consist": 67,  "partial_pass": True,  "partial_note": "⚠️ Chỉ pass Option B"},
     "TLG":    {"wr": 54, "exp": 2.24, "wfe": 1.36, "n": 26, "pf": 1.62, "cluster": "Mean Reversion",
@@ -264,37 +318,95 @@ SYMBOL_STATS = {
              "wfe_inflate": True},
     "CTG":  {"wr": 50, "exp": 1.23, "wfe": 1.11, "n": 25, "pf": 1.96, "cluster": "Momentum",
              "score": 1.02, "consist": 83,  "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option B · score biên"},
-    # ── Breakout — S34 scan v4 ────────────────────────────────────────────────
-    # Tier A — pass cả 2 options
-    "BFC":  {"wr": 55, "exp": 4.62, "wfe": 2.61, "n": 12, "pf": 1.25, "cluster": "Breakout",
-             "score": 4.62, "consist": 100, "partial_pass": False},
-    "VSC":  {"wr": 60, "exp": 6.01, "wfe": 3.87, "n": 11, "pf": 1.55, "cluster": "Breakout",
-             "score": 4.01, "consist": 67,  "partial_pass": False},
-    # Tier B — pass cả 2 options
-    "BMP":  {"wr": 58, "exp": 2.84, "wfe": 1.53, "n": 19, "pf": 1.81, "cluster": "Breakout",
-             "score": 2.84, "consist": 100, "partial_pass": False},
-    "FRT_BO": {"wr": 55, "exp": 3.01, "wfe": 2.23, "n": 12, "pf": 1.91, "cluster": "Breakout",
-               "score": 2.01, "consist": 67,  "partial_pass": False},
-    # Partial pass — chỉ Option A
-    "TCH":  {"wr": 60, "exp": 6.23, "wfe": 2.01, "n": 15, "pf": 2.35, "cluster": "Breakout",
-             "score": 6.23, "consist": 100, "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option A"},
-    "LPB_BO": {"wr": 60, "exp": 8.04, "wfe": 3.54, "n": 24, "pf": 3.61, "cluster": "Breakout",
-               "score": 6.03, "consist": 75,  "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option A (cũng MOM Tier A)"},
-    "HDB":  {"wr": 55, "exp": 1.57, "wfe": 4.05, "n": 23, "pf": 1.73, "cluster": "Breakout",
-             "score": 1.18, "consist": 75,  "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option A · score biên · WFE inflate",
-             "wfe_inflate": True},
-    # Partial pass — chỉ Option B
-    "TCB":  {"wr": 90, "exp": 3.62, "wfe": 1.48, "n": 17, "pf": 1.46, "cluster": "Breakout",
-             "score": 2.72, "consist": 75,  "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option B"},
-    "VTP_BO": {"wr": 60, "exp": 3.57, "wfe": 2.72, "n": 18, "pf": 2.02, "cluster": "Breakout",
-               "score": 2.67, "consist": 75,  "partial_pass": True, "partial_note": "⚠️ Chỉ pass Option B (cũng MOM Tier A)"},
+    # ── Breakout — S37 W3+S6 (BB Squeeze + Consol V2) ───────────────────────────
+    # Score = OOS_exp × consist/100 | Filter: score≥1.5, WFE≥0.8, consist≥80%
+    # ⚠️WFE = WFE 0.80–0.99 (IS > OOS, monitor live)
+    # Tier A
+    "CTG":    {"wr": 71, "exp": 4.75, "wfe": 2.256, "n": 33, "pf": 2.11, "cluster": "Breakout",
+               "score": 4.75, "consist": 100},
+    "LPB_BO": {"wr": 68, "exp": 4.36, "wfe": 0.901, "n": 28, "pf": 2.20, "cluster": "Breakout",
+               "score": 4.36, "consist": 100,
+               "partial_note": "⚠️ WFE borderline 0.90 (cũng MOM Tier A)"},
+    # Tier B — WFE ≥ 2.0
+    "TRC_BO": {"wr": 75, "exp": 3.68, "wfe": 2.453, "n": 32, "pf": 1.85, "cluster": "Breakout",
+               "score": 3.68, "consist": 100},
+    "CTS_BO": {"wr": 65, "exp": 4.41, "wfe": 1.726, "n": 31, "pf": 2.83, "cluster": "Breakout",
+               "score": 3.66, "consist": 83},
+    "BSI_BO": {"wr": 64, "exp": 4.30, "wfe": 2.750, "n": 28, "pf": 3.62, "cluster": "Breakout",
+               "score": 3.57, "consist": 83},
+    "DXG_BO": {"wr": 68, "exp": 3.49, "wfe": 2.573, "n": 30, "pf": 2.19, "cluster": "Breakout",
+               "score": 3.49, "consist": 100},
+    "VTP_BO": {"wr": 65, "exp": 4.17, "wfe": 2.408, "n": 31, "pf": 1.37, "cluster": "Breakout",
+               "score": 3.46, "consist": 83,
+               "partial_note": "ℹ️ Cũng MOM Tier A"},
+    "BMP_BO": {"wr": 62, "exp": 4.19, "wfe": 2.346, "n": 21, "pf": 1.57, "cluster": "Breakout",
+               "score": 3.35, "consist": 80,
+               "partial_note": "ℹ️ Cũng MR Tier A"},
+    "TCB":    {"wr": 68, "exp": 3.28, "wfe": 2.694, "n": 33, "pf": 1.60, "cluster": "Breakout",
+               "score": 3.28, "consist": 100},
+    "ACB":    {"wr": 68, "exp": 2.58, "wfe": 3.430, "n": 32, "pf": 2.13, "cluster": "Breakout",
+               "score": 2.58, "consist": 100},
+    "TV2":    {"wr": 63, "exp": 3.00, "wfe": 2.525, "n": 30, "pf": 1.47, "cluster": "Breakout",
+               "score": 2.49, "consist": 83},
+    "MBB_BO": {"wr": 60, "exp": 2.21, "wfe": 1.903, "n": 35, "pf": 1.59, "cluster": "Breakout",
+               "score": 2.21, "consist": 100,
+               "partial_note": "ℹ️ Cũng MOM Tier B"},
+    "ELC":    {"wr": 62, "exp": 2.52, "wfe": 1.376, "n": 37, "pf": 1.99, "cluster": "Breakout",
+               "score": 2.09, "consist": 83},
+    "VHC":    {"wr": 60, "exp": 1.91, "wfe": 1.702, "n": 30, "pf": 1.34, "cluster": "Breakout",
+               "score": 1.58, "consist": 83},
+    # Tier B — WFE ⚠️ (0.80–0.99)
+    "NAB_BO": {"wr": 63, "exp": 3.60, "wfe": 0.824, "n": 35, "pf": 2.43, "cluster": "Breakout",
+               "score": 2.99, "consist": 83,
+               "partial_note": "⚠️ WFE 0.82 (cũng MR Tier A)"},
+    "CTD":    {"wr": 64, "exp": 3.32, "wfe": 0.844, "n": 32, "pf": 2.15, "cluster": "Breakout",
+               "score": 2.76, "consist": 83,
+               "partial_note": "⚠️ WFE borderline 0.84"},
+    "BID":    {"wr": 65, "exp": 2.20, "wfe": 0.968, "n": 38, "pf": 2.95, "cluster": "Breakout",
+               "score": 2.20, "consist": 100,
+               "partial_note": "⚠️ WFE borderline 0.97"},
+    "FPT":    {"wr": 62, "exp": 2.13, "wfe": 0.878, "n": 29, "pf": 2.33, "cluster": "Breakout",
+               "score": 1.77, "consist": 83,
+               "partial_note": "⚠️ WFE borderline 0.88"},
+    # ── MR2 cluster — S37: Mean Reversion với Smooth Stoch ───────────────────
+    # Suffix _MR2 để phân biệt với plain key (mã không có trong cluster khác)
+    # n_cap=True: position sizing × 0.7 cho mã OOS_n < 15
+    "VPI":  {"wr": 58, "exp": 3.06, "wfe": 5.37, "n": 26, "pf": 1.85, "cluster": "Mean Reversion 2",
+             "score": 2.55, "consist": 83},
+    "CTR":  {"wr": 63, "exp": 3.13, "wfe": 2.65, "n": 19, "pf": 1.96, "cluster": "Mean Reversion 2",
+             "score": 1.88, "consist": 60},
+    "DPR":  {"wr": 61, "exp": 3.50, "wfe": 1.64, "n": 18, "pf": 1.82, "cluster": "Mean Reversion 2",
+             "score": 2.10, "consist": 60},
+    "PET":  {"wr": 65, "exp": 3.95, "wfe": 9.18, "n": 20, "pf": 2.11, "cluster": "Mean Reversion 2",
+             "score": 2.37, "consist": 60},
+    "DXG":  {"wr": 58, "exp": 4.14, "wfe": 1.02, "n": 19, "pf": 1.74, "cluster": "Mean Reversion 2",
+             "score": 2.48, "consist": 60},
+    "TDP":  {"wr": 57, "exp": 2.57, "wfe": 1.40, "n": 21, "pf": 1.63, "cluster": "Mean Reversion 2",
+             "score": 1.54, "consist": 60},
+    "VSC":  {"wr": 58, "exp": 2.17, "wfe": 2.56, "n": 19, "pf": 1.65, "cluster": "Mean Reversion 2",
+             "score": 1.30, "consist": 60},
+    "CTS":  {"wr": 59, "exp": 2.13, "wfe": 1.12, "n": 17, "pf": 1.58, "cluster": "Mean Reversion 2",
+             "score": 1.28, "consist": 60},
+    "MIG":  {"wr": 67, "exp": 1.85, "wfe": 1.34, "n": 15, "pf": 1.54, "cluster": "Mean Reversion 2",
+             "score": 1.39, "consist": 75},
+    # n<15 — vớt: consist=100% + WFE≥2.0 → n_cap=True (sizing × 0.7)
+    "TRC":  {"wr": 75, "exp": 4.48, "wfe": 5.43, "n": 12, "pf": 2.87, "cluster": "Mean Reversion 2",
+             "score": 4.48, "consist": 100, "n_cap": True,
+             "partial_note": "⚠️ n=12 (<15) — sizing giảm 30%"},
+    "HCM":  {"wr": 71, "exp": 4.40, "wfe": 2.23, "n": 14, "pf": 2.34, "cluster": "Mean Reversion 2",
+             "score": 4.40, "consist": 100, "n_cap": True,
+             "partial_note": "⚠️ n=14 (<15) — sizing giảm 30%"},
+    "CTG":  {"wr": 71, "exp": 3.49, "wfe": 6.05, "n": 14, "pf": 2.20, "cluster": "Mean Reversion 2",
+             "score": 3.49, "consist": 100, "n_cap": True,
+             "partial_note": "⚠️ n=14 (<15) — sizing giảm 30%"},
 }
 
 # SL từ MAE p25 analysis
 SL_CONFIG = {
-    "Mean Reversion": -13.5,  # p25 MAE
-    "Momentum":       -6.4,   # p25 MAE
-    "Breakout":       -6.4,   # dùng MOM SL (quyết định S31, MAE riêng TBD)
+    "Mean Reversion":   -13.5,  # p25 MAE
+    "Mean Reversion 2": -13.5,  # S37: dùng cùng SL với MR (chưa có MAE riêng)
+    "Momentum":         -6.4,   # p25 MAE
+    "Breakout":         -6.4,   # dùng MOM SL (quyết định S31, MAE riêng TBD)
 }
 
 # Trailing Stop config — validated từ backtest + walk forward (S31)
@@ -375,30 +487,50 @@ VIBE_FILTER_CONFIG = {
         "HAH": {"hard": [],  "bonus": []},
         "FTS": {"hard": [],  "bonus": []},
         "CTG": {"hard": [],  "bonus": []},
-        "VND": {"hard": [],  "bonus": []},
+        # VND: removed S37 — đã loại khỏi MOM_SYMBOLS (fail cả 2 options)
+        # HAG: removed S37 — đã loại khỏi MOM_SYMBOLS
         "VIX": {"hard": [],  "bonus": []},
         "CTS": {"hard": [],  "bonus": []},
-        "HAG": {"hard": [],  "bonus": []},
         "VDS": {"hard": [],  "bonus": []},
     },
     "Breakout": {
-        # S35 watchlist (Session 36) — 10 mã
-        # Vibe backtest S35: 0 HARD, 0 BONUS
-        #   SMC/BMP: null filter (cov=100%) + decay 40% → LOAI
-        #   SMC/TCH: null filter (cov=100%) → LOAI (theo precedent HAH/FTS MOM)
-        #   CrossMarket/FRT: exp_filt < exp_base → LOAI
-        #   CrossMarket/TCH: exp_filt < exp_base → LOAI
-        # → Tất cả mã reset về hard=[], bonus=[]
-        "BFC": {"hard": [], "bonus": []},
-        "VSC": {"hard": [], "bonus": []},
-        "BMP": {"hard": [], "bonus": []},
-        "FRT": {"hard": [], "bonus": []},
-        "TCH": {"hard": [], "bonus": []},
+        # S37 W3+S6 watchlist — 18 mã (BB Squeeze setup)
+        # Chưa có vibe backtest cho setup mới → tất cả hard=[], bonus=[]
+        # TODO: chạy vibe backtest cho 18 mã BO mới trước khi thêm engines
+        "CTG": {"hard": [], "bonus": []},
         "LPB": {"hard": [], "bonus": []},
-        "HDB": {"hard": [], "bonus": []},
-        "MCH": {"hard": [], "bonus": []},
-        "TCB": {"hard": [], "bonus": []},
+        "TRC": {"hard": [], "bonus": []},
+        "CTS": {"hard": [], "bonus": []},
+        "BSI": {"hard": [], "bonus": []},
+        "DXG": {"hard": [], "bonus": []},
         "VTP": {"hard": [], "bonus": []},
+        "BMP": {"hard": [], "bonus": []},
+        "TCB": {"hard": [], "bonus": []},
+        "NAB": {"hard": [], "bonus": []},
+        "CTD": {"hard": [], "bonus": []},
+        "ACB": {"hard": [], "bonus": []},
+        "TV2": {"hard": [], "bonus": []},
+        "MBB": {"hard": [], "bonus": []},
+        "BID": {"hard": [], "bonus": []},
+        "ELC": {"hard": [], "bonus": []},
+        "FPT": {"hard": [], "bonus": []},
+        "VHC": {"hard": [], "bonus": []},
+    },
+    # S37: MR2 cluster — chưa có vibe backtest, tất cả để trống
+    # TODO: chạy vibe backtest cho 12 mã MR2 trước khi thêm hard/bonus engines
+    "Mean Reversion 2": {
+        "VPI": {"hard": [], "bonus": []},
+        "CTR": {"hard": [], "bonus": []},
+        "DPR": {"hard": [], "bonus": []},
+        "PET": {"hard": [], "bonus": []},
+        "DXG": {"hard": [], "bonus": []},
+        "TDP": {"hard": [], "bonus": []},
+        "VSC": {"hard": [], "bonus": []},
+        "CTS": {"hard": [], "bonus": []},
+        "MIG": {"hard": [], "bonus": []},
+        "TRC": {"hard": [], "bonus": []},
+        "HCM": {"hard": [], "bonus": []},
+        "CTG": {"hard": [], "bonus": []},
     },
 }
 
@@ -414,7 +546,8 @@ ACCOUNT_SIZE = 300_000_000  # 300 triệu
 BASE_RISK_PCT  = 1.0    # % account cho mã có Score = MEDIAN_SCORE
 MIN_RISK_PCT   = 0.4    # % tối thiểu (mã yếu nhất)
 MAX_RISK_PCT   = 2.0    # % tối đa (mã mạnh nhất, 2x base)
-MEDIAN_SCORE   = 3.0    # median score S34 (OOS_exp × consist/100)
+MEDIAN_SCORE   = 2.50   # FIX S37 W6: median thực tế từ toàn bộ 50 mã trong SYMBOL_STATS
+                        # (tính lại: sorted scores → median = 2.50, thay vì 3.0 cũ)
 
 # Max concurrent positions & max exposure
 MAX_POSITIONS  = 6
@@ -521,6 +654,8 @@ def _compute_indicators(df: pd.DataFrame) -> dict | None:
     hi14   = pd.Series(high).rolling(14).max().values
     denom  = np.where(hi14 - lo14 == 0, 1e-9, hi14 - lo14)
     stoch  = 100 * (close - lo14) / denom
+    # S37 MR2: smooth stoch = SMA3(raw %K) — dùng cho MR2 cluster
+    stoch_smooth = _sma(stoch, 3)
 
     px    = close[i]
     atr_v = atr[i]   if np.isfinite(atr[i])   else px * 0.02
@@ -547,15 +682,15 @@ def _compute_indicators(df: pd.DataFrame) -> dict | None:
         "price_vs_sma20": float((px - s20) / (px + 1e-9) * 100),
         "ema_cross":      float((ema12[i] - ema26[i]) / (px + 1e-9) * 100),
         "momentum_5d":    float((px / (c5 + 1e-9) - 1.0) * 100),
-        # FIX S36: momentum_3d cho MOM guard — đà ngắn hạn 3 ngày
-        "momentum_3d":    float((px / (close[max(0, i-3)] + 1e-9) - 1.0) * 100),
+        # S37 S4: momentum_3d đã xóa — MOM_GUARD_3D experiment chưa validated (S36)
+        #         Nếu cần, sẽ thêm lại sau khi có đủ _compute_thresholds + backtest
         "volume_spike":   float((vol[i] / (vs20v + 1e-9)) - 1.0),
         "stoch_k":        float(stoch[i]),
+        # S37 MR2: smooth stoch (SMA3) — nhất quán với _compute_thresholds
+        "stoch_k_smooth": float(stoch_smooth[i]) if np.isfinite(stoch_smooth[i]) else float(stoch[i]),
         "candle_body":    float(np.clip(abs(px - opn[i]) / (atr_v + 1e-9), 0, 3)),
-        # FIX S36: candle_bull + volume_spike_bull cho MOM trigger (có hướng nến)
-        "candle_bull":    float(np.clip((px - opn[i]) / (atr_v + 1e-9), -3, 3)),
-        "volume_spike_bull": float((vol[i] / (vs20v + 1e-9)) - 1.0) if px >= opn[i] else -1.0,
         "atr_ratio":      float(atr_v / (px + 1e-9) * 100),
+        "atr":            float(atr_v),   # FIX S37 C4: ATR tuyệt đối (VND) — dùng cho trailing stop
         "sma20":          float(s20),
         "sma50":          float(s50),
         "ema12":          float(ema12[i]),
@@ -604,6 +739,8 @@ def _compute_thresholds_from_training(df: pd.DataFrame,
     hi14   = pd.Series(high).rolling(14).max().values
     denom  = np.where(hi14 - lo14 == 0, 1e-9, hi14 - lo14)
     stoch  = 100 * (close - lo14) / denom
+    # S37 MR2: smooth stoch series — nhất quán với _compute_indicators
+    stoch_smooth = _sma(stoch, 3)
 
     # FIX S33 Bug 3: tính vsma60 1 lần ngoài loop, không tính lại mỗi vòng
     vsma60 = _sma(vol, 60)
@@ -630,11 +767,10 @@ def _compute_thresholds_from_training(df: pd.DataFrame,
             "momentum_5d":    float((px / (c5 + 1e-9) - 1.0) * 100),
             "volume_spike":   float((vol[i] / (vs20v + 1e-9)) - 1.0),
             "stoch_k":        float(stoch[i]),
+            # S37 MR2: smooth stoch — nhất quán với _compute_indicators
+            "stoch_k_smooth": float(stoch_smooth[i]) if np.isfinite(stoch_smooth[i]) else float(stoch[i]),
             "candle_body":    float(np.clip(abs(px - opn[i]) / (atr_v + 1e-9), 0, 3)),
-            # FIX S36: candle_bull (có hướng) cho MOM — không fire khi nến đỏ to
-            "candle_bull":    float(np.clip((px - opn[i]) / (atr_v + 1e-9), -3, 3)),
-            # FIX S36: volume_spike_bull = -1 khi nến đỏ — không fire khi bán tháo
-            "volume_spike_bull": float((vol[i] / (vs20v + 1e-9)) - 1.0) if px >= opn[i] else -1.0,
+            # S37 S3: candle_bull + volume_spike_bull đã xóa — revert về MOM logic gốc (S36)
             "bb_squeeze":     bb_width_,
             "consolidation":  consol_,
             "vol_dry_up":     float((vs20v / (vsma60_v_ + 1e-9)) - 1.0),
@@ -719,6 +855,171 @@ def _get_vni_atr_info() -> dict:
                 "last_date": "?", "status": "⚠️ Không load được VNI"}
 
 
+# ── Vibe Filter Application ───────────────────────────────────────────────────
+
+def _run_vibe_engines(engines: list[str], symbol: str,
+                      df: pd.DataFrame) -> dict[str, int]:
+    """
+    Chạy các vibe engines được chỉ định, trả về {engine_name: signal}.
+    signal: +1 bull / -1 bear / 0 neutral.
+    Lỗi từng engine → 0 (không crash toàn bộ filter).
+    """
+    try:
+        from vibe_skills_1_ import _ENGINES, _prep
+    except ImportError:
+        logger.warning("[VibeFilter] Không import được vibe_skills_1_ — skip engines")
+        return {e: 0 for e in engines}
+
+    try:
+        df_prep  = _prep(df)
+        data_map = {symbol: df_prep}
+    except Exception as ex:
+        logger.warning(f"[VibeFilter] _prep lỗi cho {symbol}: {ex}")
+        return {e: 0 for e in engines}
+
+    results = {}
+    for name in engines:
+        engine = _ENGINES.get(name)
+        if engine is None:
+            logger.warning(f"[VibeFilter] Engine '{name}' không tìm thấy trong _ENGINES")
+            results[name] = 0
+            continue
+        try:
+            sigs, _ = engine.generate(data_map)
+            results[name] = int(sigs.get(symbol, 0))
+            logger.debug(f"[VibeFilter] {symbol}/{name}: signal={results[name]}")
+        except Exception as ex:
+            logger.warning(f"[VibeFilter] {symbol}/{name} lỗi: {ex}")
+            results[name] = 0
+
+    return results
+
+
+def _apply_vibe_filter(symbol: str, cluster: str,
+                       df: pd.DataFrame | None = None) -> dict:
+    """
+    Áp dụng VIBE_FILTER_CONFIG cho symbol/cluster.
+
+    Logic:
+      HARD filter  — TẤT CẢ hard engines phải đồng ý (+1).
+                     Nếu bất kỳ engine nào trả -1 → block_signal = True.
+                     Engine trả 0 (neutral) → không block (benefit of doubt).
+      BONUS filter — Chạy để ghi note lên Telegram; không block signal.
+                     +1 → "✅ ENGINE đồng ý" / -1 → "❌ ENGINE phủ nhận" / 0 → neutral
+
+    Args:
+        symbol  : mã cổ phiếu
+        cluster : "Mean Reversion" | "Momentum" | "Breakout"
+        df      : DataFrame OHLCV (từ load_vn_ohlcv) — cần có để chạy engines.
+                  Nếu None → không chạy được, hard_status = "NO_DATA", không block.
+
+    Trả về dict:
+        hard_engines   : list[str]
+        hard_status    : "PASS" | "FAIL" | "NO_DATA" | "N/A"
+        hard_signals   : {engine: int}
+        bonus_engines  : list[str]
+        bonus_signals  : {engine: int}
+        note           : str — hiển thị trên Telegram
+        block_signal   : bool
+    """
+    vibe_cfg      = VIBE_FILTER_CONFIG.get(cluster, {}).get(symbol, {})
+    hard_engines  = vibe_cfg.get("hard", [])
+    bonus_engines = vibe_cfg.get("bonus", [])
+
+    # Trường hợp không có filter nào → trả về nhanh
+    if not hard_engines and not bonus_engines:
+        return {
+            "hard_engines":  [],
+            "hard_status":   "N/A",
+            "hard_signals":  {},
+            "bonus_engines": [],
+            "bonus_signals": {},
+            "note":          "",
+            "block_signal":  False,
+        }
+
+    # Không có df → không thể chạy engine
+    if df is None:
+        logger.warning(f"[VibeFilter] {symbol}/{cluster}: df=None, bỏ qua vibe filter")
+        hard_note = (f"🔶 HARD filter ({', '.join(hard_engines)}) không chạy được (no data)"
+                     if hard_engines else "")
+        return {
+            "hard_engines":  hard_engines,
+            "hard_status":   "NO_DATA",
+            "hard_signals":  {},
+            "bonus_engines": bonus_engines,
+            "bonus_signals": {},
+            "note":          hard_note,
+            "block_signal":  False,   # benefit of doubt
+        }
+
+    # ── Chạy HARD engines ─────────────────────────────────────────────────────
+    hard_signals  = {}
+    hard_status   = "N/A"
+    block_signal  = False
+
+    if hard_engines:
+        hard_signals = _run_vibe_engines(hard_engines, symbol, df)
+        # Block nếu bất kỳ engine nào trả -1 (bear)
+        failed = [e for e, s in hard_signals.items() if s == -1]
+        if failed:
+            block_signal = True
+            hard_status  = "FAIL"
+            logger.info(
+                f"[VibeFilter] {symbol}/{cluster}: HARD FAIL — "
+                f"engines bearish: {failed}"
+            )
+        else:
+            hard_status = "PASS"
+            logger.debug(
+                f"[VibeFilter] {symbol}/{cluster}: HARD PASS — "
+                f"signals: {hard_signals}"
+            )
+
+    # ── Chạy BONUS engines (chỉ nếu signal chưa bị block) ────────────────────
+    bonus_signals = {}
+    if bonus_engines and not block_signal:
+        bonus_signals = _run_vibe_engines(bonus_engines, symbol, df)
+
+    # ── Build Telegram note ───────────────────────────────────────────────────
+    note_parts = []
+
+    if hard_engines:
+        if hard_status == "PASS":
+            h_detail = " | ".join(
+                f"{'✅' if s == 1 else '⬜'} {e}"
+                for e, s in hard_signals.items()
+            )
+            note_parts.append(f"🛡️ HARD ({h_detail}): PASS")
+        elif hard_status == "FAIL":
+            h_detail = " | ".join(
+                f"{'❌' if s == -1 else '✅' if s == 1 else '⬜'} {e}"
+                for e, s in hard_signals.items()
+            )
+            note_parts.append(f"🛡️ HARD ({h_detail}): ❌ BLOCK")
+        else:
+            note_parts.append(f"🔶 HARD ({', '.join(hard_engines)}): NO DATA")
+
+    if bonus_engines and not block_signal:
+        b_parts = []
+        for e, s in bonus_signals.items():
+            icon = "✅" if s == 1 else "❌" if s == -1 else "⬜"
+            b_parts.append(f"{icon} {e}")
+        note_parts.append(f"💡 Bonus: {' | '.join(b_parts)}")
+
+    note = "\n".join(note_parts)
+
+    return {
+        "hard_engines":  hard_engines,
+        "hard_status":   hard_status,
+        "hard_signals":  hard_signals,
+        "bonus_engines": bonus_engines,
+        "bonus_signals": bonus_signals,
+        "note":          note,
+        "block_signal":  block_signal,
+    }
+
+
 # ── Signal detection cho 1 mã ─────────────────────────────────────────────────
 
 def _scan_symbol(symbol: str, cluster: str) -> dict | None:
@@ -785,10 +1086,18 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
     if len(triggered) < MIN_TRIGGERS:
         return None
 
+    # Tầng 3: Vibe Filter — HARD block nếu engine bearish, BONUS ghi note
+    vibe = _apply_vibe_filter(symbol, cluster, df=df)
+    if vibe["block_signal"]:
+        logger.info(f"[Scanner] {symbol} {cluster}: blocked by HARD vibe filter "
+                    f"({vibe['hard_signals']})")
+        return None
+
     # Signal confirmed
     # Lookup SYMBOL_STATS: thử key có suffix cluster trước (FRT_MR, BMP_MR...)
     # rồi fallback về plain key (FRT, BMP...)
-    _cluster_suffix = {"Mean Reversion": "MR", "Momentum": "MOM", "Breakout": "BO"}
+    _cluster_suffix = {"Mean Reversion": "MR", "Mean Reversion 2": "MR2",
+                       "Momentum": "MOM", "Breakout": "BO"}
     _suffix = _cluster_suffix.get(cluster, "")
     stats = (SYMBOL_STATS.get(f"{symbol}_{_suffix}")
              or SYMBOL_STATS.get(symbol)
@@ -800,12 +1109,13 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
     tp_date   = (date.today() + timedelta(days=int(fwd * 1.4))).strftime("%d/%m/%Y")
 
     # Regime detail string
-    if cluster == "Mean Reversion":
-        regime_detail = (f"Giá dưới SMA50 ({val:+.1f}%) | "
+    if cluster in ("Mean Reversion", "Mean Reversion 2"):
+        mr2_tag = " [Smooth Stoch]" if cluster == "Mean Reversion 2" else ""
+        regime_detail = (f"Giá dưới SMA50 ({val:+.1f}%){mr2_tag} | "
                          f"SMA50={ind['sma50']:.1f}")
     elif cluster == "Breakout":
         consol_pct = ind.get("consolidation", 0) * 100
-        regime_detail = (f"BB rộng (width={val:.1f}%) | "
+        regime_detail = (f"BB hẹp/squeeze (width={val:.1f}%) | "
                          f"Sideways {consol_pct:.0f}% ngày | "
                          f"Vol dry-up={ind.get('vol_dry_up', 0):+.2f}x")
     else:
@@ -815,6 +1125,8 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
     # Trigger detail
     trigger_labels = {
         "stoch_k":           f"Stoch oversold ({ind['stoch_k']:.1f})",
+        # S37 MR2: smooth stoch label
+        "stoch_k_smooth":    f"Smooth Stoch oversold ({ind.get('stoch_k_smooth', ind['stoch_k']):.1f})",
         "momentum_5d":       f"Momentum 5d ({ind['momentum_5d']:+.1f}%)",
         "volume_spike":      f"Volume spike ({ind['volume_spike']:+.1f}x)",
         "candle_body":       f"Nến thân lớn ({ind['candle_body']:.2f})",
@@ -845,6 +1157,8 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
         "scan_time":     datetime.now().strftime("%H:%M"),
         "partial_note":  partial_note,
         "wfe_inflate_note": wfe_inflate_note,
+        "vibe_note":     vibe["note"],       # FIX S37 C2: HARD/BONUS filter status
+        "vibe_detail":   vibe,               # full vibe result cho debug
     }
 
 
@@ -861,16 +1175,20 @@ def _format_signal(sig: dict, vni_info: dict,
     # Cluster emoji + short
     if cluster == "Mean Reversion":
         emoji, cluster_short = "🔄", "MR"
+    elif cluster == "Mean Reversion 2":
+        emoji, cluster_short = "🔄", "MR2"
     elif cluster == "Momentum":
         emoji, cluster_short = "🚀", "MOM"
     else:
         emoji, cluster_short = "💥", "BO"
 
-    # WFE badge
+    # WFE badge — FIX S37 S5: ngưỡng 1.5/2.0/3.0 thay vì 0.5/0.7/1.0 cũ
+    # WFE < 1.0: IS tốt hơn OOS → overfit, không badge
+    # WFE ≥ 1.5: OOS đáng tin, WFE ≥ 2.0: tốt, WFE ≥ 3.0: xuất sắc
     wfe = stats.get("wfe", 0)
-    wfe_badge = ("⭐⭐⭐" if wfe >= 1.0 else
-                 "⭐⭐"  if wfe >= 0.7 else
-                 "⭐"   if wfe >= 0.5 else "")
+    wfe_badge = ("⭐⭐⭐" if wfe >= 3.0 else
+                 "⭐⭐"  if wfe >= 2.0 else
+                 "⭐"   if wfe >= 1.5 else "")
 
     lines = [
         f"{emoji} *{sym}* [{cluster_short}]{extra_tag} {wfe_badge}",
@@ -886,7 +1204,9 @@ def _format_signal(sig: dict, vni_info: dict,
         lines.append(f"*Lưu ý:* {sig['partial_note']}")
     if sig.get("wfe_inflate_note"):
         lines.append(f"*Lưu ý:* {sig['wfe_inflate_note']}")
-    if cluster == "Mean Reversion":
+    if sig.get("vibe_note"):                          # FIX S37 C2
+        lines.append(f"*Vibe Filter:* {sig['vibe_note']}")
+    if cluster in ("Mean Reversion", "Mean Reversion 2"):
         lines.append(f"*VNI ATR:* {vni_info['status']}")
 
     # Profit Factor
@@ -896,6 +1216,10 @@ def _format_signal(sig: dict, vni_info: dict,
     # Sizing score = score S34 (OOS_exp × consist/100) — đã có trong SYMBOL_STATS
     # Fallback về exp nếu mã chưa có score field (mã S33 cũ)
     sizing_score = stats.get("score") or stats.get("exp", 0)
+
+    # S37 MR2: n_cap — giảm 30% sizing cho mã OOS_n < 15
+    if stats.get("n_cap"):
+        sizing_score = sizing_score * 0.7
 
     lines += [
         f"",
@@ -951,6 +1275,8 @@ def _format_morning_scan(
     scan_label: str = "08:30",
     bo_signals: list[dict] | None = None,
     bo_no_signal: list[str] | None = None,
+    mr2_signals: list[dict] | None = None,
+    mr2_no_signal: list[str] | None = None,
 ) -> list[str]:
     """Format full morning scan report."""
     vn_now = datetime.utcnow() + timedelta(hours=7)
@@ -963,16 +1289,17 @@ def _format_morning_scan(
     messages = []
     current  = header + "\n"
 
-    total_signals = len(mr_signals) + len(mom_signals)
-
     bo_signals    = bo_signals    or []
     bo_no_signal  = bo_no_signal  or []
-    total_signals = len(mr_signals) + len(mom_signals) + len(bo_signals)
+    mr2_signals   = mr2_signals   or []
+    mr2_no_signal = mr2_no_signal or []
+    total_signals = len(mr_signals) + len(mr2_signals) + len(mom_signals) + len(bo_signals)
 
     if total_signals == 0:
         current += (
             f"\n✅ Không có signal hôm nay\n\n"
             f"*Mean Reversion ({len(MR_SYMBOLS)} mã):* Không đủ điều kiện\n"
+            f"*Mean Reversion 2 ({len(MR2_SYMBOLS)} mã):* Không đủ điều kiện\n"
             f"*Momentum ({len(MOM_SYMBOLS)} mã):* Không đủ điều kiện\n"
             f"*Breakout ({len(BREAKOUT_SYMBOLS)} mã):* Không đủ điều kiện\n\n"
             f"*VNI:* {vni_info['status']}\n"
@@ -993,6 +1320,19 @@ def _format_morning_scan(
     else:
         current += f"\n\n🔄 *MR:* Không có signal"
 
+    # MR2 signals
+    if mr2_signals:
+        current += f"\n━━ 🔄 MEAN REVERSION 2 / Smooth Stoch (FWD=20d) ━━\n"
+        for sig in mr2_signals:
+            sig_text = "\n" + _format_signal(sig, vni_info) + "\n"
+            if len(current) + len(sig_text) > 3800:
+                messages.append(current)
+                current = sig_text
+            else:
+                current += sig_text
+    else:
+        current += f"\n\n🔄 *MR2:* Không có signal"
+
     # MOM signals
     if mom_signals:
         current += f"\n━━ 🚀 MOMENTUM (FWD=10d) ━━\n"
@@ -1010,10 +1350,11 @@ def _format_morning_scan(
     if bo_signals:
         current += f"\n━━ 💥 BREAKOUT (FWD=15d) ━━\n"
         for sig in bo_signals:
-            # Ghi chú nếu mã này cũng thuộc cluster khác
             dual_tag = ""
             if sig["symbol"] in MR_SYMBOLS:
                 dual_tag = " (+MR)"
+            elif sig["symbol"] in MR2_SYMBOLS:
+                dual_tag = " (+MR2)"
             elif sig["symbol"] in MOM_SYMBOLS:
                 dual_tag = " (+MOM)"
             sig_text = "\n" + _format_signal(sig, vni_info, extra_tag=dual_tag) + "\n"
@@ -1026,16 +1367,19 @@ def _format_morning_scan(
         current += f"\n\n💥 *BO:* Không có signal"
 
     # Footer
-    total_symbols = len(MR_SYMBOLS) + len(MOM_SYMBOLS) + len(BREAKOUT_SYMBOLS)
+    total_symbols = len(MR_SYMBOLS) + len(MR2_SYMBOLS) + len(MOM_SYMBOLS) + len(BREAKOUT_SYMBOLS)
     footer = (
         f"\n━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"_Scan: {total_symbols} mã (MR={len(MR_SYMBOLS)}, MOM={len(MOM_SYMBOLS)}, BO={len(BREAKOUT_SYMBOLS)})_\n"
+        f"_Scan: {total_symbols} mã (MR={len(MR_SYMBOLS)}, MR2={len(MR2_SYMBOLS)}, "
+        f"MOM={len(MOM_SYMBOLS)}, BO={len(BREAKOUT_SYMBOLS)})_\n"
         f"*VNI ATR:* {vni_info['atr_ratio']:.3f} "
         f"({'cao ✅' if vni_info['is_high'] else 'thấp ⚠️'} "
         f"vs threshold {vni_info['threshold']:.3f})\n"
     )
     if mr_no_signal:
         footer += f"MR không signal: {' '.join(mr_no_signal)}\n"
+    if mr2_no_signal:
+        footer += f"MR2 không signal: {' '.join(mr2_no_signal)}\n"
     if mom_no_signal:
         footer += f"MOM không signal: {' '.join(mom_no_signal)}\n"
     footer += f"⏰ Update tiếp: 12:30 VN"
@@ -1168,6 +1512,7 @@ def run_morning_scan() -> tuple[list[str], dict]:
     mr_signals, mr_no_signal   = [], []
     mom_signals, mom_no_signal = [], []
     bo_signals,  bo_no_signal  = [], []
+    mr2_signals, mr2_no_signal = [], []
 
     for sym in MR_SYMBOLS:
         sig = _scan_symbol(sym, "Mean Reversion")
@@ -1177,6 +1522,15 @@ def run_morning_scan() -> tuple[list[str], dict]:
         else:
             mr_no_signal.append(sym)
             logger.debug(f"[Scanner] {sym} MR: no signal")
+
+    for sym in MR2_SYMBOLS:
+        sig = _scan_symbol(sym, "Mean Reversion 2")
+        if sig:
+            mr2_signals.append(sig)
+            logger.info(f"[Scanner] {sym} MR2 SIGNAL: {sig['trigger_str']}")
+        else:
+            mr2_no_signal.append(sym)
+            logger.debug(f"[Scanner] {sym} MR2: no signal")
 
     for sym in MOM_SYMBOLS:
         sig = _scan_symbol(sym, "Momentum")
@@ -1199,9 +1553,9 @@ def run_morning_scan() -> tuple[list[str], dict]:
     # Lưu vào memory để 12:30 update
     global _morning_signals
     _morning_signals = {}
-    for sig in mr_signals + mom_signals + bo_signals:
-        cluster_short = ("MR"  if sig["cluster"] == "Mean Reversion" else
-                         "MOM" if sig["cluster"] == "Momentum" else "BO")
+    for sig in mr_signals + mr2_signals + mom_signals + bo_signals:
+        cluster_short = {"Mean Reversion": "MR", "Mean Reversion 2": "MR2",
+                         "Momentum": "MOM", "Breakout": "BO"}.get(sig["cluster"], "?")
         _morning_signals[sig["symbol"]] = {
             "entry":         sig["entry_price"],
             "cluster":       sig["cluster"],
@@ -1211,12 +1565,13 @@ def run_morning_scan() -> tuple[list[str], dict]:
         }
 
     # Ghi vao cluster_journal (S31)
-    _journal_log_signals(mr_signals + mom_signals + bo_signals, vni_info)
+    _journal_log_signals(mr_signals + mr2_signals + mom_signals + bo_signals, vni_info)
 
-    total = len(mr_signals) + len(mom_signals) + len(bo_signals)
+    total = len(mr_signals) + len(mr2_signals) + len(mom_signals) + len(bo_signals)
     elapsed = round(_time.time() - t_start, 1)
     logger.info(f"[Scanner] Morning scan done: {total} signals "
-                f"(MR={len(mr_signals)}, MOM={len(mom_signals)}, BO={len(bo_signals)}) "
+                f"(MR={len(mr_signals)}, MR2={len(mr2_signals)}, "
+                f"MOM={len(mom_signals)}, BO={len(bo_signals)}) "
                 f"in {elapsed}s")
 
     messages = _format_morning_scan(
@@ -1224,6 +1579,7 @@ def run_morning_scan() -> tuple[list[str], dict]:
         mr_no_signal, mom_no_signal,
         vni_info, "08:30",
         bo_signals=bo_signals, bo_no_signal=bo_no_signal,
+        mr2_signals=mr2_signals, mr2_no_signal=mr2_no_signal,
     )
     return messages, _morning_signals
 
@@ -1277,10 +1633,26 @@ def run_afternoon_update() -> list[str] | None:
         if sig and sig["last_date"] != _morning_signals.get(sym, {}).get("last_date"):
             new_signals.append(sig)
 
+    # S37: MR2 cluster — scan afternoon nhất quán với morning
+    for sym in MR2_SYMBOLS:
+        if sym in morning_syms:
+            continue
+        sig = _scan_symbol(sym, "Mean Reversion 2")
+        if sig:
+            new_signals.append(sig)
+
     for sym in MOM_SYMBOLS:
         if sym in morning_syms:
             continue
         sig = _scan_symbol(sym, "Momentum")
+        if sig:
+            new_signals.append(sig)
+
+    # FIX S37 S2: thêm BO scan — nhất quán với morning scan
+    for sym in BREAKOUT_SYMBOLS:
+        if sym in morning_syms:
+            continue
+        sig = _scan_symbol(sym, "Breakout")
         if sig:
             new_signals.append(sig)
 
