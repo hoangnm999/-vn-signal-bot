@@ -143,29 +143,24 @@ BREAKOUT_SYMBOLS = [
     "CTG",   # [A] score=4.75 OOS=+4.75% WFE=2.256 consist=100% n=33 ✅
     "LPB",   # [A] score=4.36 OOS=+4.36% WFE=0.901 consist=100% n=28 ⚠️WFE (cũng MOM A)
     # ── Tier B (score 1.5–3.99) ───────────────────────────────────────────────
-    "TRC",   # [B] score=3.68 OOS=+3.68% WFE=2.453 consist=100% n=32 ✅
-    "CTS",   # [B] score=3.66 OOS=+4.41% WFE=1.726 consist=83%  n=31 ✅
-    "BSI",   # [B] score=3.57 OOS=+4.30% WFE=2.750 consist=83%  n=28 ✅
+    "CTS",   # [B] score=3.66 OOS=+4.41% WFE=1.726 consist=83%  n=31 ✅ HARD:SMC
     "DXG",   # [B] score=3.49 OOS=+3.49% WFE=2.573 consist=100% n=30 ✅
-    "VTP",   # [B] score=3.46 OOS=+4.17% WFE=2.408 consist=83%  n=31 ✅ (cũng MOM A)
+    "VTP",   # [B] score=3.46 OOS=+4.17% WFE=2.408 consist=83%  n=31 ✅ HARD:MultiFactor
     "BMP",   # [B] score=3.35 OOS=+4.19% WFE=2.346 consist=80%  n=21 ✅ (cũng MR A)
-    "TCB",   # [B] score=3.28 OOS=+3.28% WFE=2.694 consist=100% n=33 ✅
-    "NAB",   # [B] score=2.99 OOS=+3.60% WFE=0.824 consist=83%  n=35 ⚠️WFE (cũng MR A)
-    "CTD",   # [B] score=2.76 OOS=+3.32% WFE=0.844 consist=83%  n=32 ⚠️WFE
+    "TCB",   # [B] score=3.28 OOS=+3.28% WFE=2.694 consist=100% n=33 ✅ BONUS:MultiFactor
     "ACB",   # [B] score=2.58 OOS=+2.58% WFE=3.430 consist=100% n=32 ✅
-    "TV2",   # [B] score=2.49 OOS=+3.00% WFE=2.525 consist=83%  n=30 ✅
-    "MBB",   # [B] score=2.21 OOS=+2.21% WFE=1.903 consist=100% n=35 ✅
+    "MBB",   # [B] score=2.21 OOS=+2.21% WFE=1.903 consist=100% n=35 ✅ (SMC NULL filter)
     "BID",   # [B] score=2.20 OOS=+2.20% WFE=0.968 consist=100% n=38 ⚠️WFE
-    "ELC",   # [B] score=2.09 OOS=+2.52% WFE=1.376 consist=83%  n=37 ✅
     "FPT",   # [B] score=1.77 OOS=+2.13% WFE=0.878 consist=83%  n=29 ⚠️WFE
     "VHC",   # [B] score=1.58 OOS=+1.91% WFE=1.702 consist=83%  n=30 ✅
-    # ── Loại so với baseline S34 ──────────────────────────────────────────────
-    # BFC: không pass W3+S6 regime (BB squeeze) → loại
-    # VSC: không pass W3+S6 → loại
-    # FRT: không pass W3+S6 → loại
-    # MCH: không pass W3+S6 → loại
-    # TCH: không pass W3+S6 → loại
-    # Loại theo score < 1.5: TLG(1.20), HDB(1.18), EIB(1.09)
+    "CTD",   # [B] score=2.76 OOS=+3.32% WFE=0.844 consist=83%  n=32 ⚠️WFE
+    # ── Loại theo vibe filter S37 ─────────────────────────────────────────────
+    # BSI : CrossMarket=LOAI
+    # ELC : SMC=LOAI + CrossMarket=LOAI
+    # NAB : TechBasic=LOAI + CrossMarket=LOAI (vẫn giữ trong MR cluster)
+    # TRC : CrossMarket=LOAI + Chanlun=LOAI
+    # TV2 : SMC=LOAI
+    # MBB : giữ nhưng không có HARD (SMC NULL filter)
 ]
 
 FWD_DAYS = {"Mean Reversion": 20, "Mean Reversion 2": 20, "Momentum": 10, "Breakout": 15}
@@ -494,25 +489,25 @@ VIBE_FILTER_CONFIG = {
         "VDS": {"hard": [],  "bonus": []},
     },
     "Breakout": {
-        # S37 W3+S6 watchlist — 18 mã (BB Squeeze setup)
-        # Chưa có vibe backtest cho setup mới → tất cả hard=[], bonus=[]
-        # TODO: chạy vibe backtest cho 18 mã BO mới trước khi thêm engines
+        # S37 W3+S6 watchlist — 13 mã còn lại sau vibe filter
+        # Loại: BSI(CrossMarket), ELC(SMC+CrossMarket), NAB(TechBasic+CrossMarket),
+        #        TRC(CrossMarket+Chanlun), TV2(SMC)
+        # MBB: SMC cov=100% → NULL filter → LOAI theo precedent S35
+        #
+        # HARD_FILTER: signal chỉ fire khi engine đồng ý
+        "CTS": {"hard": ["SMC"],         "bonus": []},
+        "VTP": {"hard": ["MultiFactor"],  "bonus": []},   # conflict SMC=LOAI, MultiFactor=HARD → HARD wins
+        "MBB": {"hard": [],              "bonus": []},    # SMC NULL filter (cov=100%) → NO_FILTER
+        # BONUS: engine đồng ý thì tăng điểm score
+        "TCB": {"hard": [],              "bonus": ["MultiFactor"]},
+        # NO_FILTER: không có engine đủ data (giữ nguyên, chờ live data)
         "CTG": {"hard": [], "bonus": []},
         "LPB": {"hard": [], "bonus": []},
-        "TRC": {"hard": [], "bonus": []},
-        "CTS": {"hard": [], "bonus": []},
-        "BSI": {"hard": [], "bonus": []},
         "DXG": {"hard": [], "bonus": []},
-        "VTP": {"hard": [], "bonus": []},
-        "BMP": {"hard": [], "bonus": []},
-        "TCB": {"hard": [], "bonus": []},
-        "NAB": {"hard": [], "bonus": []},
-        "CTD": {"hard": [], "bonus": []},
+        "BMP": {"hard": [], "bonus": []},   # tất cả engines INSUF
         "ACB": {"hard": [], "bonus": []},
-        "TV2": {"hard": [], "bonus": []},
-        "MBB": {"hard": [], "bonus": []},
+        "CTD": {"hard": [], "bonus": []},
         "BID": {"hard": [], "bonus": []},
-        "ELC": {"hard": [], "bonus": []},
         "FPT": {"hard": [], "bonus": []},
         "VHC": {"hard": [], "bonus": []},
     },
@@ -849,6 +844,10 @@ def _get_vni_atr_info() -> dict:
             "status":     "✅ ATR cao — MR signals mạnh hơn" if is_high
                           else "⚠️ ATR thấp — MR signals yếu hơn",
         }
+    except SystemExit:
+        logger.warning("[VNI] vnstock rate limit (sys.exit) — dùng fallback")
+        return {"atr_ratio": 0, "threshold": 0.863, "is_high": None,
+                "last_date": "?", "status": "⚠️ Rate limit — dùng fallback VNI"}
     except Exception as e:
         logger.warning(f"[VNI] Error: {e}")
         return {"atr_ratio": 0, "threshold": 0.863, "is_high": None,
@@ -1039,6 +1038,13 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
                 logger.warning(f"[Scanner] {symbol} load TIMEOUT (>30s) — SKIP")
                 return None
         df["date"] = pd.to_datetime(df["date"])
+    except SystemExit as e:
+        # FIX S37: vnstock gọi sys.exit() khi rate limit — KHÔNG được crash server
+        # Bắt SystemExit, log warning, chờ rồi skip symbol này
+        logger.warning(f"[Scanner] {symbol} vnstock rate limit (sys.exit) — chờ 65s rồi skip")
+        import time as _time_rl
+        _time_rl.sleep(65)
+        return None
     except Exception as e:
         logger.warning(f"[Scanner] {symbol} load fail: {e}")
         return None
@@ -1515,7 +1521,11 @@ def run_morning_scan() -> tuple[list[str], dict]:
     mr2_signals, mr2_no_signal = [], []
 
     for sym in MR_SYMBOLS:
-        sig = _scan_symbol(sym, "Mean Reversion")
+        try:
+            sig = _scan_symbol(sym, "Mean Reversion")
+        except SystemExit:
+            logger.warning(f"[Scanner] {sym} MR: rate limit crash — skip")
+            sig = None
         if sig:
             mr_signals.append(sig)
             logger.info(f"[Scanner] {sym} MR SIGNAL: {sig['trigger_str']}")
@@ -1619,6 +1629,8 @@ def run_afternoon_update() -> list[str] | None:
                 "changed":       changed,
                 "note":          note,
             })
+        except SystemExit:
+            logger.warning(f"[Scanner] Update {sym}: vnstock rate limit — skip")
         except Exception as e:
             logger.debug(f"[Scanner] Update {sym}: {e}")
 
