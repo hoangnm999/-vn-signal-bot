@@ -106,12 +106,13 @@ except ImportError:
     logger.warning("analog_cmd.py chua co — /analog bi tat")
 
 try:
-    from cluster_scanner import cluster_scan_cmd, _start_cluster_scan_cron
+    from cluster_scanner import cluster_scan_cmd, size_cmd, _start_cluster_scan_cron
     _CLUSTER_SCANNER = True
     logger.info("cluster_scanner.py loaded OK")
 except ImportError:
     _CLUSTER_SCANNER = False
-    logger.warning("cluster_scanner.py chua co — /cluster_scan bi tat")
+    size_cmd = None
+    logger.warning("cluster_scanner.py chua co — /cluster_scan /size bi tat")
 
 try:
     from wave_pattern import wave_cmd
@@ -1829,7 +1830,8 @@ def main():
         app.add_handler(CommandHandler("signal_status",  signal_status_cmd))
         app.add_handler(CommandHandler("signal_history", signal_history_cmd))
     if _CLUSTER_SCANNER:
-        app.add_handler(CommandHandler("cluster_scan",   cluster_scan_cmd))
+        app.add_handler(CommandHandler("cluster_scan", cluster_scan_cmd))
+        app.add_handler(CommandHandler("size",         size_cmd))
     if _WAVE_PATTERN:
         app.add_handler(CommandHandler("wave", wave_cmd))
     if _MARKET_REGIME:

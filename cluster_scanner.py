@@ -399,10 +399,13 @@ SYMBOL_STATS = {
 
 # SL từ MAE p25 analysis
 SL_CONFIG = {
-    "Mean Reversion":   -13.5,  # p25 MAE
-    "Mean Reversion 2": -13.5,  # S37: dùng cùng SL với MR (chưa có MAE riêng)
-    "Momentum":         -6.4,   # p25 MAE
-    "Breakout":         -6.4,   # dùng MOM SL (quyết định S31, MAE riêng TBD)
+    "Mean Reversion":   -13.5,  # p25 MAE — S38: WF REJECT tất cả SL changes, giữ nguyên
+    "Mean Reversion 2": -13.5,  # p25 MAE — S38: tương tự MR, giữ nguyên
+    "Momentum":         -5.0,   # S38: WF 6/7 ADOPT (avg delta +0.383%), tighter từ -6.4%
+                                #      MAE p50 winners=-0.4%, p50 losers=-6.1%
+                                #      SL -5.0%: W_cut=8.7%, L_cut=60.0%
+    "Breakout":         -6.4,   # S38: WF REJECT -5.0%, giữ nguyên -6.4%
+                                #      SL -6.4%: W_cut=4.1%, L_cut=52.1% — hợp lý
 }
 
 # Trailing Stop config — validated từ backtest + walk forward (S31)
@@ -696,6 +699,9 @@ def _compute_indicators(df: pd.DataFrame) -> dict | None:
         "bb_squeeze":    bb_width,
         "consolidation": _consol_val(close, i),
         "vol_dry_up":    float((vs20v / (vsma60_v + 1e-9)) - 1.0),
+        # S38 Part 6: S/R levels cho dynamic position sizing (MR/MR2)
+        "nearest_s":     float(round((min(close[max(0,i-20):i+1]) / (px+1e-9) - 1.0)*100, 2)),
+        "nearest_r":     float(round((max(close[max(0,i-20):i+1]) / (px+1e-9) - 1.0)*100, 2)),
     }
 
 
@@ -1110,6 +1116,20 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
     fwd       = FWD_DAYS[cluster]
     entry     = ind["close"]
     sl_pct    = SL_CONFIG[cluster]
+
+    # S38 Part 6: Dynamic SL cho MR/MR2 — đặt tại nearest_s - 1% buffer
+    # position size = risk_budget / sl_dist → tự động adjust theo market structure
+    # Cap tại fixed SL để tránh worst case quá lớn
+    sl_dynamic_note = ""
+    if cluster in ("Mean Reversion", "Mean Reversion 2"):
+        ns = ind.get("nearest_s")   # % từ entry, âm
+        if ns is not None and ns < 0:
+            sl_dynamic = round(ns - 1.0, 1)          # 1% buffer dưới support
+            sl_pct     = max(sl_dynamic, SL_CONFIG[cluster])  # cap tại fixed SL
+            sl_dynamic_note = f"S/R-based (nearest_s={ns:+.1f}%)"
+        else:
+            sl_dynamic_note = "fallback to fixed (no valid S/R)"
+
     sl_price  = round(entry * (1 + sl_pct / 100), 1)
     tp_date   = (date.today() + timedelta(days=int(fwd * 1.4))).strftime("%d/%m/%Y")
 
@@ -1150,6 +1170,7 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
         "entry_price":   round(entry, 2),
         "sl_price":      sl_price,
         "sl_pct":        sl_pct,
+        "sl_dynamic_note": sl_dynamic_note,
         "tp_date":       tp_date,
         "fwd_days":      fwd,
         "regime_detail": regime_detail,
@@ -1226,35 +1247,38 @@ def _format_signal(sig: dict, vni_info: dict,
     if stats.get("n_cap"):
         sizing_score = sizing_score * 0.7
 
-    # S38: Apply vibe bonus/disagree vào sizing_score
-    # HARD engines: chỉ block/pass, không ảnh hưởng score
-    # BONUS engines: +20% khi đồng ý (+1), -20% khi phủ nhận (-1), neutral = không đổi
-    vibe_detail   = sig.get("vibe_detail", {})
-    bonus_signals = vibe_detail.get("bonus_signals", {})
-    score_adj     = 0.0
-    score_adj_parts = []
-    for engine, esignal in bonus_signals.items():
-        if esignal == 1:
-            score_adj += VIBE_AGREE_BONUS
-            score_adj_parts.append(f"{engine} ✅ +{int(VIBE_AGREE_BONUS*100)}%")
-        elif esignal == -1:
-            score_adj += VIBE_DISAGREE_BONUS
-            score_adj_parts.append(f"{engine} ❌ {int(VIBE_DISAGREE_BONUS*100)}%")
-    base_score   = sizing_score
-    sizing_score = round(sizing_score * (1 + score_adj), 2)
-    score_note   = f" | adj: {', '.join(score_adj_parts)}" if score_adj_parts else ""
-
     lines += [
         f"",
         f"*📊 Walk Forward OOS (2022→nay):*",
         f"  WR={stats.get('wr', '?')}% | Exp={stats.get('exp', 0):+.1f}% | "
         f"PF={pf_str} | WFE={wfe:.2f} | n={stats.get('n', '?')}",
-        f"  Score={sizing_score:.2f} (base={base_score:.2f}, median={MEDIAN_SCORE}){score_note}",
+        f"  Score={sizing_score:.1f} (median={MEDIAN_SCORE})",
         f"",
         f"*🎯 Trade Plan:*",
         f"  Entry: Close hôm nay ~{sig['entry_price']:,.0f}",
-        f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%) — Catastrophic stop",
     ]
+
+    # S38 Part 6: Dynamic SL display cho MR/MR2
+    cluster = sig["cluster"]
+    sl_note = sig.get("sl_dynamic_note", "")
+    fixed_sl = SL_CONFIG[cluster]
+    if cluster in ("Mean Reversion", "Mean Reversion 2") and sl_note:
+        if sig['sl_pct'] > fixed_sl:
+            # Dynamic SL chặt hơn fixed → dùng dynamic
+            lines.append(
+                f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%) "
+                f"— Dynamic [{sl_note}]"
+            )
+        else:
+            # Fallback về fixed (support quá xa)
+            lines.append(
+                f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%) "
+                f"— Catastrophic stop [{sl_note}]"
+            )
+    else:
+        lines.append(
+            f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%) — Catastrophic stop"
+        )
 
     # Trailing stop nếu có config cho mã này
     trail_cfg = TRAIL_CONFIG.get(sym)
@@ -1694,6 +1718,9 @@ def run_afternoon_update() -> list[str] | None:
 
 
 # ── Telegram command handler ──────────────────────────────────────────────────
+# Để register /size command trong bot.py, thêm:
+#   from cluster_scanner import size_cmd
+#   application.add_handler(CommandHandler("size", size_cmd))
 
 async def cluster_scan_cmd(update, context):
     """
@@ -1709,6 +1736,241 @@ async def cluster_scan_cmd(update, context):
             await asyncio.sleep(0.3)
     except Exception as e:
         await update.message.reply_text(f"❌ Scan lỗi: {str(e)[:200]}")
+
+
+async def size_cmd(update, context):
+    """
+    /size <symbol> <support_price> [resistance_price] [risk_pct]
+
+    Tính position sizing dựa trên support/resistance do trader nhập.
+    Logic: position = risk_amount / sl_distance_per_share
+           → max loss = risk_amount dù SL xa hay gần
+
+    Ví dụ:
+      /size NAB 14500              → SL only, risk 0.5/1.0/1.5/2.0%
+      /size NAB 14500 17000        → SL + TP, hiển thị R/R ratio
+      /size NAB 14500 17000 1.0    → SL + TP, chỉ hiển thị risk 1.0%
+    """
+    args = context.args if context.args else []
+
+    # ── Parse arguments ───────────────────────────────────────────────
+    if len(args) < 2:
+        await update.message.reply_text(
+            "📐 *Cách dùng:*\n"
+            "`/size <symbol> <support>`\n"
+            "`/size <symbol> <support> <resistance>`\n"
+            "`/size <symbol> <support> <resistance> <risk%>`\n\n"
+            "Ví dụ:\n"
+            "`/size NAB 14500`\n"
+            "`/size NAB 14500 17000`\n"
+            "`/size NAB 14500 17000 1.0`",
+            parse_mode="Markdown"
+        )
+        return
+
+    symbol      = args[0].upper().strip()
+    support_raw = args[1].replace(",", "").replace(".", "")
+
+    # Parse optional resistance và risk_pct
+    resistance_price = None
+    risk_filter      = None
+
+    if len(args) >= 3:
+        try:
+            val = float(args[2].replace(",", "").replace(".", ""))
+            # Phân biệt: nếu < 20 thì là risk_pct, ngược lại là resistance
+            if val < 20:
+                risk_filter = val
+            else:
+                resistance_price = val
+        except ValueError:
+            pass
+
+    if len(args) >= 4:
+        try:
+            risk_filter = float(args[3])
+        except ValueError:
+            pass
+
+    try:
+        support_price = float(support_raw)
+    except ValueError:
+        await update.message.reply_text(
+            f"❌ Giá support không hợp lệ: `{args[1]}`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # ── Lấy giá hiện tại ─────────────────────────────────────────────
+    await update.message.reply_text(f"⏳ Đang lấy giá {symbol}...")
+    try:
+        from vnstock.api.quote import Quote
+
+        entry_price = None
+        for src in ["VCI", "KBS"]:
+            try:
+                end_d   = date.today().strftime("%Y-%m-%d")
+                start_d = (date.today() - timedelta(days=10)).strftime("%Y-%m-%d")
+                df      = Quote(symbol=symbol, source=src).history(
+                    start=start_d, end=end_d, interval="1D"
+                )
+                if df is not None and len(df) > 0:
+                    df.columns  = [c.lower() for c in df.columns]
+                    close_col   = "close" if "close" in df.columns else df.columns[-2]
+                    raw_price   = float(df[close_col].iloc[-1])
+                    entry_price = raw_price / 1000 if raw_price > 5000 else raw_price
+                    break
+            except Exception:
+                continue
+
+        if entry_price is None or entry_price <= 0:
+            await update.message.reply_text(
+                f"❌ Không lấy được giá {symbol}."
+            )
+            return
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Lỗi lấy giá: {str(e)[:200]}")
+        return
+
+    # ── Normalize prices về cùng đơn vị (nghìn đồng) ─────────────────
+    entry_vnd = entry_price * 1000      # entry luôn là nghìn đồng → VND
+
+    # Support: nếu user nhập 14500 → 14500đ (VND), nếu nhập 14.5 → 14,500đ
+    if support_price < entry_vnd * 0.1:
+        # User nhập theo nghìn đồng (vd: 14.5 nghìn)
+        support_vnd = support_price * 1000
+    else:
+        support_vnd = support_price
+
+    # Resistance (nếu có)
+    resistance_vnd = None
+    if resistance_price is not None:
+        if resistance_price < entry_vnd * 0.1:
+            resistance_vnd = resistance_price * 1000
+        else:
+            resistance_vnd = resistance_price
+
+    # ── Validate ──────────────────────────────────────────────────────
+    if support_vnd <= 0 or support_vnd >= entry_vnd:
+        await update.message.reply_text(
+            f"❌ Support ({support_vnd:,.0f}đ) phải thấp hơn entry ({entry_vnd:,.0f}đ)."
+        )
+        return
+
+    if resistance_vnd is not None and resistance_vnd <= entry_vnd:
+        await update.message.reply_text(
+            f"❌ Resistance ({resistance_vnd:,.0f}đ) phải cao hơn entry ({entry_vnd:,.0f}đ)."
+        )
+        return
+
+    # ── Tính SL và TP distance ────────────────────────────────────────
+    sl_dist_vnd  = entry_vnd - support_vnd
+    sl_dist_pct  = sl_dist_vnd / entry_vnd * 100
+
+    tp_dist_vnd  = (resistance_vnd - entry_vnd) if resistance_vnd else None
+    tp_dist_pct  = (tp_dist_vnd / entry_vnd * 100) if tp_dist_vnd else None
+    rr_ratio     = (tp_dist_vnd / sl_dist_vnd) if tp_dist_vnd else None
+
+    if sl_dist_pct <= 0:
+        await update.message.reply_text("❌ SL distance = 0.")
+        return
+
+    # ── Build message ─────────────────────────────────────────────────
+    account           = ACCOUNT_SIZE
+    max_exposure_vnd  = account * MAX_EXPOSURE
+    risk_levels       = [0.5, 1.0, 1.5, 2.0] if risk_filter is None \
+                        else [risk_filter]
+
+    lines = [
+        f"📐 *Position Sizing — {symbol}*",
+        f"",
+        f"  Entry  : ~{entry_vnd:,.0f}đ",
+        f"  Support: {support_vnd:,.0f}đ  (SL -{sl_dist_pct:.1f}%, "
+        f"-{sl_dist_vnd:,.0f}đ/cổ)",
+    ]
+
+    if resistance_vnd and tp_dist_pct and rr_ratio:
+        # R/R verdict
+        if rr_ratio >= 2.0:
+            rr_verdict = "✅ Tốt"
+        elif rr_ratio >= 1.5:
+            rr_verdict = "~ Chấp nhận được"
+        else:
+            rr_verdict = "⚠️ Thấp — cân nhắc lại"
+
+        lines += [
+            f"  Resist.: {resistance_vnd:,.0f}đ  (TP +{tp_dist_pct:.1f}%, "
+            f"+{tp_dist_vnd:,.0f}đ/cổ)",
+            f"  R/R    : {rr_ratio:.2f}  {rr_verdict}",
+        ]
+
+    lines += [
+        f"",
+        f"  *Sizing (account={account/1e9:.0f}tỷ):*",
+        f"",
+    ]
+
+    for rp in risk_levels:
+        risk_amount = account * rp / 100
+        raw_qty     = risk_amount / sl_dist_vnd
+        qty         = max(100, int(raw_qty / 100) * 100)
+        value       = qty * entry_vnd
+        pct_nav     = value / account * 100
+        loss_actual = qty * sl_dist_vnd
+
+        capped = False
+        if value > max_exposure_vnd:
+            qty         = max(100, int(max_exposure_vnd / entry_vnd / 100) * 100)
+            value       = qty * entry_vnd
+            pct_nav     = value / account * 100
+            loss_actual = qty * sl_dist_vnd
+            capped      = True
+
+        cap_note = " ⚠️ capped" if capped else ""
+        lines.append(
+            f"  Risk {rp:.1f}% → *{qty:,} cổ* "
+            f"({value/1e6:.1f}tr, {pct_nav:.1f}% NAV){cap_note}"
+        )
+        lines.append(
+            f"    Lỗ nếu SL hit : {loss_actual/1e6:.2f}tr "
+            f"({loss_actual/account*100:.2f}% NAV)"
+        )
+
+        # Lãi nếu TP hit
+        if tp_dist_vnd:
+            profit = qty * tp_dist_vnd
+            lines.append(
+                f"    Lãi nếu TP hit: +{profit/1e6:.2f}tr "
+                f"(+{profit/account*100:.2f}% NAV)"
+            )
+        lines.append("")
+
+    lines += [
+        f"  Max/trade: {MAX_EXPOSURE*100:.0f}% NAV = {max_exposure_vnd/1e6:.0f}tr",
+        f"",
+        f"  _qty = risk ÷ (entry − support)_",
+        f"  _→ max loss = risk% × NAV dù SL xa hay gần_",
+    ]
+
+    # Note nếu symbol trong MR/MR2
+    all_syms = {
+        "Mean Reversion":   MR_SYMBOLS,
+        "Mean Reversion 2": MR2_SYMBOLS,
+        "Momentum":         MOM_SYMBOLS,
+        "Breakout":         BO_SYMBOLS,
+    }
+    for cl, syms in all_syms.items():
+        if symbol in syms and cl in ("Mean Reversion", "Mean Reversion 2"):
+            lines += [
+                f"",
+                f"  ℹ️ {symbol} ∈ *{cl}* — dynamic SL đang active",
+            ]
+            break
+
+    await update.message.reply_text(
+        "\n".join(lines)[:4000], parse_mode="Markdown"
+    )
 
 
 # ── Cron loops ────────────────────────────────────────────────────────────────
