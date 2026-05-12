@@ -41,32 +41,6 @@ import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
-# ── Hermes notify helper ───────────────────────────────────────────────────────
-
-def _notify_hermes(signal_text: str) -> None:
-    """
-    Gọi POST /notify trên Hermes để Hermes phân tích signal ngay lập tức.
-    Chạy trong thread riêng — không block cron nếu Hermes offline.
-    """
-    import requests as _req
-    hermes_url = os.environ.get(
-        "HERMES_NOTIFY_URL",
-        "https://hermes-telegram-bot-hnl.onrender.com/notify"
-    )
-    secret = os.environ.get("NOTIFY_SECRET", "")
-    try:
-        payload = {"signal": signal_text}
-        if secret:
-            payload["secret"] = secret
-        resp = _req.post(hermes_url, json=payload, timeout=10)
-        if resp.status_code == 200:
-            logger.info(f"[HermesNotify] OK — {len(signal_text)} ký tự pushed")
-        else:
-            logger.warning(f"[HermesNotify] HTTP {resp.status_code}: {resp.text[:100]}")
-    except Exception as e:
-        logger.warning(f"[HermesNotify] Lỗi (non-critical): {e}")
-
-
 
 # ── Watchlist & Config ────────────────────────────────────────────────────────
 MR_SYMBOLS  = [
@@ -1751,7 +1725,6 @@ def run_afternoon_update() -> list[str] | None:
 async def cluster_scan_cmd(update, context):
     """
     /cluster_scan — chạy manual scan ngay lập tức.
-    Sau khi gửi kết quả → push sang Hermes để phân tích tự động.
     """
     await update.message.reply_text("🔍 Đang scan cluster signals...")
     try:
@@ -1761,10 +1734,6 @@ async def cluster_scan_cmd(update, context):
                 m, parse_mode="Markdown"
             )
             await asyncio.sleep(0.3)
-        # Push sang Hermes để phân tích ngay — không chờ kết quả
-        full_signal = "\n\n".join(messages)
-        if full_signal.strip():
-            await asyncio.to_thread(_notify_hermes, full_signal)
     except Exception as e:
         await update.message.reply_text(f"❌ Scan lỗi: {str(e)[:200]}")
 
@@ -2018,20 +1987,7 @@ async def _start_cluster_scan_cron(bot, chat_ids: list[int]):
     Khởi động cả 2 cron tasks:
       - Morning scan: 08:30 VN (01:30 UTC)
       - Afternoon update: 12:30 VN (05:30 UTC)
-
-    Nếu GROUP_CHAT_ID được set trong env, thêm vào chat_ids để
-    signal được gửi đồng thời vào Telegram Group (cho Hermes đọc).
     """
-    # Đọc GROUP_CHAT_ID từ env — nếu có thì thêm vào danh sách nhận signal
-    _group_id_raw = os.environ.get("GROUP_CHAT_ID", "").strip()
-    if _group_id_raw.lstrip("-").isdigit():
-        _group_id = int(_group_id_raw)
-        if _group_id not in chat_ids:
-            chat_ids = list(chat_ids) + [_group_id]
-            logger.info(f"[ClusterCron] GROUP_CHAT_ID={_group_id} added to recipients")
-    else:
-        logger.info("[ClusterCron] GROUP_CHAT_ID not set — skipping group broadcast")
-
     asyncio.create_task(_morning_cron(bot, chat_ids))
     asyncio.create_task(_afternoon_cron(bot, chat_ids))
     logger.info(f"[ClusterCron] Started: morning=08:30 VN, afternoon=12:30 VN | "
@@ -2062,7 +2018,6 @@ async def _morning_cron(bot, chat_ids: list[int]):
         logger.info("[MorningCron] Running morning scan...")
         try:
             messages, _ = await asyncio.to_thread(run_morning_scan)
-            logger.info(f"[MorningCron] Gửi {len(messages)} message(s) tới {len(chat_ids)} chat_id(s): {chat_ids}")
             for cid in chat_ids:
                 for m in messages:
                     try:
@@ -2073,13 +2028,6 @@ async def _morning_cron(bot, chat_ids: list[int]):
                         await asyncio.sleep(0.3)
                     except Exception as se:
                         logger.warning(f"[MorningCron] send {cid}: {se}")
-
-            # Sau khi gửi xong → push toàn bộ nội dung sang Hermes để phân tích
-            # Gộp tất cả messages thành 1 nội dung để Hermes có context đầy đủ
-            full_signal = "\n\n".join(messages)
-            if full_signal.strip():
-                await asyncio.to_thread(_notify_hermes, full_signal)
-
         except Exception as e:
             import traceback
             logger.error(f"[MorningCron] ERROR: {e}\n{traceback.format_exc()}")
@@ -2118,7 +2066,6 @@ async def _afternoon_cron(bot, chat_ids: list[int]):
             if messages is None:
                 logger.info("[AfternoonCron] No updates — skip send")
                 continue
-            logger.info(f"[AfternoonCron] Gửi {len(messages)} message(s) tới {len(chat_ids)} chat_id(s): {chat_ids}")
             for cid in chat_ids:
                 for m in messages:
                     try:
