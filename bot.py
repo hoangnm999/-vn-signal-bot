@@ -156,6 +156,30 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 # ── Message split helper ──────────────────────────────────────────────────────
 TELEGRAM_MAX = 4096
 
+# ── Hermes notify helper ───────────────────────────────────────────────────────
+
+def _notify_hermes_bg(text: str) -> None:
+    """
+    Push kết quả từ bất kỳ lệnh nào sang Hermes /notify để phân tích tự động.
+    Chạy trong thread riêng — không block event loop, không crash nếu Hermes offline.
+    """
+    import requests as _req
+    hermes_url = os.environ.get(
+        "HERMES_NOTIFY_URL",
+        "https://hermes-telegram-bot-hnl.onrender.com/notify"
+    )
+    secret = os.environ.get("NOTIFY_SECRET", "")
+    try:
+        payload = {"signal": text[:8000]}   # cap 8000 ký tự
+        if secret:
+            payload["secret"] = secret
+        resp = _req.post(hermes_url, json=payload, timeout=8)
+        logger.info(f"[HermesNotify] {resp.status_code} — {len(text)} ký tự pushed")
+    except Exception as e:
+        logger.debug(f"[HermesNotify] Lỗi (non-critical): {e}")
+
+
+
 def _smart_split(text: str) -> list:
     """Tách text tại điểm tự nhiên, mỗi part <= TELEGRAM_MAX."""
     if len(text) <= TELEGRAM_MAX:
@@ -179,7 +203,7 @@ def _smart_split(text: str) -> list:
 async def _split_and_send(message, text: str):
     """
     Gửi text dài qua Telegram, tự động tách nếu > 4096 ký tự.
-    Phần đầu dùng reply_text, các phần sau reply tiếp để tạo thread.
+    Sau khi gửi → push sang Hermes để phân tích tự động.
     """
     parts = _smart_split(plain(text))
     sent = None
@@ -187,8 +211,10 @@ async def _split_and_send(message, text: str):
         if i == 0:
             sent = await message.reply_text(part)
         else:
-            # Reply vào message gốc (không phải part trước) để giữ context
             sent = await message.reply_text(part)
+    # Push toàn bộ nội dung sang Hermes (không chờ)
+    import threading as _th
+    _th.Thread(target=_notify_hermes_bg, args=(plain(text),), daemon=True).start()
     return sent
 
 
@@ -197,6 +223,7 @@ async def _edit_or_split(msg, message, text: str):
     Với message đã gửi trước (loading indicator):
       - Nếu chỉ 1 part: edit message cũ (trải nghiệm tốt hơn)
       - Nếu nhiều parts: delete/edit part1 + send phần còn lại
+    Sau khi gửi → push sang Hermes để phân tích tự động.
     """
     parts = _smart_split(plain(text))
     if len(parts) == 1:
@@ -205,14 +232,15 @@ async def _edit_or_split(msg, message, text: str):
         except Exception:
             await message.reply_text(parts[0])
     else:
-        # Edit message loading thành part 1
         try:
             await msg.edit_text(parts[0])
         except Exception:
             await message.reply_text(parts[0])
-        # Gửi các phần còn lại
         for part in parts[1:]:
             await message.reply_text(part)
+    # Push toàn bộ nội dung sang Hermes (không chờ)
+    import threading as _th
+    _th.Thread(target=_notify_hermes_bg, args=(plain(text),), daemon=True).start()
 
 # ── Authorization ─────────────────────────────────────────────────────────────
 def _allowed_ids() -> set:
