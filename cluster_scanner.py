@@ -41,6 +41,32 @@ import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+# ── Hermes notify helper ───────────────────────────────────────────────────────
+
+def _notify_hermes(signal_text: str) -> None:
+    """
+    Gọi POST /notify trên Hermes để Hermes phân tích signal ngay lập tức.
+    Chạy trong thread riêng — không block cron nếu Hermes offline.
+    """
+    import requests as _req
+    hermes_url = os.environ.get(
+        "HERMES_NOTIFY_URL",
+        "https://hermes-telegram-bot-hnl.onrender.com/notify"
+    )
+    secret = os.environ.get("NOTIFY_SECRET", "")
+    try:
+        payload = {"signal": signal_text}
+        if secret:
+            payload["secret"] = secret
+        resp = _req.post(hermes_url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            logger.info(f"[HermesNotify] OK — {len(signal_text)} ký tự pushed")
+        else:
+            logger.warning(f"[HermesNotify] HTTP {resp.status_code}: {resp.text[:100]}")
+    except Exception as e:
+        logger.warning(f"[HermesNotify] Lỗi (non-critical): {e}")
+
+
 
 # ── Watchlist & Config ────────────────────────────────────────────────────────
 MR_SYMBOLS  = [
@@ -2042,6 +2068,13 @@ async def _morning_cron(bot, chat_ids: list[int]):
                         await asyncio.sleep(0.3)
                     except Exception as se:
                         logger.warning(f"[MorningCron] send {cid}: {se}")
+
+            # Sau khi gửi xong → push toàn bộ nội dung sang Hermes để phân tích
+            # Gộp tất cả messages thành 1 nội dung để Hermes có context đầy đủ
+            full_signal = "\n\n".join(messages)
+            if full_signal.strip():
+                await asyncio.to_thread(_notify_hermes, full_signal)
+
         except Exception as e:
             import traceback
             logger.error(f"[MorningCron] ERROR: {e}\n{traceback.format_exc()}")
