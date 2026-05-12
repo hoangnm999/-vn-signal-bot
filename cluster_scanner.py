@@ -1281,15 +1281,13 @@ def _format_signal(sig: dict, vni_info: dict,
     sl_note  = sig.get("sl_dynamic_note", "")
     fixed_sl = SL_CONFIG[cluster]
     if cluster in ("Mean Reversion", "Mean Reversion 2") and sl_note:
-        ns_val = ind.get("nearest_s", 0)
+        ns_val = sig.get("ind", {}).get("nearest_s", 0)
         if sig['sl_pct'] > fixed_sl:
-            # Dynamic SL chặt hơn fixed → tốt, dùng S/R
             lines.append(
                 f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%)"
                 f" — S/R dynamic (20d low {ns_val:+.1f}%)"
             )
         else:
-            # nearest_s quá xa → fallback về catastrophic stop
             lines.append(
                 f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%)"
                 f" — Catastrophic stop (S/R={ns_val:+.1f}%, quá xa)"
