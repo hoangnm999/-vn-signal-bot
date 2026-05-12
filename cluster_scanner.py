@@ -700,8 +700,11 @@ def _compute_indicators(df: pd.DataFrame) -> dict | None:
         "consolidation": _consol_val(close, i),
         "vol_dry_up":    float((vs20v / (vsma60_v + 1e-9)) - 1.0),
         # S38 Part 6: S/R levels cho dynamic position sizing (MR/MR2)
-        "nearest_s":     float(round((min(close[max(0,i-20):i+1]) / (px+1e-9) - 1.0)*100, 2)),
-        "nearest_r":     float(round((max(close[max(0,i-20):i+1]) / (px+1e-9) - 1.0)*100, 2)),
+        # Nhìn về QUÁ KHỨ — exclude ngày hiện tại (close[max(0,i-20):i])
+        "nearest_s":     float(round((min(close[max(0,i-20):i]) / (px+1e-9) - 1.0)*100, 2))
+                         if i > 5 else -13.5,
+        "nearest_r":     float(round((max(close[max(0,i-20):i]) / (px+1e-9) - 1.0)*100, 2))
+                         if i > 5 else 13.5,
     }
 
 
@@ -1225,6 +1228,21 @@ def _format_signal(sig: dict, vni_info: dict,
         f"*Triggers:* {sig['trigger_str']}",
     ]
 
+    # ── Signal history (số lần xuất hiện trong 20d) ───────────────────
+    hist = sig.get("signal_history")
+    if hist and hist.get("count", 0) > 1:
+        first_date  = hist.get("first_date", "")
+        first_price = hist.get("first_price", 0)
+        cur_price   = sig["entry_price"]
+        pct_chg     = ((cur_price - first_price) / first_price * 100
+                       if first_price > 0 else 0)
+        chase_warn  = " ⚠️ ĐUỔI GIÁ" if pct_chg > 5 else ""
+        lines.append(
+            f"📍 Signal #{hist['count']}/20d | "
+            f"Lần đầu: {first_date} ~{first_price:,.0f} "
+            f"({pct_chg:+.1f}% vs nay){chase_warn}"
+        )
+
     # Partial pass warning
     if sig.get("partial_note"):
         lines.append(f"*Lưu ý:* {sig['partial_note']}")
@@ -1259,21 +1277,22 @@ def _format_signal(sig: dict, vni_info: dict,
     ]
 
     # S38 Part 6: Dynamic SL display cho MR/MR2
-    cluster = sig["cluster"]
-    sl_note = sig.get("sl_dynamic_note", "")
+    cluster  = sig["cluster"]
+    sl_note  = sig.get("sl_dynamic_note", "")
     fixed_sl = SL_CONFIG[cluster]
     if cluster in ("Mean Reversion", "Mean Reversion 2") and sl_note:
+        ns_val = ind.get("nearest_s", 0)
         if sig['sl_pct'] > fixed_sl:
-            # Dynamic SL chặt hơn fixed → dùng dynamic
+            # Dynamic SL chặt hơn fixed → tốt, dùng S/R
             lines.append(
-                f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%) "
-                f"— Dynamic [{sl_note}]"
+                f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%)"
+                f" — S/R dynamic (20d low {ns_val:+.1f}%)"
             )
         else:
-            # Fallback về fixed (support quá xa)
+            # nearest_s quá xa → fallback về catastrophic stop
             lines.append(
-                f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%) "
-                f"— Catastrophic stop [{sl_note}]"
+                f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%)"
+                f" — Catastrophic stop (S/R={ns_val:+.1f}%, quá xa)"
             )
     else:
         lines.append(
@@ -1499,6 +1518,39 @@ def _format_afternoon_update(
 # ── Main scan functions ───────────────────────────────────────────────────────
 
 
+def _get_signal_history(symbol: str, cluster: str, entry_price: float) -> dict:
+    """
+    Lấy lịch sử signal của symbol trong 20 ngày qua từ cluster_journal.
+    Returns dict: {count, first_date, first_price} hoặc {} nếu không có.
+    """
+    try:
+        from db import journal_get_active
+        active = journal_get_active()
+        # Lọc cùng symbol + cluster, trong 20 ngày qua
+        from datetime import date as _date
+        cutoff = _date.today() - timedelta(days=20)
+        hist = [
+            r for r in active
+            if r.get("symbol") == symbol
+            and r.get("cluster") == cluster
+            and r.get("entry_date", _date.today()) >= cutoff
+        ]
+        if len(hist) <= 1:
+            return {}
+        # Sắp xếp theo ngày
+        hist_sorted = sorted(hist, key=lambda x: x.get("entry_date", _date.today()))
+        first       = hist_sorted[0]
+        return {
+            "count":       len(hist),
+            "first_date":  first["entry_date"].strftime("%d/%m/%Y")
+                           if hasattr(first.get("entry_date"), "strftime")
+                           else str(first.get("entry_date", "")),
+            "first_price": float(first.get("entry_price", entry_price)),
+        }
+    except Exception:
+        return {}
+
+
 # ── Journal auto-logging (S31) ────────────────────────────────────────────────
 
 def _journal_log_signals(signals: list, vni_info: dict) -> None:
@@ -1617,6 +1669,12 @@ def run_morning_scan() -> tuple[list[str], dict]:
 
     # Ghi vao cluster_journal (S31)
     _journal_log_signals(mr_signals + mr2_signals + mom_signals + bo_signals, vni_info)
+
+    # Inject signal_history vào mỗi signal (số lần xuất hiện trong 20d)
+    for sig in mr_signals + mr2_signals + mom_signals + bo_signals:
+        sig["signal_history"] = _get_signal_history(
+            sig["symbol"], sig["cluster"], sig["entry_price"]
+        )
 
     total = len(mr_signals) + len(mr2_signals) + len(mom_signals) + len(bo_signals)
     elapsed = round(_time.time() - t_start, 1)
