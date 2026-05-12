@@ -673,21 +673,18 @@ def _compute_indicators(df: pd.DataFrame) -> dict | None:
         mid    = c_arr[idx]
         return float(np.sum(np.abs(window - mid) / (mid + 1e-9) < 0.03)) / len(window)
 
-    return {
+    ind = {
         "close":          px,
         "price_vs_sma50": float((px - s50) / (px + 1e-9) * 100),
         "price_vs_sma20": float((px - s20) / (px + 1e-9) * 100),
         "ema_cross":      float((ema12[i] - ema26[i]) / (px + 1e-9) * 100),
         "momentum_5d":    float((px / (c5 + 1e-9) - 1.0) * 100),
-        # S37 S4: momentum_3d đã xóa — MOM_GUARD_3D experiment chưa validated (S36)
-        #         Nếu cần, sẽ thêm lại sau khi có đủ _compute_thresholds + backtest
         "volume_spike":   float((vol[i] / (vs20v + 1e-9)) - 1.0),
         "stoch_k":        float(stoch[i]),
-        # S37 MR2: smooth stoch (SMA3) — nhất quán với _compute_thresholds
         "stoch_k_smooth": float(stoch_smooth[i]) if np.isfinite(stoch_smooth[i]) else float(stoch[i]),
         "candle_body":    float(np.clip(abs(px - opn[i]) / (atr_v + 1e-9), 0, 3)),
         "atr_ratio":      float(atr_v / (px + 1e-9) * 100),
-        "atr":            float(atr_v),   # FIX S37 C4: ATR tuyệt đối (VND) — dùng cho trailing stop
+        "atr":            float(atr_v),
         "sma20":          float(s20),
         "sma50":          float(s50),
         "ema12":          float(ema12[i]),
@@ -695,17 +692,124 @@ def _compute_indicators(df: pd.DataFrame) -> dict | None:
         "last_date":      str(df["date"].iloc[i])[:10],
         "volume":         float(vol[i]),
         "vol_sma20":      float(vs20v),
-        # Breakout cluster indicators
         "bb_squeeze":    bb_width,
         "consolidation": _consol_val(close, i),
         "vol_dry_up":    float((vs20v / (vsma60_v + 1e-9)) - 1.0),
-        # S38 Part 6: S/R levels cho dynamic position sizing (MR/MR2)
-        # Nhìn về QUÁ KHỨ — exclude ngày hiện tại (close[max(0,i-20):i])
-        "nearest_s":     float(round((min(close[max(0,i-20):i]) / (px+1e-9) - 1.0)*100, 2))
-                         if i > 5 else -13.5,
-        "nearest_r":     float(round((max(close[max(0,i-20):i]) / (px+1e-9) - 1.0)*100, 2))
-                         if i > 5 else 13.5,
     }
+
+    # ── S38 Part 6: Support/Resistance calculation ────────────────────
+    # Fallback chain:
+    #   1. Volume Profile (High Volume Node dưới entry)
+    #   2. Swing Low (2-bar confirmation)
+    #   3. SMA200
+    #   4. Fixed -13.5%
+
+    # Window: exclude 5 ngày gần nhất để tránh vùng oversold hiện tại
+    _LOOKBACK  = 120
+    _EXCL_TAIL = 5
+    _win_start = max(0, i - _LOOKBACK)
+    _win_end   = max(0, i - _EXCL_TAIL)   # exclusive
+
+    def _vol_profile_support(px_entry):
+        """Cách 1: Tìm High Volume Node gần nhất dưới entry."""
+        if _win_end <= _win_start + 10:
+            return None
+        _lo  = low[_win_start:_win_end]
+        _hi  = high[_win_start:_win_end]
+        _v   = vol[_win_start:_win_end]
+        _typ = (_lo + _hi) / 2.0   # typical price per bar
+
+        price_lo = _typ.min(); price_hi = _typ.max()
+        if price_hi <= price_lo:
+            return None
+
+        N_BINS = 25
+        bin_edges   = np.linspace(price_lo, price_hi, N_BINS + 1)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+        vol_by_bin  = np.zeros(N_BINS)
+        for _p, _vv in zip(_typ, _v):
+            _b = min(int((_p - price_lo) / (price_hi - price_lo) * N_BINS), N_BINS - 1)
+            vol_by_bin[_b] += _vv
+
+        nonzero = vol_by_bin[vol_by_bin > 0]
+        if len(nonzero) == 0:
+            return None
+        median_v  = np.median(nonzero)
+        hvn_mask  = vol_by_bin > 1.5 * median_v
+
+        # HVN nodes dưới entry (ít nhất 1% dưới để có ý nghĩa)
+        candidates = [
+            (bin_centers[k] / px_entry - 1.0) * 100
+            for k in range(N_BINS)
+            if hvn_mask[k] and bin_centers[k] < px_entry * 0.99
+        ]
+        return max(candidates) if candidates else None
+
+    def _swing_low_support(px_entry):
+        """Cách 2: Swing low gần nhất dưới entry (2-bar confirmation)."""
+        if _win_end <= _win_start + 4:
+            return None
+        _lo = low[_win_start:_win_end]
+        swings = []
+        for _j in range(2, len(_lo) - 2):
+            if (_lo[_j] < _lo[_j-1] and _lo[_j] < _lo[_j-2]
+                    and _lo[_j] < _lo[_j+1] and _lo[_j] < _lo[_j+2]):
+                pct = (_lo[_j] / px_entry - 1.0) * 100
+                if pct < -1.0:   # phải thực sự dưới entry
+                    swings.append(pct)
+        return max(swings) if swings else None
+
+    def _sma200_support(px_entry):
+        """Cách 3: SMA200 nếu nằm dưới entry."""
+        if i < 199:
+            return None
+        _s200 = float(np.mean(close[i-199:i+1]))
+        pct   = (_s200 / px_entry - 1.0) * 100
+        return pct if pct < -1.0 else None
+
+    # Chạy fallback chain
+    _ns = (_vol_profile_support(px)
+           or _swing_low_support(px)
+           or _sma200_support(px)
+           or -13.5)
+
+    # nearest_r: HVN trên entry (resistance)
+    def _vol_profile_resist(px_entry):
+        if _win_end <= _win_start + 10:
+            return None
+        _lo  = low[_win_start:_win_end]
+        _hi  = high[_win_start:_win_end]
+        _v   = vol[_win_start:_win_end]
+        _typ = (_lo + _hi) / 2.0
+        price_lo = _typ.min(); price_hi = _typ.max()
+        if price_hi <= price_lo: return None
+        N_BINS = 25
+        bin_edges   = np.linspace(price_lo, price_hi, N_BINS + 1)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+        vol_by_bin  = np.zeros(N_BINS)
+        for _p, _vv in zip(_typ, _v):
+            _b = min(int((_p - price_lo) / (price_hi - price_lo) * N_BINS), N_BINS - 1)
+            vol_by_bin[_b] += _vv
+        nonzero = vol_by_bin[vol_by_bin > 0]
+        if len(nonzero) == 0: return None
+        hvn_mask = vol_by_bin > 1.5 * np.median(nonzero)
+        candidates = [
+            (bin_centers[k] / px_entry - 1.0) * 100
+            for k in range(N_BINS)
+            if hvn_mask[k] and bin_centers[k] > px_entry * 1.01
+        ]
+        return min(candidates) if candidates else None
+
+    _nr = _vol_profile_resist(px) or 13.5
+
+    ind["nearest_s"]      = float(round(_ns, 2))
+    ind["nearest_r"]      = float(round(_nr, 2))
+    ind["support_method"] = ("vol_profile" if _vol_profile_support(px) is not None
+                             else "swing_low" if _swing_low_support(px) is not None
+                             else "sma200"    if _sma200_support(px) is not None
+                             else "fixed")
+
+    return ind
 
 
 def _compute_thresholds_from_training(df: pd.DataFrame,
@@ -1120,18 +1224,18 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
     entry     = ind["close"]
     sl_pct    = SL_CONFIG[cluster]
 
-    # S38 Part 6: Dynamic SL cho MR/MR2 — đặt tại nearest_s - 1% buffer
-    # position size = risk_budget / sl_dist → tự động adjust theo market structure
-    # Cap tại fixed SL để tránh worst case quá lớn
+    # S38 Part 6: Dynamic SL cho MR/MR2 dựa trên Volume Profile support
+    # nearest_s từ vol_profile/swing_low/sma200 — không phải rolling min
     sl_dynamic_note = ""
     if cluster in ("Mean Reversion", "Mean Reversion 2"):
-        ns = ind.get("nearest_s")   # % từ entry, âm
-        if ns is not None and ns < 0:
-            sl_dynamic = round(ns - 1.0, 1)          # 1% buffer dưới support
-            sl_pct     = max(sl_dynamic, SL_CONFIG[cluster])  # cap tại fixed SL
-            sl_dynamic_note = f"S/R-based (nearest_s={ns:+.1f}%)"
+        ns     = ind.get("nearest_s", -13.5)
+        method = ind.get("support_method", "fixed")
+        if ns < -3.0:   # chỉ dùng dynamic nếu support có ý nghĩa (> 3% dưới entry)
+            sl_dynamic = round(ns - 1.0, 1)                    # 1% buffer dưới support
+            sl_pct     = max(sl_dynamic, SL_CONFIG[cluster])   # cap tại fixed SL
+            sl_dynamic_note = f"{method} (support={ns:+.1f}%)"
         else:
-            sl_dynamic_note = "fallback to fixed (no valid S/R)"
+            sl_dynamic_note = f"fallback fixed ({method}={ns:+.1f}%)"
 
     sl_price  = round(entry * (1 + sl_pct / 100), 1)
     tp_date   = (date.today() + timedelta(days=int(fwd * 1.4))).strftime("%d/%m/%Y")
@@ -1276,22 +1380,16 @@ def _format_signal(sig: dict, vni_info: dict,
         f"  Entry: Close hôm nay ~{sig['entry_price']:,.0f}",
     ]
 
-    # S38 Part 6: Dynamic SL display cho MR/MR2
-    cluster  = sig["cluster"]
-    sl_note  = sig.get("sl_dynamic_note", "")
-    fixed_sl = SL_CONFIG[cluster]
-    if cluster in ("Mean Reversion", "Mean Reversion 2") and sl_note:
-        ns_val = sig.get("ind", {}).get("nearest_s", 0)
-        if sig['sl_pct'] > fixed_sl:
-            lines.append(
-                f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%)"
-                f" — S/R dynamic (20d low {ns_val:+.1f}%)"
-            )
-        else:
-            lines.append(
-                f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%)"
-                f" — Catastrophic stop (S/R={ns_val:+.1f}%, quá xa)"
-            )
+    # SL display
+    _cluster  = sig["cluster"]
+    _sl_note  = sig.get("sl_dynamic_note", "")
+    _fixed_sl = SL_CONFIG[_cluster]
+    if _cluster in ("Mean Reversion", "Mean Reversion 2") and _sl_note and "fallback" not in _sl_note:
+        # Dynamic SL tìm được support có ý nghĩa
+        lines.append(
+            f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%)"
+            f" — Dynamic [{_sl_note}]"
+        )
     else:
         lines.append(
             f"  SL: {sig['sl_price']:,.0f} ({sig['sl_pct']:+.1f}%) — Catastrophic stop"
