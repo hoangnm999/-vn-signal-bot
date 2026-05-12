@@ -557,30 +557,44 @@ _morning_signals: dict = {}   # symbol → signal_info (từ 8:30 scan)
 # ── Position sizing helper ───────────────────────────────────────────────────
 
 def _calc_position_size(entry_price: float, sl_pct: float,
-                        sizing_score: float) -> dict:
+                        sizing_score: float,
+                        nearest_s: float | None = None) -> dict:
     """
-    Continuous position sizing — tỷ lệ trực tiếp với Score (log scale).
+    Risk-based position sizing — S38 Part 6 ADOPT (tất cả 4 clusters).
 
-    Formula:
-        risk_pct = BASE_RISK_PCT × log(1 + score) / log(1 + MEDIAN_SCORE)
-        Clamped: [MIN_RISK_PCT, MAX_RISK_PCT]
+    Core formula (institutional approach):
+        qty = risk_amount / sl_dist_per_share
+        → max loss = risk_amount = constant dù SL xa hay gần
 
-    Dùng log scale để tránh outlier score (SSI=329) chiếm quá nhiều size.
-    Mã có Score = MEDIAN (8.4) → risk = BASE_RISK_PCT (1%)
-    Mã có Score > median       → risk tăng dần, max 2x
-    Mã có Score < median       → risk giảm dần, min 0.4x
+    sl_dist cho sizing: dùng nearest_s (vol profile support) nếu có
+    sl_dist cho exit:   dùng sl_pct (fixed per cluster) — không thay đổi
+
+    Sizing score vẫn drive risk_pct (log scale):
+        risk_pct = BASE × log(1+score) / log(1+MEDIAN)  ∈ [MIN, MAX]
     """
     import math
 
-    # Log-scaled risk
-    score       = max(sizing_score, 0.1)   # tránh log(0)
-    log_score   = math.log(1 + score)
-    log_median  = math.log(1 + MEDIAN_SCORE)
-    raw_risk    = BASE_RISK_PCT * (log_score / log_median)
-    risk_pct    = round(max(MIN_RISK_PCT, min(MAX_RISK_PCT, raw_risk)), 2)
-
+    # ── Risk % từ sizing score (log scale) ───────────────────────────
+    score      = max(sizing_score, 0.1)
+    log_score  = math.log(1 + score)
+    log_median = math.log(1 + MEDIAN_SCORE)
+    raw_risk   = BASE_RISK_PCT * (log_score / log_median)
+    risk_pct   = round(max(MIN_RISK_PCT, min(MAX_RISK_PCT, raw_risk)), 2)
     risk_amount = ACCOUNT_SIZE * risk_pct / 100
-    sl_value    = entry_price * abs(sl_pct) / 100
+
+    # ── SL distance cho sizing (vol profile nearest_s) ────────────────
+    # Dùng nearest_s nếu có ý nghĩa (< -1.5%), fallback về sl_pct
+    if nearest_s is not None and nearest_s < -1.5:
+        # Sizing SL = nearest_s - 1% buffer (như Part 6)
+        sizing_sl_pct = nearest_s - 1.0
+        # Cap tại fixed SL (không để sizing SL xa hơn fixed)
+        sizing_sl_pct = max(sizing_sl_pct, sl_pct)
+        sizing_note   = "vol_profile"
+    else:
+        sizing_sl_pct = sl_pct
+        sizing_note   = "fixed"
+
+    sl_value = entry_price * abs(sizing_sl_pct) / 100
     if sl_value <= 0:
         return {}
 
@@ -596,7 +610,10 @@ def _calc_position_size(entry_price: float, sl_pct: float,
         value    = qty * entry_price
         exposure = value / ACCOUNT_SIZE * 100
 
-    # Label để hiển thị
+    # Max loss thực tế (dùng sl_pct fixed, không phải sizing_sl)
+    actual_loss = qty * entry_price * abs(sl_pct) / 100
+
+    # Label
     if risk_pct >= BASE_RISK_PCT * 1.5:
         size_label = "⬆️ TĂNG SIZE"
     elif risk_pct >= BASE_RISK_PCT * 0.8:
@@ -605,12 +622,15 @@ def _calc_position_size(entry_price: float, sl_pct: float,
         size_label = "⬇️ GIẢM SIZE"
 
     return {
-        "qty":         qty,
-        "value":       value,
-        "risk_amount": round(risk_amount),
-        "risk_pct":    risk_pct,
-        "size_label":  size_label,
-        "exposure":    round(exposure, 1),
+        "qty":          qty,
+        "value":        value,
+        "risk_amount":  round(risk_amount),
+        "risk_pct":     risk_pct,
+        "size_label":   size_label,
+        "exposure":     round(exposure, 1),
+        "actual_loss":  round(actual_loss),
+        "sizing_note":  sizing_note,
+        "sizing_sl_pct": round(sizing_sl_pct, 1),
     }
 
 
@@ -1412,18 +1432,28 @@ def _format_signal(sig: dict, vni_info: dict,
     else:
         lines.append(f"  Exit: Time Stop T+{fwd}d (~{sig['tp_date']})")
 
-    # Position sizing cụ thể
-    ps = _calc_position_size(sig["entry_price"], sig["sl_pct"], sizing_score)
+    # Position sizing — S38 Part 6: risk-based với vol profile nearest_s
+    _ns_for_sizing = sig.get("ind", {}).get("nearest_s")
+    ps = _calc_position_size(sig["entry_price"], sig["sl_pct"],
+                             sizing_score, nearest_s=_ns_for_sizing)
     if ps:
+        # Hiển thị sizing basis nếu dùng vol profile
+        _sizing_basis = ""
+        if ps.get("sizing_note") == "vol_profile":
+            _sizing_basis = f" _(sizing via S/R {ps['sizing_sl_pct']:+.1f}%)_"
+
+        # actual_loss = max loss nếu SL bị hit (dùng fixed sl_pct)
+        _actual_loss = ps.get("actual_loss", ps["risk_amount"])
+
         lines += [
             f"",
             f"*💰 Position Sizing ({ACCOUNT_SIZE/1e6:.0f}M account):*",
             f"  {ps['size_label']} — risk {ps['risk_pct']}% "
-            f"= {ps['risk_amount']/1e6:.1f}M",
+            f"= {ps['risk_amount']/1e6:.1f}M{_sizing_basis}",
             f"  → Mua: {ps['qty']:,} cổ (~{ps['value']/1e6:.1f}M, "
             f"chiếm {ps['exposure']}% vốn)",
             f"  → Max loss nếu chạm SL: "
-            f"~{ps['risk_amount']/1e6:.1f}M ({ps['risk_pct']}% account)",
+            f"~{_actual_loss/1e6:.1f}M ({_actual_loss/ACCOUNT_SIZE*100:.2f}% account)",
         ]
     else:
         lines.append(f"  Size: Risk {BASE_RISK_PCT}% account")
