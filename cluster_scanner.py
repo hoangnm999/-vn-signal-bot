@@ -2031,6 +2031,7 @@ async def _morning_cron(bot, chat_ids: list[int]):
         logger.info("[MorningCron] Running morning scan...")
         try:
             messages, _ = await asyncio.to_thread(run_morning_scan)
+            logger.info(f"[MorningCron] Gửi {len(messages)} message(s) tới {len(chat_ids)} chat_id(s): {chat_ids}")
             for cid in chat_ids:
                 for m in messages:
                     try:
@@ -2079,6 +2080,7 @@ async def _afternoon_cron(bot, chat_ids: list[int]):
             if messages is None:
                 logger.info("[AfternoonCron] No updates — skip send")
                 continue
+            logger.info(f"[AfternoonCron] Gửi {len(messages)} message(s) tới {len(chat_ids)} chat_id(s): {chat_ids}")
             for cid in chat_ids:
                 for m in messages:
                     try:
