@@ -23,6 +23,31 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# ── Hermes notify helper ───────────────────────────────────────────────────────
+
+def _notify_hermes_bg(text: str) -> None:
+    """
+    Push kết quả sang Hermes /notify để phân tích tự động trong group.
+    Chạy trong thread riêng — không block, không crash nếu Hermes offline.
+    """
+    import os as _os
+    import requests as _req
+    hermes_url = _os.environ.get(
+        "HERMES_NOTIFY_URL",
+        "https://hermes-telegram-bot-hnl.onrender.com/notify"
+    )
+    secret = _os.environ.get("NOTIFY_SECRET", "")
+    try:
+        payload = {"signal": text[:8000]}
+        if secret:
+            payload["secret"] = secret
+        resp = _req.post(hermes_url, json=payload, timeout=8)
+        logger.info(f"[HermesNotify] {resp.status_code} — {len(text)} ký tự")
+    except Exception as e:
+        logger.debug(f"[HermesNotify] Non-critical: {e}")
+
+
+
 BACKTEST_RULE_COOLDOWN = 120   # 2 phút per user
 _last_backtest_rule: dict[str, float] = {}
 # Đếm số lần run per (user, symbol) để cảnh báo overfitting
@@ -670,6 +695,8 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
             )
             full_text = plain_fn(header + NL + bt_summary)
             await msg.edit_text(full_text[:4096])
+            import threading as _th
+            _th.Thread(target=_notify_hermes_bg, args=(full_text,), daemon=True).start()
 
             # Chart
             chart_path = result.get("chart_path", "")
@@ -749,6 +776,8 @@ async def _handle_auto_context(update, context, symbol: str, plain_fn):
             report = format_analog_report(symbol, analogs, state_vec,
                                           current_price=_current_price)
             await msg.edit_text(plain_fn(report)[:4096])
+            import threading as _th
+            _th.Thread(target=_notify_hermes_bg, args=(plain_fn(report),), daemon=True).start()
 
         else:
             no_info_lines = [
@@ -943,6 +972,9 @@ async def backtest_rule_cmd(update, context):
                 chat_id=chat_id, message_id=msg.message_id,
                 text=plain(summary)[:4096],
             )
+            # Notify Hermes phân tích
+            import threading as _th
+            _th.Thread(target=_notify_hermes_bg, args=(plain(summary),), daemon=True).start()
 
             # Gửi overfit warning nếu user đã run nhiều lần
             if overfit_warning:
@@ -1808,7 +1840,10 @@ async def backtest_analog_cmd(update, context):
                 ), timeout=300,
             )
             logger.info(f"[BacktestV3] Done {symbol}: {res.get('status')}")
-            await msg.edit_text(_plain(_format_analog_backtest_result(res)))
+            _analog_result_text = _plain(_format_analog_backtest_result(res))
+            await msg.edit_text(_analog_result_text)
+            import threading as _th
+            _th.Thread(target=_notify_hermes_bg, args=(_analog_result_text,), daemon=True).start()
         except asyncio.TimeoutError:
             await msg.edit_text("Timeout — thu lai sau.")
         except Exception as e:
@@ -1850,7 +1885,10 @@ async def walkforward_analog_cmd(update, context):
                 )
                 lines.append(_format_wf_result(res))
                 lines.append("")
-            await msg.edit_text(_plain("\n".join(lines))[:4000])
+            _wf_text = _plain("\n".join(lines))[:4000]
+            await msg.edit_text(_wf_text)
+            import threading as _th
+            _th.Thread(target=_notify_hermes_bg, args=(_wf_text,), daemon=True).start()
         except Exception as e:
             logger.exception(f"[WFV3] Error: {e}")
             await msg.edit_text(f"Loi: {e}")
@@ -1893,7 +1931,10 @@ async def analog_pipeline_cmd(update, context):
                 results[sym] = await asyncio.get_event_loop().run_in_executor(
                     None, lambda s=sym: _run_pipeline_wf_sync(s)
                 )
-            await msg.edit_text(_plain(_format_pipeline_summary(results)))
+            _pipeline_text = _plain(_format_pipeline_summary(results))
+            await msg.edit_text(_pipeline_text)
+            import threading as _th
+            _th.Thread(target=_notify_hermes_bg, args=(_pipeline_text,), daemon=True).start()
         except Exception as e:
             await msg.edit_text(f"Loi: {e}")
 
