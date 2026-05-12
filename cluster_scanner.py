@@ -767,11 +767,12 @@ def _compute_indicators(df: pd.DataFrame) -> dict | None:
         pct   = (_s200 / px_entry - 1.0) * 100
         return pct if pct < -1.0 else None
 
-    # Chạy fallback chain
-    _ns = (_vol_profile_support(px)
-           or _swing_low_support(px)
-           or _sma200_support(px)
-           or -13.5)
+    # Chạy fallback chain — cache kết quả để tránh double-call
+    _vp_s  = _vol_profile_support(px)
+    _sw_s  = _swing_low_support(px) if _vp_s is None else None
+    _s200  = _sma200_support(px)    if _vp_s is None and _sw_s is None else None
+
+    _ns = _vp_s or _sw_s or _s200 or -13.5
 
     # nearest_r: HVN trên entry (resistance)
     def _vol_profile_resist(px_entry):
@@ -804,9 +805,9 @@ def _compute_indicators(df: pd.DataFrame) -> dict | None:
 
     ind["nearest_s"]      = float(round(_ns, 2))
     ind["nearest_r"]      = float(round(_nr, 2))
-    ind["support_method"] = ("vol_profile" if _vol_profile_support(px) is not None
-                             else "swing_low" if _swing_low_support(px) is not None
-                             else "sma200"    if _sma200_support(px) is not None
+    ind["support_method"] = ("vol_profile" if _vp_s  is not None
+                             else "swing_low" if _sw_s  is not None
+                             else "sma200"    if _s200  is not None
                              else "fixed")
 
     return ind
@@ -1230,7 +1231,9 @@ def _scan_symbol(symbol: str, cluster: str) -> dict | None:
     if cluster in ("Mean Reversion", "Mean Reversion 2"):
         ns     = ind.get("nearest_s", -13.5)
         method = ind.get("support_method", "fixed")
-        if ns < -3.0:   # chỉ dùng dynamic nếu support có ý nghĩa (> 3% dưới entry)
+        # Threshold -1.5%: support phải đủ xa để SL có ý nghĩa
+        # (tránh SL quá sát entry như -0.2%, -0.5%)
+        if ns < -1.5:
             sl_dynamic = round(ns - 1.0, 1)                    # 1% buffer dưới support
             sl_pct     = max(sl_dynamic, SL_CONFIG[cluster])   # cap tại fixed SL
             sl_dynamic_note = f"{method} (support={ns:+.1f}%)"
