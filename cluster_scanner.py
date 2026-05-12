@@ -1751,6 +1751,7 @@ def run_afternoon_update() -> list[str] | None:
 async def cluster_scan_cmd(update, context):
     """
     /cluster_scan — chạy manual scan ngay lập tức.
+    Sau khi gửi kết quả → push sang Hermes để phân tích tự động.
     """
     await update.message.reply_text("🔍 Đang scan cluster signals...")
     try:
@@ -1760,6 +1761,10 @@ async def cluster_scan_cmd(update, context):
                 m, parse_mode="Markdown"
             )
             await asyncio.sleep(0.3)
+        # Push sang Hermes để phân tích ngay — không chờ kết quả
+        full_signal = "\n\n".join(messages)
+        if full_signal.strip():
+            await asyncio.to_thread(_notify_hermes, full_signal)
     except Exception as e:
         await update.message.reply_text(f"❌ Scan lỗi: {str(e)[:200]}")
 
